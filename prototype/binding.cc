@@ -235,6 +235,74 @@ static napi_value CompactAsync(napi_env env, napi_callback_info info) {
 }
 
 // hashKey(key) -> hex string, so JS can map ring records back to L1 entries
+// Structural size estimate for a JS value, walked through Node-API.
+// V8 gives embedders no per-object size (GetShallowSize exists only on a
+// HeapGraphNode, i.e. inside a stop-the-world heap snapshot), so this models
+// V8's layout instead:
+//   Smi              0  (pointer-tagged, stored inline)
+//   double          16  (HeapNumber; often unboxed in practice, so this runs high)
+//   string      16+len  (SeqOneByteString header + chars, 8-aligned)
+//   array    16+16+8*n  (JSArray + FixedArray header + one slot per element)
+//   object      16+8*n  (JSObject header + one slot per property)
+// Property NAMES and hidden classes are internalised and shared between objects
+// of the same shape, so they are deliberately counted as zero - right for the
+// homogeneous objects a cache usually holds, an undercount for varied shapes.
+static const size_t SZ_HEAPNUMBER = 16, SZ_STR_HDR = 16, SZ_JSOBJ = 16,
+                    SZ_JSARRAY = 16, SZ_FIXEDARRAY_HDR = 16, SZ_SLOT = 8;
+
+static size_t estimateSize(napi_env env, napi_value v, int depth, size_t *nodes) {
+  if (depth > 32 || ++(*nodes) > 200000) return 0;
+  napi_valuetype t;
+  if (napi_typeof(env, v, &t) != napi_ok) return 0;
+  switch (t) {
+    case napi_undefined: case napi_null: case napi_boolean:
+      return 0;                                     // singletons
+    case napi_number: {
+      double d; napi_get_value_double(env, v, &d);
+      bool smi = d == (double)(int32_t)d && d >= -1073741824.0 && d <= 1073741823.0;
+      return smi ? 0 : SZ_HEAPNUMBER;
+    }
+    case napi_string: {
+      size_t len = 0;
+      napi_get_value_string_utf8(env, v, nullptr, 0, &len);
+      return (SZ_STR_HDR + len + 7) & ~(size_t)7;
+    }
+    case napi_object: {
+      bool isArr = false;
+      napi_is_array(env, v, &isArr);
+      size_t total = 0;
+      if (isArr) {
+        uint32_t n = 0; napi_get_array_length(env, v, &n);
+        total = SZ_JSARRAY + SZ_FIXEDARRAY_HDR + SZ_SLOT * (size_t)n;
+        for (uint32_t i = 0; i < n; i++) {
+          napi_value el;
+          if (napi_get_element(env, v, i, &el) != napi_ok) break;
+          total += estimateSize(env, el, depth + 1, nodes);
+        }
+      } else {
+        napi_value names;
+        if (napi_get_property_names(env, v, &names) != napi_ok) return SZ_JSOBJ;
+        uint32_t n = 0; napi_get_array_length(env, names, &n);
+        total = SZ_JSOBJ + SZ_SLOT * (size_t)n;
+        for (uint32_t i = 0; i < n; i++) {
+          napi_value k, val;
+          if (napi_get_element(env, names, i, &k) != napi_ok) break;
+          if (napi_get_property(env, v, k, &val) != napi_ok) break;
+          total += estimateSize(env, val, depth + 1, nodes);
+        }
+      }
+      return total;
+    }
+    default: return SZ_SLOT;
+  }
+}
+
+static napi_value EstimateSize(napi_env env, napi_callback_info info) {
+  ARG(1) size_t nodes = 0;
+  size_t n = estimateSize(env, argv[0], 0, &nodes);
+  napi_value r; napi_create_double(env, (double)n, &r); return r;
+}
+
 static napi_value HashKey(napi_env env, napi_callback_info info) {
   ARG(1) char key[512]; size_t klen = 0;
   napi_get_value_string_latin1(env, argv[0], key, sizeof(key), &klen);
@@ -343,7 +411,7 @@ static napi_value Init(napi_env env, napi_value exports) {
   FN("create", Create) FN("attach", Attach) FN("set", Set) FN("get", Get)
   FN("getLen", GetLen) FN("probe", Probe) FN("stats", Stats)
   FN("destroy", Destroy) FN("poke", Poke)
-  FN("suppressRefBit", SetSuppressRefBit) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin)
+  FN("suppressRefBit", SetSuppressRefBit) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin)
   return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)

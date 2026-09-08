@@ -6,6 +6,8 @@
 //   coherence - workers drain the shared invalidation ring and drop stale L1 entries
 const cluster = require('cluster');
 const native = require('./build/Release/l2.node');
+const v8 = require('v8');
+const { PerformanceObserver } = require('perf_hooks');
 
 const MSG = 'tc';
 
@@ -21,6 +23,7 @@ class TurboCache {
     #codec;
     #freeze;
     #heapFactor;
+    #guardMax = 0; #guardShed = 0.25; #gcObserver = null; liveHeapFraction = 0;
     #attached = false;
     stats = { l1Hits: 0, l2Hits: 0, misses: 0, sets: 0, invalidated: 0, flushes: 0, sent: 0 };
 
@@ -39,6 +42,28 @@ class TurboCache {
         // and JS cannot measure that. The budget is in encoded bytes scaled by
         // this factor; it is an estimate, not a guarantee.
         this.#heapFactor = opts.heapFactor || (this.#codec ? 3 : 1);
+        // Per-object size cannot be measured: V8 exposes no such API, and a
+        // structural estimate is both less accurate than encodedBytes*3 and far
+        // more expensive. So do not try. Bound the thing that actually matters -
+        // LIVE heap - instead.
+        //
+        // used_heap_size sampled at an arbitrary moment includes uncollected
+        // garbage, so it rises when you shed and the guard thrashes. Read it
+        // immediately after a major GC instead, where it is the live set.
+        const g = opts.heapGuard;
+        if (g !== false) {
+            this.#guardMax = (g && g.maxHeapFraction) || 0.80;
+            this.#guardShed = (g && g.shedFraction) || 0.25;
+            const self = this;
+            this.#gcObserver = new PerformanceObserver(list => {
+                for (const e of list.getEntries()) {
+                    if (e.detail && e.detail.kind === undefined) continue;
+                    self.#onGc();
+                }
+            });
+            this.#gcObserver.observe({ entryTypes: ['gc'] });
+            if (this.#gcObserver.disconnect) { /* caller may stop() */ }
+        }
     }
 
     static deepFreeze(o) {
@@ -67,6 +92,7 @@ class TurboCache {
         this.#l1.set(key, { v, bytes, hits: 1 });
         this.#byHash.set(hash, key);
         this.#l1Bytes += bytes;
+
         // FIFO with second chance: Map preserves insertion order, so the oldest
         // entry is first. A entry that has been read again gets one reprieve.
         while (this.#l1Bytes > this.#l1Max) {
@@ -78,6 +104,21 @@ class TurboCache {
             this.#l1Bytes -= e.bytes;
         }
     }
+    // Runs right after a GC, so used_heap_size is the LIVE set, not live+garbage.
+    // The byte budget is an estimate; this is not.
+    #onGc() {
+        const h = v8.getHeapStatistics();
+        this.liveHeapFraction = h.used_heap_size / h.heap_size_limit;
+        if (this.liveHeapFraction < this.#guardMax) return;
+        const target = this.#l1Bytes * (1 - this.#guardShed);
+        for (const [k, e] of this.#l1) {
+            if (this.#l1Bytes <= target) break;
+            this.#l1Bytes -= e.bytes;
+            this.#l1.delete(k);
+        }
+        this.stats.heapShed = (this.stats.heapShed || 0) + 1;
+    }
+
     #l1Drop(key) {
         const e = this.#l1.get(key);
         if (!e) return;
@@ -133,6 +174,10 @@ class TurboCache {
             setImmediate(() => this.flush());
         }
     }
+
+    get l1Size() { return this.#l1.size; }
+
+    stopGuard() { if (this.#gcObserver) { this.#gcObserver.disconnect(); this.#gcObserver = null; } }
 
     flush() {
         this.#flushScheduled = false;

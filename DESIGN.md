@@ -615,7 +615,9 @@ it is largest exactly where a cache is meant to spend its time.
    measured cost 25–30% (1,529k → 1,125k ops/s).
 2. **The L1 byte budget becomes an estimate, not a cap.** JS cannot measure an
    object's heap footprint, so the budget counts encoded bytes scaled by
-   `heapFactor`. Measured against real heap usage for JSON-shaped objects:
+   `heapFactor`. See "Can object size be measured?" below for why no better
+   estimate exists, and what to do instead. Measured against real heap usage for
+   JSON-shaped objects:
 
    | encoded size | heap per object | ratio |
    |---|---|---|
@@ -631,7 +633,115 @@ it is largest exactly where a cache is meant to spend its time.
    than L1 more reads fall through to L2 (161k L1 hits becomes 132k in the 60k-key
    scenario). Net throughput still improves, but by 26% rather than 3.6x.
 
-### Architecture validation### Architecture validation### Comparison against the Bugsee appserver cache
+### Can object size be measured? No - and a better estimate is not the answer
+
+**Where L1 crosses into native.** An L1 *hit* in the primary crosses nothing —
+it is a plain `Map` lookup, which is why it measures 42ns. A worker's L1 hit
+crosses once, for the `ringHead()` drain check. Every L1 *insert* already calls
+`hashKey()`, so a size measurement there would cost no extra boundary crossing.
+
+**V8 exposes no per-object size to embedders.** `GetShallowSize()` exists only
+on `HeapGraphNode` — inside a heap snapshot, which is stop-the-world. Node-API
+has nothing. Confirmed against the Node 24.15 headers.
+
+**A native structural estimate was built and is worse on both axes.** It walks
+the value through Node-API and models V8 layout (Smi 0, HeapNumber 16,
+SeqOneByteString 16+len, JSObject 16+8n, JSArray 16+16+8n), counting internalised
+property names and shared hidden classes as zero. Against ground truth (measured
+`heapUsed` delta per object, after forced GC):
+
+| estimator | 645B object | 2144B object | 7946B object | cost per call |
+|---|---|---|---|---|
+| **`encodedBytes x 3`** | **-7%** | **+4%** | **+7%** | free — length already known |
+| native structural walk | -26% | -17% | -14% | **5825ns** |
+| `v8.serialize().length` | -73% | -71% | -70% | 3506ns |
+
+The walk consistently undercounts because backing stores, allocation alignment
+and per-object bookkeeping cost more than the model, and shared property names
+cannot be attributed to any one instance. It is also ~5x more expensive than the
+`JSON.stringify` it would accompany (1191ns). Tuning its constants would only
+curve-fit toward the accuracy `encodedBytes x 3` already delivers for free.
+
+**The productive answer is to stop needing per-object accuracy.** The point of
+the byte budget is to bound memory; bound the memory directly instead. A guard
+reads `v8.getHeapStatistics()` after a GC and sheds L1 when the live set exceeds
+a configured fraction of the heap limit:
+
+| configuration | retained live heap | L1 entries kept |
+|---|---|---|
+| guard off, 1GB byte budget | 445MB (50% of limit) | 200,000 |
+| guard at 40% | 297MB (33%) | 128,998 |
+| guard at 20% | **121MB (14%)** | 46,079 |
+
+The deliberately-wrong 1GB budget bound nothing; the guard bounds what actually
+matters. Two things it is not:
+
+- **It needs the event loop to turn.** GC notifications arrive on a later tick,
+  so a fully synchronous loop never receives them. Fine for a server — and a
+  cache that never yields cannot flush its IPC write batch either.
+- **The signal must be read after a GC.** Sampling `used_heap_size` at an
+  arbitrary moment includes uncollected garbage, so shedding *raises* the
+  reading and the guard thrashes. A first attempt did exactly that, ending with
+  higher peak heap than no guard at all.
+
+So: `heapFactor` stays the sizing mechanism, and the guard is the backstop that
+makes its inaccuracy non-fatal rather than something to engineer away.
+
+### Architecture validation### Can object size be measured? No - and a better estimate is not the answer
+
+**Where L1 crosses into native.** An L1 *hit* in the primary crosses nothing —
+it is a plain `Map` lookup, which is why it measures 42ns. A worker's L1 hit
+crosses once, for the `ringHead()` drain check. Every L1 *insert* already calls
+`hashKey()`, so a size measurement there would cost no extra boundary crossing.
+
+**V8 exposes no per-object size to embedders.** `GetShallowSize()` exists only
+on `HeapGraphNode` — inside a heap snapshot, which is stop-the-world. Node-API
+has nothing. Confirmed against the Node 24.15 headers.
+
+**A native structural estimate was built and is worse on both axes.** It walks
+the value through Node-API and models V8 layout (Smi 0, HeapNumber 16,
+SeqOneByteString 16+len, JSObject 16+8n, JSArray 16+16+8n), counting internalised
+property names and shared hidden classes as zero. Against ground truth (measured
+`heapUsed` delta per object, after forced GC):
+
+| estimator | 645B object | 2144B object | 7946B object | cost per call |
+|---|---|---|---|---|
+| **`encodedBytes x 3`** | **-7%** | **+4%** | **+7%** | free — length already known |
+| native structural walk | -26% | -17% | -14% | **5825ns** |
+| `v8.serialize().length` | -73% | -71% | -70% | 3506ns |
+
+The walk consistently undercounts because backing stores, allocation alignment
+and per-object bookkeeping cost more than the model, and shared property names
+cannot be attributed to any one instance. It is also ~5x more expensive than the
+`JSON.stringify` it would accompany (1191ns). Tuning its constants would only
+curve-fit toward the accuracy `encodedBytes x 3` already delivers for free.
+
+**The productive answer is to stop needing per-object accuracy.** The point of
+the byte budget is to bound memory; bound the memory directly instead. A guard
+reads `v8.getHeapStatistics()` after a GC and sheds L1 when the live set exceeds
+a configured fraction of the heap limit:
+
+| configuration | retained live heap | L1 entries kept |
+|---|---|---|
+| guard off, 1GB byte budget | 445MB (50% of limit) | 200,000 |
+| guard at 40% | 297MB (33%) | 128,998 |
+| guard at 20% | **121MB (14%)** | 46,079 |
+
+The deliberately-wrong 1GB budget bound nothing; the guard bounds what actually
+matters. Two things it is not:
+
+- **It needs the event loop to turn.** GC notifications arrive on a later tick,
+  so a fully synchronous loop never receives them. Fine for a server — and a
+  cache that never yields cannot flush its IPC write batch either.
+- **The signal must be read after a GC.** Sampling `used_heap_size` at an
+  arbitrary moment includes uncollected garbage, so shedding *raises* the
+  reading and the guard thrashes. A first attempt did exactly that, ending with
+  higher peak heap than no guard at all.
+
+So: `heapFactor` stays the sizing mechanism, and the guard is the backstop that
+makes its inaccuracy non-fatal rather than something to engineer away.
+
+### Architecture validation### Comparison against the Bugsee appserver cache
 
 Measured against `Bugsee/appserver/code/components/shared/cache`, a production
 implementation of the same shape: L1 `JsonLru` per worker, L2 in the primary's
@@ -701,6 +811,60 @@ values; add an opt-in JSON mode; or accept it and document that turbocache's
 advantage is for opaque payloads and cross-process scaling, not for object
 workloads in a single process.
 
+### Can object size be measured? No - and a better estimate is not the answer
+
+**Where L1 crosses into native.** An L1 *hit* in the primary crosses nothing —
+it is a plain `Map` lookup, which is why it measures 42ns. A worker's L1 hit
+crosses once, for the `ringHead()` drain check. Every L1 *insert* already calls
+`hashKey()`, so a size measurement there would cost no extra boundary crossing.
+
+**V8 exposes no per-object size to embedders.** `GetShallowSize()` exists only
+on `HeapGraphNode` — inside a heap snapshot, which is stop-the-world. Node-API
+has nothing. Confirmed against the Node 24.15 headers.
+
+**A native structural estimate was built and is worse on both axes.** It walks
+the value through Node-API and models V8 layout (Smi 0, HeapNumber 16,
+SeqOneByteString 16+len, JSObject 16+8n, JSArray 16+16+8n), counting internalised
+property names and shared hidden classes as zero. Against ground truth (measured
+`heapUsed` delta per object, after forced GC):
+
+| estimator | 645B object | 2144B object | 7946B object | cost per call |
+|---|---|---|---|---|
+| **`encodedBytes x 3`** | **-7%** | **+4%** | **+7%** | free — length already known |
+| native structural walk | -26% | -17% | -14% | **5825ns** |
+| `v8.serialize().length` | -73% | -71% | -70% | 3506ns |
+
+The walk consistently undercounts because backing stores, allocation alignment
+and per-object bookkeeping cost more than the model, and shared property names
+cannot be attributed to any one instance. It is also ~5x more expensive than the
+`JSON.stringify` it would accompany (1191ns). Tuning its constants would only
+curve-fit toward the accuracy `encodedBytes x 3` already delivers for free.
+
+**The productive answer is to stop needing per-object accuracy.** The point of
+the byte budget is to bound memory; bound the memory directly instead. A guard
+reads `v8.getHeapStatistics()` after a GC and sheds L1 when the live set exceeds
+a configured fraction of the heap limit:
+
+| configuration | retained live heap | L1 entries kept |
+|---|---|---|
+| guard off, 1GB byte budget | 445MB (50% of limit) | 200,000 |
+| guard at 40% | 297MB (33%) | 128,998 |
+| guard at 20% | **121MB (14%)** | 46,079 |
+
+The deliberately-wrong 1GB budget bound nothing; the guard bounds what actually
+matters. Two things it is not:
+
+- **It needs the event loop to turn.** GC notifications arrive on a later tick,
+  so a fully synchronous loop never receives them. Fine for a server — and a
+  cache that never yields cannot flush its IPC write batch either.
+- **The signal must be read after a GC.** Sampling `used_heap_size` at an
+  arbitrary moment includes uncollected garbage, so shedding *raises* the
+  reading and the guard thrashes. A first attempt did exactly that, ending with
+  higher peak heap than no guard at all.
+
+So: `heapFactor` stays the sizing mechanism, and the guard is the backstop that
+makes its inaccuracy non-fatal rather than something to engineer away.
+
 ### Architecture validation
 
 | Claim | Result |
@@ -755,6 +919,7 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 | 14 | Batched, fire-and-forget writes to the primary | synchronous write-through | Keeps `set()` off the IPC critical path; costs ~1 tick of cross-worker staleness |
 | 15 | Current LTS, darwin + linux, x64 + arm64 | Windows in v1 | Windows needs `CreateFileMapping` — a second shared-memory implementation |
 | 17 | **No background compaction** | async compress-on-the-threadpool with version-validated apply | Built and proven race-safe (18k stale captures correctly discarded, 0 wrong values), but worth only +1.9 points of hit rate at 3x read latency, while doubling the arena buys +6.9 points at no cost. Restricting to cold entries removes the latency penalty *and* the entire benefit. |
+| 22 | **No per-object size measurement; a post-GC heap guard instead** | native structural size walk; `v8.serialize().length`; sampling `used_heap_size` directly | V8 exposes no per-object size outside a heap snapshot. A native walk was built and is -14% to -26% accurate against +/-7% for `encodedBytes x 3`, at 5825ns versus free. Bounding live heap after a GC bounds the thing that actually matters: retained heap 445MB to 121MB where the byte budget bound nothing. |
 | 21 | **Optional caller-supplied codec; L1 caches decoded values, L2 stores bytes** | app owns the codec (L1 caches encoded strings); built-in JSON mode; accept the limitation | Resolves the decision 4/5 conflict by applying each at its own boundary. 3.6x on L1-resident object workloads, p50 1334ns to 42ns. Costs a documented aliasing contract (or 25-30% for `freeze: true`) and turns the L1 byte cap into a `heapFactor`-scaled estimate, measured at 2.79-3.21x for JSON-shaped objects. |
 | 20 | **Arena sizing and `indexSlots` validated at create time** | trust the caller | A too-small segment underflowed into a hang; a non-power-of-two slot count breaks the probe mask |
 | 19 | **Index slots hold the monotonic log position, not a physical offset** | physical offsets + seqlock alone | A seqlock cannot detect log reuse: once the head wraps over an evicted entry, its `seq` field is another record's payload. A monotonic position lets a reader prove liveness with `tailPub <= pos`. Closes a silent stale/torn-read bug. |
