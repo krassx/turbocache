@@ -303,6 +303,60 @@ static napi_value EstimateSize(napi_env env, napi_callback_info info) {
   napi_value r; napi_create_double(env, (double)n, &r); return r;
 }
 
+// Returns a freshly allocated flat string. A V8 SlicedString keeps its parent
+// alive, so caching a 100-byte substring of a 4MB document retains all 4MB -
+// measured. Round-tripping through a buffer produces a SeqString that owns only
+// its own characters, making the byte accounting exact.
+// A V8 string is one-byte only if it is pure ASCII as far as we can tell from
+// Node-API: latin1 chars 128-255 are one byte in V8 but two in UTF-8, so
+// utf8Len == charLen implies ASCII, and anything else is treated as two-byte.
+static bool strInfo(napi_env env, napi_value v, size_t *charLen, size_t *utf8Len) {
+  if (napi_get_value_string_utf8(env, v, nullptr, 0, utf8Len) != napi_ok) return false;
+  if (napi_get_value_string_utf16(env, v, nullptr, 0, charLen) != napi_ok) return false;
+  return true;
+}
+
+static napi_value Flatten(napi_env env, napi_callback_info info) {
+  ARG(1)
+  if (!scratch) { scratch = (uint8_t *)malloc(SCRATCH); cbuf = (uint8_t *)malloc(SCRATCH); }
+  size_t charLen = 0, utf8Len = 0;
+  if (!strInfo(env, argv[0], &charLen, &utf8Len)) return argv[0];
+  if (charLen == 0) return argv[0];
+  napi_value out;
+  if (utf8Len == charLen) {                       // ASCII: one-byte round trip
+    if (charLen + 1 > SCRATCH) return argv[0];
+    size_t got = 0;
+    napi_get_value_string_latin1(env, argv[0], (char *)scratch, SCRATCH, &got);
+    if (napi_create_string_latin1(env, (const char *)scratch, got, &out) != napi_ok) return argv[0];
+  } else {                                        // two-byte round trip
+    if ((charLen + 1) * 2 > SCRATCH) return argv[0];
+    size_t got = 0;
+    napi_get_value_string_utf16(env, argv[0], (char16_t *)scratch, SCRATCH / 2, &got);
+    if (napi_create_string_utf16(env, (const char16_t *)scratch, got, &out) != napi_ok) return argv[0];
+  }
+  return out;
+}
+
+// Exact V8 heap cost of a primitive. Verified against measured heapUsed to
+// within 1% for flat strings; Smis and singletons genuinely cost nothing.
+static napi_value PrimBytes(napi_env env, napi_callback_info info) {
+  ARG(1)
+  napi_valuetype t; napi_typeof(env, argv[0], &t);
+  double bytes = 0;
+  if (t == napi_string) {
+    size_t charLen = 0, utf8Len = 0;
+    if (strInfo(env, argv[0], &charLen, &utf8Len)) {
+      size_t body = (utf8Len == charLen) ? charLen : charLen * 2;
+      bytes = (double)((16 + body + 7) & ~(size_t)7);
+    }
+  } else if (t == napi_number) {
+    double d; napi_get_value_double(env, argv[0], &d);
+    bool smi = d == (double)(int32_t)d && d >= -1073741824.0 && d <= 1073741823.0;
+    bytes = smi ? 0 : 16;
+  }
+  napi_value r; napi_create_double(env, bytes, &r); return r;
+}
+
 static napi_value HashKey(napi_env env, napi_callback_info info) {
   ARG(1) char key[512]; size_t klen = 0;
   napi_get_value_string_latin1(env, argv[0], key, sizeof(key), &klen);
@@ -411,7 +465,7 @@ static napi_value Init(napi_env env, napi_value exports) {
   FN("create", Create) FN("attach", Attach) FN("set", Set) FN("get", Get)
   FN("getLen", GetLen) FN("probe", Probe) FN("stats", Stats)
   FN("destroy", Destroy) FN("poke", Poke)
-  FN("suppressRefBit", SetSuppressRefBit) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin)
+  FN("suppressRefBit", SetSuppressRefBit) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin)
   return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)

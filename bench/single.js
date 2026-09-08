@@ -75,8 +75,12 @@ const fresh = (opts) => TurboCache.createPrimary('/tc-sng-' + process.pid + '-' 
     for (let i = 0; i < planC.vals.length; i++) planC.vals[i] = JSON.stringify(planC.vals[i]);
     head();
     report('(harness floor, no cache)', await run(noop, planC, 256, NOYIELD));
-    const tcC = fresh();
-    report('turbocache (sync)', await run(tcStr(tcC), planC, 256, NOYIELD));
+    let tcC = fresh();
+    report('turbocache (raw bytes)', await run(tcStr(tcC), planC, 256, NOYIELD));
+    TurboCache.native().destroy();
+    tcC = fresh({ values: 'primitives', l1MaxBytes: L1 });
+    report('turbocache (primitives)', await run(tcStr(tcC), planC, 256, NOYIELD),
+           'exact accounting + flatten');
     TurboCache.native().destroy();
     report('bugsee (L1 only)', await run(bs(new bugsee.Cache({ l1MaxBytes: L1, enableIpc: false })), planC, 256, NOYIELD));
 

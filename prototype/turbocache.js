@@ -21,6 +21,7 @@ class TurboCache {
     #cursor = 0;
     #id;
     #codec;
+    #primitives = false;
     #freeze;
     #heapFactor;
     #guardMax = 0; #guardShed = 0.25; #gcObserver = null; liveHeapFraction = 0;
@@ -36,12 +37,18 @@ class TurboCache {
         this.#l1Max = opts.l1MaxBytes || 2 * 1024 * 1024;
         this.#id = opts.workerId || 0;
         this.#attached = opts.attached !== false;
-        this.#codec = opts.codec || null;
+        // 'primitives' mode: accept only string/number/boolean/null. Buys three
+        // things the codec mode cannot: byte accounting that is exact rather
+        // than a heapFactor estimate, no aliasing hazard (primitives are
+        // immutable), and no codec to configure. Costs the caller a decode on
+        // every L1 hit if its values are really objects.
+        this.#primitives = opts.values === 'primitives';
+        this.#codec = this.#primitives ? null : (opts.codec || null);
         this.#freeze = opts.freeze === true;
         // A decoded object costs several times its encoded size on the V8 heap,
         // and JS cannot measure that. The budget is in encoded bytes scaled by
         // this factor; it is an estimate, not a guarantee.
-        this.#heapFactor = opts.heapFactor || (this.#codec ? 3 : 1);
+        this.#heapFactor = this.#primitives ? 1 : (opts.heapFactor || (this.#codec ? 3 : 1));
         // Per-object size cannot be measured: V8 exposes no such API, and a
         // structural estimate is both less accurate than encodedBytes*3 and far
         // more expensive. So do not try. Bound the thing that actually matters -
@@ -86,7 +93,11 @@ class TurboCache {
 
     // --- L1 --------------------------------------------------------------
     #l1Put(key, v, hash, encodedLen) {
-        const bytes = (key.length + encodedLen + 64) * this.#heapFactor;
+        // In primitives mode the cost is known exactly; otherwise it is the
+        // encoded length scaled by heapFactor, which is only an estimate.
+        const bytes = this.#primitives
+            ? native.primBytes(v) + native.primBytes(key) + 64
+            : (key.length + encodedLen + 64) * this.#heapFactor;
         const prev = this.#l1.get(key);
         if (prev) this.#l1Bytes -= prev.bytes;
         this.#l1.set(key, { v, bytes, hits: 1 });
@@ -163,6 +174,17 @@ class TurboCache {
 
     set(key, value) {
         this.stats.sets++;
+        if (this.#primitives) {
+            const t = typeof value;
+            if (t !== 'string' && t !== 'number' && t !== 'boolean' && value !== null)
+                throw new TypeError(`primitives mode accepts string/number/boolean/null, got ${t}`);
+            if (t === 'string') {
+                // A V8 SlicedString keeps its parent alive: caching a 1MB
+                // substring of an 8MB document retains all 8MB (measured).
+                // Flattening costs ~42ns and makes the accounting honest.
+                value = native.flatten(value);
+            }
+        }
         // Encode once: L2 needs bytes regardless, so this is not extra work.
         const enc = this.#codec ? this.#codec.encode(value) : value;
         if (this.#codec && this.#freeze) TurboCache.deepFreeze(value);

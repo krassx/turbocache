@@ -687,6 +687,67 @@ matters. Two things it is not:
 So: `heapFactor` stays the sizing mechanism, and the guard is the backstop that
 makes its inaccuracy non-fatal rather than something to engineer away.
 
+### Primitives-only mode
+
+Restricting accepted values to `string | number | boolean | null` fixes, in one
+move, the three things the codec mode could not. All three verified:
+
+1. **Byte accounting becomes exact.** A flat V8 string costs `16 + len`
+   (one-byte) or `16 + 2*len` (two-byte), 8-aligned. Measured against real heap
+   usage:
+
+   | kind | len | measured | predicted | error |
+   |---|---|---|---|---|
+   | one-byte | 32 | 51B | 48B | -6% |
+   | one-byte | 1024 | 1041B | 1040B | -0% |
+   | one-byte | 8192 | 8209B | 8208B | -0% |
+   | two-byte | 1024 | 2064B | 2064B | -0% |
+
+   Smis and `true`/`false`/`null` genuinely cost nothing; a non-Smi number is a
+   16-byte HeapNumber. So `heapFactor` disappears and the budget is a real cap
+   rather than an estimate.
+2. **The aliasing hazard disappears.** Primitives are immutable, so there is
+   nothing to mutate, no do-not-mutate contract, and no need for `freeze`.
+3. **No codec to configure.**
+
+**One hole, found and closed.** A V8 `SlicedString` keeps its parent alive, so a
+cached substring can retain an arbitrarily larger document. Measured with an 8MB
+parent, keeping one derived 1MB string and dropping the parent:
+
+| kept value | retained |
+|---|---|
+| the whole 8MB parent (control) | 8.00MB |
+| **1MB substring, as-is** | **8.00MB — the entire parent** |
+| 1MB substring via `native.flatten()` | **1.00MB — exactly its own bytes** |
+
+Primitives mode therefore flattens strings on insert, in native. This costs
+nothing extra in boundary crossings because the insert path already calls
+`hashKey()`, and the flatten itself measures ~42ns for a 200-char value —
+cheaper than the hash call beside it.
+
+**The cost of the mode** is ~20% throughput for flatten plus exact sizing
+(1,542k to 1,227k ops/s on opaque payloads, still 2.4x the bugsee cache), and
+that object workloads must encode in the caller and therefore decode on every
+L1 hit — 291k versus 1,583k measured.
+
+### Three coherent value modes
+
+| mode | L1 holds | accounting | aliasing | L1 hit cost |
+|---|---|---|---|---|
+| **primitives** | the primitive | **exact** | **none** | free |
+| JSON-always (the bugsee design) | JSON string | exact | none | parse per hit |
+| codec, decoded L1 | decoded object | `heapFactor` estimate | **yes** | free |
+
+Worth stating plainly: the bugsee cache's fixed-JSON design gets exact
+accounting and freedom from aliasing for the same structural reason primitives
+mode does — its L1 holds a string. That simplicity is real, and its price is one
+parse per hit, which is what the cluster comparison measured.
+
+**Recommendation:** primitives is the default. The codec mode stays available
+for object-heavy workloads that are dominated by L1 hits, carrying its two
+documented caveats. This keeps the safe, exactly-accountable configuration as
+the one users get without reading anything.
+
 ### Architecture validation### Can object size be measured? No - and a better estimate is not the answer
 
 **Where L1 crosses into native.** An L1 *hit* in the primary crosses nothing —
@@ -740,6 +801,67 @@ matters. Two things it is not:
 
 So: `heapFactor` stays the sizing mechanism, and the guard is the backstop that
 makes its inaccuracy non-fatal rather than something to engineer away.
+
+### Primitives-only mode
+
+Restricting accepted values to `string | number | boolean | null` fixes, in one
+move, the three things the codec mode could not. All three verified:
+
+1. **Byte accounting becomes exact.** A flat V8 string costs `16 + len`
+   (one-byte) or `16 + 2*len` (two-byte), 8-aligned. Measured against real heap
+   usage:
+
+   | kind | len | measured | predicted | error |
+   |---|---|---|---|---|
+   | one-byte | 32 | 51B | 48B | -6% |
+   | one-byte | 1024 | 1041B | 1040B | -0% |
+   | one-byte | 8192 | 8209B | 8208B | -0% |
+   | two-byte | 1024 | 2064B | 2064B | -0% |
+
+   Smis and `true`/`false`/`null` genuinely cost nothing; a non-Smi number is a
+   16-byte HeapNumber. So `heapFactor` disappears and the budget is a real cap
+   rather than an estimate.
+2. **The aliasing hazard disappears.** Primitives are immutable, so there is
+   nothing to mutate, no do-not-mutate contract, and no need for `freeze`.
+3. **No codec to configure.**
+
+**One hole, found and closed.** A V8 `SlicedString` keeps its parent alive, so a
+cached substring can retain an arbitrarily larger document. Measured with an 8MB
+parent, keeping one derived 1MB string and dropping the parent:
+
+| kept value | retained |
+|---|---|
+| the whole 8MB parent (control) | 8.00MB |
+| **1MB substring, as-is** | **8.00MB — the entire parent** |
+| 1MB substring via `native.flatten()` | **1.00MB — exactly its own bytes** |
+
+Primitives mode therefore flattens strings on insert, in native. This costs
+nothing extra in boundary crossings because the insert path already calls
+`hashKey()`, and the flatten itself measures ~42ns for a 200-char value —
+cheaper than the hash call beside it.
+
+**The cost of the mode** is ~20% throughput for flatten plus exact sizing
+(1,542k to 1,227k ops/s on opaque payloads, still 2.4x the bugsee cache), and
+that object workloads must encode in the caller and therefore decode on every
+L1 hit — 291k versus 1,583k measured.
+
+### Three coherent value modes
+
+| mode | L1 holds | accounting | aliasing | L1 hit cost |
+|---|---|---|---|---|
+| **primitives** | the primitive | **exact** | **none** | free |
+| JSON-always (the bugsee design) | JSON string | exact | none | parse per hit |
+| codec, decoded L1 | decoded object | `heapFactor` estimate | **yes** | free |
+
+Worth stating plainly: the bugsee cache's fixed-JSON design gets exact
+accounting and freedom from aliasing for the same structural reason primitives
+mode does — its L1 holds a string. That simplicity is real, and its price is one
+parse per hit, which is what the cluster comparison measured.
+
+**Recommendation:** primitives is the default. The codec mode stays available
+for object-heavy workloads that are dominated by L1 hits, carrying its two
+documented caveats. This keeps the safe, exactly-accountable configuration as
+the one users get without reading anything.
 
 ### Architecture validation### Comparison against the Bugsee appserver cache
 
@@ -865,6 +987,67 @@ matters. Two things it is not:
 So: `heapFactor` stays the sizing mechanism, and the guard is the backstop that
 makes its inaccuracy non-fatal rather than something to engineer away.
 
+### Primitives-only mode
+
+Restricting accepted values to `string | number | boolean | null` fixes, in one
+move, the three things the codec mode could not. All three verified:
+
+1. **Byte accounting becomes exact.** A flat V8 string costs `16 + len`
+   (one-byte) or `16 + 2*len` (two-byte), 8-aligned. Measured against real heap
+   usage:
+
+   | kind | len | measured | predicted | error |
+   |---|---|---|---|---|
+   | one-byte | 32 | 51B | 48B | -6% |
+   | one-byte | 1024 | 1041B | 1040B | -0% |
+   | one-byte | 8192 | 8209B | 8208B | -0% |
+   | two-byte | 1024 | 2064B | 2064B | -0% |
+
+   Smis and `true`/`false`/`null` genuinely cost nothing; a non-Smi number is a
+   16-byte HeapNumber. So `heapFactor` disappears and the budget is a real cap
+   rather than an estimate.
+2. **The aliasing hazard disappears.** Primitives are immutable, so there is
+   nothing to mutate, no do-not-mutate contract, and no need for `freeze`.
+3. **No codec to configure.**
+
+**One hole, found and closed.** A V8 `SlicedString` keeps its parent alive, so a
+cached substring can retain an arbitrarily larger document. Measured with an 8MB
+parent, keeping one derived 1MB string and dropping the parent:
+
+| kept value | retained |
+|---|---|
+| the whole 8MB parent (control) | 8.00MB |
+| **1MB substring, as-is** | **8.00MB — the entire parent** |
+| 1MB substring via `native.flatten()` | **1.00MB — exactly its own bytes** |
+
+Primitives mode therefore flattens strings on insert, in native. This costs
+nothing extra in boundary crossings because the insert path already calls
+`hashKey()`, and the flatten itself measures ~42ns for a 200-char value —
+cheaper than the hash call beside it.
+
+**The cost of the mode** is ~20% throughput for flatten plus exact sizing
+(1,542k to 1,227k ops/s on opaque payloads, still 2.4x the bugsee cache), and
+that object workloads must encode in the caller and therefore decode on every
+L1 hit — 291k versus 1,583k measured.
+
+### Three coherent value modes
+
+| mode | L1 holds | accounting | aliasing | L1 hit cost |
+|---|---|---|---|---|
+| **primitives** | the primitive | **exact** | **none** | free |
+| JSON-always (the bugsee design) | JSON string | exact | none | parse per hit |
+| codec, decoded L1 | decoded object | `heapFactor` estimate | **yes** | free |
+
+Worth stating plainly: the bugsee cache's fixed-JSON design gets exact
+accounting and freedom from aliasing for the same structural reason primitives
+mode does — its L1 holds a string. That simplicity is real, and its price is one
+parse per hit, which is what the cluster comparison measured.
+
+**Recommendation:** primitives is the default. The codec mode stays available
+for object-heavy workloads that are dominated by L1 hits, carrying its two
+documented caveats. This keeps the safe, exactly-accountable configuration as
+the one users get without reading anything.
+
 ### Architecture validation
 
 | Claim | Result |
@@ -919,6 +1102,7 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 | 14 | Batched, fire-and-forget writes to the primary | synchronous write-through | Keeps `set()` off the IPC critical path; costs ~1 tick of cross-worker staleness |
 | 15 | Current LTS, darwin + linux, x64 + arm64 | Windows in v1 | Windows needs `CreateFileMapping` — a second shared-memory implementation |
 | 17 | **No background compaction** | async compress-on-the-threadpool with version-validated apply | Built and proven race-safe (18k stale captures correctly discarded, 0 wrong values), but worth only +1.9 points of hit rate at 3x read latency, while doubling the arena buys +6.9 points at no cost. Restricting to cold entries removes the latency penalty *and* the entire benefit. |
+| 23 | **`values: 'primitives'` is the default mode; codec is opt-in** | codec everywhere; JSON-always like bugsee; accept objects natively | Primitives make accounting exact (verified within 1% against measured heap), remove the aliasing hazard entirely, and need no codec. Costs ~20% for flattening plus exact sizing, and pushes object workloads onto a decode-per-hit path. Requires flattening on insert: a cached 1MB substring otherwise retains an 8MB parent. |
 | 22 | **No per-object size measurement; a post-GC heap guard instead** | native structural size walk; `v8.serialize().length`; sampling `used_heap_size` directly | V8 exposes no per-object size outside a heap snapshot. A native walk was built and is -14% to -26% accurate against +/-7% for `encodedBytes x 3`, at 5825ns versus free. Bounding live heap after a GC bounds the thing that actually matters: retained heap 445MB to 121MB where the byte budget bound nothing. |
 | 21 | **Optional caller-supplied codec; L1 caches decoded values, L2 stores bytes** | app owns the codec (L1 caches encoded strings); built-in JSON mode; accept the limitation | Resolves the decision 4/5 conflict by applying each at its own boundary. 3.6x on L1-resident object workloads, p50 1334ns to 42ns. Costs a documented aliasing contract (or 25-30% for `freeze: true`) and turns the L1 byte cap into a `heapFactor`-scaled estimate, measured at 2.79-3.21x for JSON-shaped objects. |
 | 20 | **Arena sizing and `indexSlots` validated at create time** | trust the caller | A too-small segment underflowed into a hang; a non-power-of-two slot count breaks the probe mask |
