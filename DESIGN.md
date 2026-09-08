@@ -1,0 +1,605 @@
+# turbocache — Design
+
+> Status: **draft, pre-implementation**. Nothing in this repo is built yet.
+> All performance numbers were measured on the target machine (Apple Silicon, Node 24.15.0, V8 13.6.233) — see [Measurements](#measurements).
+
+---
+
+## 1. Understanding
+
+**What.** A layered in-memory key/value cache for Node.js services running under `node:cluster`. Two tiers: **L1**, private to each worker; **L2**, owned by the primary process and exposed to workers as a read-only shared memory mapping. A future **L3** (Valkey/Redis) sits behind both.
+
+**Why.** Existing options force a bad choice: per-worker caches (`lru-cache`) duplicate data N times with no coherence, and out-of-process stores (Redis over a socket) cost ~50–200µs per hit. The gap is a cache that is *shared* across workers but served at *memory* latency.
+
+**Who.** Node services on multi-core hosts, caching values hot enough that decode cost matters.
+
+**Non-goals for v1.** Persistence. Distribution. Arbitrary JS object values. Windows. Atomic read-modify-write. Async APIs.
+
+---
+
+## 2. Public API (v1)
+
+```ts
+type CacheValue = string | Buffer | Uint8Array | ArrayBuffer;
+
+class Cache {
+  constructor(opts?: {
+    l1Bytes?: number;       // default: auto from worker heap limit
+    l2Bytes?: number;       // default: auto from total RAM (primary only)
+    namespace?: string;     // prefixed into the key before hashing
+    compress?: boolean;         // default FALSE - see Measurements
+    compressMinBytes?: number;  // default 256, only relevant when compress:true
+    externMinBytes?: number;    // default 1024
+  });
+
+  get(key: string): CacheValue | undefined;   // synchronous
+  set(key: string, value: CacheValue, opts?: { ttlMs?: number }): void;
+  has(key: string): boolean;
+  delete(key: string): boolean;
+  clear(): void;
+
+  readonly stats: { l1Hits, l2Hits, misses, l1Bytes, l2Bytes, evictions, ... };
+}
+```
+
+**Everything is synchronous.** L1 and L2 are both memory accesses; there is nothing to await. When L3 lands it arrives as *separate* methods (`getAsync`), and the sync methods keep meaning "L1+L2 only". No existing call site changes.
+
+**Return semantics.** String values are returned **by reference** — the same immutable V8 string on every hit, zero copy. `Buffer`/`Uint8Array` values are **copied** on every `get`, because handing out a shared mutable buffer lets one caller silently corrupt the cache for every other reader.
+
+---
+
+## 3. Architecture
+
+```
+┌─ primary process ────────────────────────────────────────────┐
+│  L2 arena  (shm_open + mmap, READ/WRITE — sole writer)       │
+│    ├── header (magic, layout ver, heartbeat, sizes)          │
+│    ├── invalidation ring buffer                              │
+│    ├── hash index (open addressing)                          │
+│    └── slab arena (entries: LZ4-compressed above threshold)  │
+│  IPC receiver  ← batched writes from workers                 │
+│  background sweeper (TTL expiry, CLOCK eviction)             │
+└──────────────────────────────────────────────────────────────┘
+        ▲ writes (batched IPC)        │ mmap READ-ONLY
+        │                             ▼
+┌─ worker process ─────────────────────────────────────────────┐
+│  L1: JS Map<string, Entry>          ~21 ns/hit               │
+│      small values  → ordinary V8 strings                     │
+│      large values  → external strings over off-heap arena    │
+│  native addon (Node-API): rapidhash, LZ4, seqlock L2 reader  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Why the primary is the only writer
+
+This is the load-bearing decision. A single writer means:
+
+- **No cross-process locks.** No shared allocator under contention, no write-side seqlock, no CAS loops.
+- **No robust-mutex problem.** macOS has no `PTHREAD_MUTEX_ROBUST`. With multiple writers, a `SIGKILL`ed worker holding a lock deadlocks the arena permanently, and there is no portable recovery. With one writer, that failure mode does not exist.
+- **A worker physically cannot corrupt L2.** Its mapping has no write permission. Worker crashes are contained by the MMU, not by discipline.
+- **The primary is off the read path**, so it is not a throughput bottleneck. It only absorbs writes, which are batched.
+
+The cost is that `set()` reaches L2 asynchronously (next tick). For a cache, that is the right trade.
+
+---
+
+## 4. L1 — per-worker
+
+L1 is a **JS `Map`**, not a native store. Measurements drove this:
+
+| L1 strategy | hit, 200B | hit, 16KB | allocation per hit |
+|---|---|---|---|
+| **JS `Map`** | **~20 ns** | **~21 ns** | **none** |
+| native, copy out | 30 ns | 439 ns | new V8 string every hit |
+| native, external string per call | 58 ns | 59 ns | new external + finalizer every hit |
+
+A native store must build a fresh V8 string on **every hit** — so it does not avoid GC pressure, it *manufactures* it. A `Map` returns the identical immutable string with zero allocation.
+
+### Off-heap bytes without the per-hit cost
+
+External strings (`node_api_create_external_string_latin1`) let V8 point directly at off-heap memory. Created *per call* they are slower than copying below ~1KB. Created **once at insert** and cached in the `Map`, they give ~21ns hits at every size *and* keep the bytes off the V8 heap.
+
+So:
+
+- value `< externMinBytes` (1KB) → ordinary V8 string, copied once at insert
+- value `>= externMinBytes` → external string over a per-worker off-heap arena, created once at insert
+
+Both are ~21ns to read thereafter.
+
+**The catch: eviction becomes GC-gated.** The external string holds a raw pointer into the arena. Dropping the `Map` entry does not free the arena slot — the finalizer only runs when V8 collects the string, and a caller holding a long-lived reference pins those bytes indefinitely. The `l1Bytes` cap is therefore *soft* for the external tier.
+**Mitigation:** track pinned bytes; when the arena is full and every slot is pinned, fall back to copied heap strings for new inserts until pressure drops. Degrades gracefully instead of stalling.
+
+L1 keys are JS strings in a `Map` — V8 already hashes and caches those. **rapidhash is used for L2 only.**
+
+Eviction is **CLOCK / sampled**, not strict LRU: strict LRU in a JS `Map` means `delete`+`set` on every hit (~50–80ns), which would triple hit cost. A per-entry counter bumped on read is ~1ns.
+
+---
+
+## 5. L2 — shared arena
+
+Created by the primary before forking. `shm_open` (mode 0600) + `ftruncate` + `mmap`; workers reopen `O_RDONLY` and `mmap` with `PROT_READ`.
+
+### Entry layout
+
+```c
+struct Entry {
+  uint32_t seq;         // seqlock: even = stable, odd = write in progress
+  uint64_t hash;        // rapidhash64(namespace + key)
+  uint32_t version;     // bumped per write; matches invalidation ring
+  uint32_t expiresAt;   // seconds from arena epoch; 0 = no TTL
+  uint32_t rawLen;      // uncompressed length
+  uint32_t storedLen;   // on-disk length (== rawLen if uncompressed)
+  uint16_t keyLen;
+  uint8_t  flags;       // COMPRESSED | IS_STRING | IS_LATIN1
+  uint8_t  refBit;      // CLOCK
+  // ... keyLen bytes of key text, then storedLen bytes of value
+};  // 32-byte header
+```
+
+**Key text is stored.** It costs bytes, and it buys three things: exact `memcmp` verification (so a 64-bit hash is *exactly* correct, no collision risk, rather than probabilistic); key enumeration remains possible; and the future L3 can use real Redis keys instead of opaque hash hex.
+
+`IS_LATIN1` matters: `napi_create_string_latin1` is materially cheaper than UTF-8 decoding, so latin1 values take a faster read path.
+
+### Data region: circular log with second chance
+
+Entries are appended at a monotonic head; eviction advances the tail. There is
+**no free list and no fragmentation** — a variable-size record never has to fit
+a fixed class, so the calcification that strands memory in a size-class
+allocator cannot occur.
+
+Plain FIFO eviction, though, is frequency-blind, which costs it real hit rate.
+So when the tail reaches a live entry whose CLOCK reference bit is set, the
+entry is **re-appended at the head** and its bit cleared, rather than dropped —
+CLOCK's second chance, expressed on a log. Re-appends are capped (64 per
+allocation in the prototype) so a fully-hot arena still makes progress.
+
+A record must not straddle the wrap point, so the tail of the buffer is filled
+with a pad record when the next entry will not fit. Note that masking also
+quantises capacity to powers of two — see open question 8. Note that in this mode a
+re-append advances the head, so any write position must be recomputed *after*
+the eviction loop, not before — getting this wrong silently corrupts entries,
+and it is the one bug the prototype actually hit.
+
+### Seqlock read (worker side)
+
+```
+do {
+  s1 = load_acquire(e.seq);
+  if (s1 & 1) continue;              // writer mid-update
+  bounds-check keyLen/storedLen against arena size
+  memcpy header + key + value into a local scratch buffer
+  s2 = load_acquire(e.seq);
+} while (s1 != s2);
+memcmp(scratch.key, requestedKey)    // verify, then decompress
+```
+
+Copy-then-validate is required: a torn read must be discarded, not acted on. The bounds check is defensive — the primary is trusted, but a corrupt length would otherwise be an out-of-bounds read.
+
+### Invalidation ring
+
+Rather than `worker.send()` per write per worker (`O(writes × workers)` IPC messages), the ring lives **in the arena**:
+
+```c
+struct Ring { _Atomic uint64_t head; uint32_t capacity; Record records[]; };
+struct Record { uint64_t hash; uint32_t version; uint16_t writerId; };
+```
+
+The primary appends on every write — `O(1)` regardless of worker count, zero IPC. Each worker keeps a private cursor and drains lazily at the top of each `get`/`set`: one relaxed load of `head`, a hot and usually-unchanged cache line. Records carry `writerId` so a worker skips invalidations caused by its own writes.
+
+If `head - cursor > capacity` the ring has wrapped past that worker; it flushes its entire L1. Safe, self-correcting, and bounded.
+
+---
+
+## 6. Data flow
+
+**`get(key)`**
+1. Drain invalidation ring (one atomic load, usually a no-op).
+2. `l1.get(key)` → hit: check TTL, bump CLOCK bit, return. **~21ns.**
+3. Miss → native L2 probe: rapidhash64 → open-address probe → seqlock read → `memcmp` key → LZ4 decompress if flagged → build JS value → insert into L1 → return. **~150–400ns**, size-dependent.
+4. Miss → `undefined`. (Future: fall through to L3, async only.)
+
+**`set(key, value, {ttlMs})`**
+1. *(Only if compression is explicitly enabled — it is **off by default**, see §9.)* Compress in the **worker** if `rawLen >= compressMinBytes` and LZ4 shrinks it by >12.5%.
+2. Insert into L1, evicting to stay under budget.
+3. Append to a per-tick outbox.
+4. Flush the outbox to the primary on `setImmediate` — one IPC message per tick, `serialization: 'advanced'` so `Buffer`s cross without base64.
+5. Return (synchronous).
+
+Compressing in the worker distributes ~200–250ns of CPU across all workers instead of concentrating it in the primary, and shrinks the IPC payload. The primary then only `memcpy`s the already-compressed blob — this is the "propagate without recomputing" property, preserved exactly.
+
+Batching means a `set` in worker A is visible to worker B after ~1 tick. **Documented, bounded staleness.**
+
+---
+
+## 7. Sizing
+
+Computed once at startup, then fixed. A fixed mapping is the single biggest simplification available — growing L2 would mean remapping in every live worker mid-read.
+
+| | formula | typical |
+|---|---|---|
+| L2 | `clamp(totalRAM × 1%, 16MB, 128MB)` | ~40MB on a 4GB host |
+| L1 | `clamp(heapLimit × 0.5%, 512KB, 2MB)` | ~1–2MB |
+
+Both overridable via constructor options.
+
+---
+
+## 8. Failure modes
+
+| Failure | Behaviour |
+|---|---|
+| Worker `SIGKILL`ed | Arena untouched — worker had no write permission. Its unflushed outbox is lost. |
+| Worker killed mid-read | Nothing held; no lock, no cleanup. |
+| Primary crashes | Arena goes stale. Primary bumps a `heartbeatNs` header field; a worker seeing it stale beyond threshold degrades to L1-only. Under `cluster` the workers usually die with it anyway. |
+| Ring wrap | Lagging worker flushes its whole L1. |
+| Layout change across versions | `magic` + `layoutVersion` in the header; mismatch refuses to attach rather than misreading. |
+| Corrupt length field | Bounds-checked before every `memcpy`. |
+| L1 arena fully pinned by live external strings | Fall back to copied heap strings until finalizers release slots. |
+
+**Security boundary:** the segment is uid-scoped, mode 0600. Any process running as the same user can read every cached value. This is not safe for untrusted co-tenants, and must be documented plainly.
+
+---
+
+## 9. Measurements
+
+Apple Silicon, Node 24.15.0, V8 13.6.233. Harness in `prototype/`.
+
+> **Payload entropy matters enormously.** An earlier draft of this document reported
+> LZ4 figures measured against `'x'.repeat(n)`, which compresses to nothing and is
+> ~16x faster to compress than real data. Every number below uses JSON-shaped
+> payloads with randomised field values (gzip 29–67%). Do not benchmark this
+> system with repetitive filler.
+
+### Call overhead
+
+| Operation | ns/op |
+|---|---|
+| JS no-op function | 0.9 |
+| Node-API no-op call | 8.1 |
+| Node-API, read latin1 string arg | 17.7 |
+| Node-API, arg + construct 200B string | 30.8 |
+| JS `Map.get` (cached string) | 19.2 |
+
+### String return strategy
+
+| bytes | copy out | external per call | `Map` holding external |
+|---|---|---|---|
+| 200 | 30.0 | 58.0 | 20.6 |
+| 1024 | 59.7 | 55.2 | 22.1 |
+| 16384 | 438.9 | 58.9 | 21.6 |
+| 262144 | 26350.3 | 55.8 | 21.4 |
+
+External-string cost is **flat ~56ns** irrespective of size; copy cost is linear.
+Crossover ~1KB. Caching the handle in a `Map` beats both at every size.
+
+### L2 arena, end to end, uncompressed
+
+`probe` = hash + index probe + `memcmp`. `getLen` = full seqlock read + copy.
+`get` = plus V8 string construction. All three allocators agree within noise.
+
+| bytes | probe | getLen | get (full) | set | JS `Map.get` |
+|---|---|---|---|---|---|
+| 64 | 26 | 36 | **42** | 45 | 17 |
+| 256 | 31 | 40 | **51** | 55 | 17 |
+| 1024 | 32 | 54 | **80** | 86 | 17 |
+| 4096 | 32 | 122 | **200** | 250 | 17 |
+| 16384 | 35 | 335 | **830** | 620 | 17 |
+
+An L2 hit is only ~2.5x an L1 hit for small values. The index probe is ~32ns and
+essentially flat — the cost is all in copying and decoding the value.
+
+### LZ4 on realistic data — the case against compression
+
+| bytes | ratio | compress | decompress | memcpy |
+|---|---|---|---|---|
+| 64 | 94% | 210ns | 8ns | 1ns |
+| 256 | 75% | 305ns | 24ns | 2ns |
+| 1024 | 64% | 806ns | 155ns | 9ns |
+| 4096 | 57% | 2984ns | 697ns | 37ns |
+| 16384 | 51% | 11919ns | 3034ns | 183ns |
+
+Measured through the real store, LZ4 is **the entire cost** of an operation:
+
+| bytes | get uncompressed | get compressed | set uncompressed | set compressed |
+|---|---|---|---|---|
+| 256 | 40ns | 75ns | 84ns | 388ns |
+| 1024 | 55ns | 205ns | 104ns | 1242ns |
+| 4096 | 117ns | 791ns | 249ns | 4671ns |
+| 16384 | 316ns | 3403ns | 749ns | 20118ns |
+
+Compression makes reads **2–10x slower** and writes **5–27x slower**, to buy
+roughly **2x density** — and it gets worse as values grow, so no size threshold
+rescues it. On a 32MB default arena, the alternative to compressing is simply
+allocating 64MB, which costs nothing anyone will notice.
+
+### Allocator comparison — hit rate at fixed capacity
+
+32MB arena, 60k keys, Zipf s=1.0, cache-aside, compression off. `SLAB` =
+size-class free lists + CLOCK. `LOG` = circular log, FIFO eviction.
+`LOG2` = circular log where a live entry with its reference bit set is
+re-appended at the head instead of dropped (CLOCK semantics on a log).
+
+| scenario | SLAB | LOG | **LOG2** |
+|---|---|---|---|
+| stable mixed sizes (64B–8KB), steady state | 71.7% | 72.3% | **75.0%** |
+| after a shift to larger values (new keys) | 50.0% | 55.2% | **58.1%** |
+| workload oscillating back to the earlier small keys | **87.6%** | 80.4% | 80.4% |
+
+`LOG2` wins the two realistic cases. `SLAB` wins only the third, and for a
+narrow reason: its stranded small-size classes are never reclaimed, so old
+small entries survive a large-value phase and are still there if the workload
+swings back. That is slab calcification being scored as a benefit by a
+contrived oscillation — the same stranding costs it 8 points in the row above.
+
+Write cost is identical across all three when the arena is not under pressure;
+`LOG2`'s re-append only does work during eviction, and is capped at 64
+relocations per allocation so a hot arena still makes progress.
+
+### Does compression make sense at all? — measured at fixed budget
+
+Compression is never a latency win; it is only ever a density win. Density only
+matters while the working set does not fit. So the question is whether trading
+latency for density ever beats simply buying the density with RAM.
+
+Same workload, varying the data region, `LOG2`, foreground compression on write:
+
+| data region | uncompressed hit / get | compressed (≥1KB) hit / get | compression buys |
+|---|---|---|---|
+| 16MB | 80.7% / 117ns | 85.5% / 355ns | +4.8 pts |
+| 32MB | 87.7% / 122ns | 89.9% / 371ns | +2.2 pts |
+| 64MB | 89.9% / 122ns | 89.9% / 352ns | **+0.0 pts** |
+
+Compression costs ~3x on reads and ~9x on writes (176ns → 1729ns) at every
+point, and its benefit decays to exactly nothing once the working set fits.
+
+**At every row, spending 2x the memory dominates compressing.** 32MB
+uncompressed (87.7%, 122ns) beats 16MB compressed (85.5%, 355ns) on *both*
+axes. 64MB uncompressed matches 32MB compressed on hit rate at a third of the
+read latency. Since L2 is one shared arena per host — not per worker — the
+memory in question is tens of megabytes.
+
+Break-even, if you genuinely cannot spend the RAM: the added cost is
+~0.85 × 230ns per hit plus ~0.15 × 1550ns per miss ≈ 420ns per operation, against
+a 4.8-point hit-rate gain. So compression pays only where a miss costs more than
+**~8.8µs** — which is true of a Valkey hop (~50–200µs) or a database query, and
+false of anything computed locally.
+
+Threshold and acceleration, if it is enabled:
+
+| policy | hit% | get(ns) | set(ns) |
+|---|---|---|---|
+| off | 80.7 | 117 | 182 |
+| ≥256B | 85.8 | 372 | 1909 |
+| **≥1KB** | **85.5** | **346** | **1729** |
+| ≥2KB | 84.8 | 321 | 1521 |
+| ≥4KB | 83.4 | 257 | 1027 |
+| ≥1KB, LZ4 accel=4 | 84.5 | 341 | 1488 |
+| ≥1KB, LZ4 accel=16 | 80.7 | 112 | 573 |
+
+A 1KB floor is the right default: below it, ratios are 75–94% so it is nearly
+pure cost. LZ4 acceleration does not rescue the write path — at accel=16 nothing
+clears the "12.5% smaller" bar at all, so it degenerates to compression being
+off. There is no setting that makes compression cheap.
+
+**Verdict: off by default, off in v1.** Retained as a per-cache opt-in
+(`compress: true`, floor 1KB) for deployments under a hard memory cap that
+cannot simply enlarge the arena.
+
+### Background compaction — prototyped, and rejected
+
+The idea: since the primary owns L2 and is off the read path, compress cold
+entries in the background, keeping writes fast and recovering density only
+under pressure. It was built and it works correctly. It is still not worth it.
+
+Design as built: capture candidates walking forward from the tail, compress on
+the **libuv threadpool**, apply back on the writer thread. Because a circular
+log cannot reclaim space in the middle, "compress" means re-append the smaller
+record at the head and repoint the index slot — i.e. LOG2's second chance, but
+compressed.
+
+**Race safety (works).** Only the LZ4 call is off-thread; capture and apply both
+run on the single writer thread, so the sole exposure is the window between
+them. It is closed by re-checking `(slot, offset, hash, version)` before
+publishing, and again after the allocation (which can evict the source).
+The `version` field is the global `++inserts` counter, so it is never reused —
+strictly stronger than a per-key counter, which would be ABA-vulnerable across
+an eviction and reinsertion of the same key. Compaction deliberately does not
+bump the version or touch the invalidation ring, since the value is unchanged.
+
+| test | result |
+|---|---|
+| every key overwritten during a widened 40ms window | **18,000 stale captures discarded, 0 wrong values, 0 resurrections** |
+| realistic 5% overwrite rate during the window | 4,103 applied / 212 discarded — **95% make progress**, 0 wrong values |
+
+**Value (does not justify it).** 16MB data region, 40k keys, Zipf s=1.0:
+
+| configuration | hit rate | entries resident | read latency | complexity |
+|---|---|---|---|---|
+| plain | 80.8% | 10,321 | 129ns | — |
+| + compaction, all entries near tail | 82.7% | 12,118 | **390ns (3.0x)** | async subsystem + race window |
+| + compaction, cold entries only | 80.8% | 10,175 | 285ns (2.2x) | same |
+| **plain, data region 16MB → 32MB** | **87.7%** | 20,459 | **121ns** | none |
+
+Restricting to cold entries cuts the latency penalty but erases the entire
+hit-rate gain — which is not a policy bug but the shape of the trade: the gain
+comes precisely from compressing data that gets read. Meanwhile utilisation
+falls to ~78%, because re-appending leaves garbage behind that the tail has not
+yet reclaimed, eating much of the density won.
+
+And simply doubling the arena — 16MB to 32MB, an amount nobody will notice —
+delivers **+6.9 points, 3.6x the gain of compaction, at no latency cost and no
+complexity.** The hit-rate curve then saturates near 64MB for this working set.
+
+Conclusion: do not build it. The entry format keeps the `COMPRESSED` flag so a
+genuinely memory-constrained deployment can opt in later.
+
+### Two gaps found by measurement — both now fixed
+
+**Gap 1: workers could not set CLOCK reference bits.** Reads happen in workers
+holding a `PROT_READ` mapping, so they could not write a reference bit; every
+earlier `LOG2` benchmark ran in-process where the reader *was* the writer.
+Suppressing bit-setting collapsed `LOG2` (80.8%) to `LOG` (78.7%) — the entire
+advantage.
+
+*Fixed* with a **separate hints segment**: one byte per index slot, in its own
+`shm` object opened `O_RDWR` by workers, while the arena's own descriptor stays
+`O_RDONLY`. Isolation is therefore a property of the file descriptor, not merely
+of the mapping — a worker cannot map the arena writable even deliberately, but
+can still record what it read. The read path loads before storing, so a hot
+entry already marked skips the store and workers do not ping-pong the cache line.
+
+Verified end to end: a worker attached read-only, read exactly 100 of 5000 keys,
+and the primary observed **exactly 100 reference bits set**. Arena writes from a
+worker still fault with SIGBUS.
+
+**Gap 2: tombstones accumulated without bound.** `HASH_TOMB` was never reclaimed
+and `findSlot` stops only at `HASH_EMPTY`, so probes degraded to full-table
+scans — 45ns → 342ns at **3% load factor**, and up to ~33µs with a larger live set.
+
+*Fixed* with **backward-shift deletion** (Knuth 6.4 Algorithm R), which closes
+the gap by relocating entries instead of leaving a marker, plus a **75% index
+load ceiling** so the index can never saturate before the data region (which
+previously caused inserts to fail silently).
+
+| cumulative inserts | live | before | after |
+|---|---|---|---|
+| 65,536 | 2,001 | 45ns | 31ns |
+| 400,000 | 2,001 | 342ns | 29ns |
+| 1,000,000 | 49,152 | ~33,000ns | 41ns |
+
+Probe cost is now flat. Live entries cap cleanly at 49,152 (75% of 65,536)
+instead of drifting to 59,074 while inserts silently failed.
+
+### A silent data-corruption bug, and a correction
+
+Stress-testing the fixes surfaced a **pre-existing** bug that invalidates an
+earlier claim in this document. The reported "22,257,202 reads, 0 torn values"
+was **under-stressed**: the arena was large enough that the log rarely wrapped
+over an offset a reader was holding. Tuned to force wrap-around (2MB arena, 800
+keys, 6 readers) the original code produces **3–7 corrupt reads per ~24M**, and
+it is present with or without the index changes.
+
+Two distinct defects:
+
+**a) Second-chance re-append wrote without checking for room.** `logDropTail`
+relocated a surviving entry to the head, but that branch only runs while the log
+is under allocation pressure — precisely when free space is scarce. It could
+overwrite live records near the tail whose index slots still pointed at them.
+Fixed by requiring `freeBytes >= bsz` before writing.
+
+**b) The seqlock cannot detect log reuse.** A seqlock protects an *in-place
+rewrite* of an entry. When an entry is evicted and the head wraps over its bytes,
+that address is no longer an `Entry` header at all — `e->seq` becomes somebody
+else's payload and can read as stable and even twice in a row. Because the same
+keys are rewritten repeatedly, those bytes frequently hold an **older copy of the
+same key**, so `memcmp` passes too, and a stale or torn value is returned.
+
+*Fixed* by making index slots store the **monotonic log position** rather than a
+physical offset (physical address is `pos & (dataBytes-1)`). The position never
+wraps, so it can express liveness that an offset cannot: the bytes at `pos`
+belong to record `pos` exactly while `logTail <= pos`. The reader loads the
+published tail *after* copying; since the tail only advances, observing
+`tailPub <= pos` proves the record was live for the entire copy.
+
+This is the load-bearing correctness argument of the whole read path and should
+be the first thing any reviewer checks.
+
+After both fixes, the same wrap-heavy stress across five configurations —
+~90M reads against ~28M concurrent writes — reports **0 corrupt reads**, and
+read latency is unchanged (43/52/80/205/741ns at 64B–16KB).
+
+### Arena sizing validation
+
+`create()` did not check that header + index + ring actually fit. A 1MB segment
+with 65,536 index slots (1MB of index alone) underflowed `totalBytes - dataOff`
+into a huge unsigned value and hung. Now rejected, along with a non-power-of-two
+`indexSlots`.
+
+### Architecture validation### Architecture validation
+
+| Claim | Result |
+|---|---|
+| Workers read a live arena through `PROT_READ` while the primary writes | **22,257,202 cross-process reads against 11,660,000 concurrent writes, 0 torn or wrong values** (4 forked readers, 5s, blocks constantly reused at changing sizes) |
+| A worker cannot corrupt the arena | Write through a worker mapping faults with **SIGBUS**; primary reads correctly afterwards. Enforced by the MMU, not by convention. |
+
+Seqlock correctness needs TSAN before this is trusted in production — 22M clean
+reads is strong evidence, not proof.
+
+## 10. Why not V8 fast calls
+
+The original premise. It does not survive contact:
+
+1. **The header is not shipped.** `v8-fast-api-calls.h` is absent from Node's public headers on 22.20.0, 24.14.0 and 24.15.0. In `v8-template.h`, `CFunction` is only forward-declared (line 21) — you can pass a `CFunction*` but cannot construct one. Node core uses fast calls because it builds against the full V8 tree. Using them from an addon means vendoring an unsupported internal header pinned to V8 13.6.233, where a layout mismatch is a runtime crash, not a build error.
+2. **The prize is ~6ns.** A Node-API no-op is 8.1ns; a fast call would be ~2ns. Against ~21ns for an L1 hit and ~150ns+ for an L2 hit, that is noise.
+3. **Node-API is worth more than 6ns.** A stable ABI means one prebuild per platform works on every current and future Node major — no rebuild treadmill, which was the largest recurring maintenance cost in the original plan.
+
+Also, fast calls only accept `const FastOneByteString&`, so any two-byte key would have deoptimized to the slow path regardless.
+
+---
+
+## 11. Testing
+
+- **Unit (native):** hash table probing and tombstones, slab allocator, LZ4 round-trip, seqlock under a deliberately racing writer.
+- **Sanitizers:** ASAN + UBSAN builds in CI; **TSAN specifically for the seqlock**, which is the only lock-free code in the design.
+- **Multi-process integration:** fork N workers, run randomized op streams against a JS `Map` reference model, assert every read is either correct-current or correct-stale-within-bound.
+- **Crash tests:** `SIGKILL` a worker mid-`set`; assert the arena stays readable and self-consistent, and that surviving workers are unaffected.
+- **Fuzzing:** feed the entry decoder adversarial arena bytes (corrupt lengths, torn seq values) and assert no out-of-bounds access.
+- **GC-pressure tests:** hold long-lived references to external-string values, assert the pinned-bytes fallback engages and no use-after-free occurs.
+- **Benchmarks:** L1 hit, L2 hit, miss, `set`, versus `lru-cache` and Redis over a unix socket.
+
+---
+
+## 12. Decision log
+
+| # | Decision | Alternatives | Rationale |
+|---|---|---|---|
+| 1 | L2 in a shared arena, primary is sole writer; workers map it read-only | multi-writer shared memory; IPC request/response to primary | Sync reads with no cross-process locks and no macOS robust-mutex problem; a worker cannot corrupt the arena, and the primary is off the read path |
+| 2 | Fully synchronous v1 API; async arrives as separate methods with L3 | `Promise` API from day one | Promise alloc + microtask tick is 100–300ns on a ~21ns operation; would pay the L3 tax for years before L3 exists |
+| 3 | rapidhash **64**-bit + `memcmp` verification | 64-bit unverified; 128-bit unverified | Key text is stored for L3 anyway, so verification is nearly free — exactly correct instead of probabilistic, 8 bytes smaller, and enumeration stays possible |
+| 4 | Values limited to `string` / `Buffer` / `Uint8Array` / `ArrayBuffer` | `v8::ValueSerializer` for arbitrary `any` | Structured clone costs 0.5–3µs and would dominate every other cost in the system |
+| 5 | **L1 is a JS `Map`, not a native store** | native off-heap L1 | Measured: `Map` ~20ns/hit with zero allocation vs native 30ns (200B) to 439ns (16KB), allocating a fresh V8 string every hit |
+| 6 | Large L1 values as external strings created once at insert | copy on every hit; externalize on every call | Flat ~21ns hits at any size with bytes off-heap; per-call externalization (~56ns) loses to copying below 1KB |
+| 7 | Strings by reference, buffers copied | all by reference; frozen buffers | Immutability makes string sharing free and safe; mutable buffers would let one caller corrupt every reader |
+| 8 | Invalidation via shared-memory ring buffer | IPC broadcast; per-entry version check on hit | `O(1)` per write regardless of worker count, zero IPC, and L1 hits touch one hot cache line instead of a cold per-entry one |
+| 9 | CLOCK / sampled eviction | strict LRU | Strict LRU costs `delete`+`set` (~50–80ns) on every `Map` hit — more than tripling hit cost |
+| 10 | **LZ4 off by default and in v1**; per-cache opt-in with a 1KB floor | compress above a threshold; compress in both layers | **Overturned by measurement.** Compression is a density win only, costing ~3x reads and ~9x writes. At a fixed 16MB budget it buys +4.8 points, but 32MB uncompressed beats 16MB compressed on *both* hit rate and latency, and the benefit reaches exactly zero once the working set fits. L2 is one arena per host, so the RAM is trivial. Justified only under a hard memory cap, where a miss must also cost >8.8µs. |
+| 11 | When compression *is* enabled, the worker performs it | in the primary, synchronously | Distributes CPU across workers, shrinks IPC payloads, preserves `memcpy`-only propagation in the primary. Open: the primary's sweeper could instead compress cold entries in the background, keeping writes fast and recovering density only under pressure. |
+| 12 | **Node-API, no V8 fast calls** | direct V8 with a vendored `v8-fast-api-calls.h` | The header is not shipped and `CFunction` is incomplete; the prize is ~6ns; Node-API's stable ABI removes the per-Node-major rebuild treadmill |
+| 13 | Sizes computed at startup, then fixed | runtime-adaptive L2 | Growing L2 requires remapping in every live worker mid-read; a fixed mapping is the largest available simplification |
+| 14 | Batched, fire-and-forget writes to the primary | synchronous write-through | Keeps `set()` off the IPC critical path; costs ~1 tick of cross-worker staleness |
+| 15 | Current LTS, darwin + linux, x64 + arm64 | Windows in v1 | Windows needs `CreateFileMapping` — a second shared-memory implementation |
+| 17 | **No background compaction** | async compress-on-the-threadpool with version-validated apply | Built and proven race-safe (18k stale captures correctly discarded, 0 wrong values), but worth only +1.9 points of hit rate at 3x read latency, while doubling the arena buys +6.9 points at no cost. Restricting to cold entries removes the latency penalty *and* the entire benefit. |
+| 20 | **Arena sizing and `indexSlots` validated at create time** | trust the caller | A too-small segment underflowed into a hang; a non-power-of-two slot count breaks the probe mask |
+| 19 | **Index slots hold the monotonic log position, not a physical offset** | physical offsets + seqlock alone | A seqlock cannot detect log reuse: once the head wraps over an evicted entry, its `seq` field is another record's payload. A monotonic position lets a reader prove liveness with `tailPub <= pos`. Closes a silent stale/torn-read bug. |
+| 18 | **Reference bits live in a separate hints segment**, workers map it `O_RDWR` while the arena fd stays `O_RDONLY` | reference bit inside the entry | Workers do the reads but cannot write the arena, so in-entry bits were never set and second chance never fired. Isolation is preserved at descriptor level; a bad worker can only degrade eviction quality. |
+| 17b | **Backward-shift deletion + 75% index load ceiling** | tombstones | Tombstones were never reclaimed, degrading probes to full-table scans at 3% load. Probe cost is now flat over 1M inserts. |
+| 16 | **L2 data region is a circular log with second-chance re-append (`LOG2`)** | size-class slabs + CLOCK; plain FIFO log | Measured best hit rate in both realistic scenarios (+3.3 and +8.1 points over slab); zero external fragmentation; no slab calcification and no per-class rebalancing to build. Slab wins only a contrived size-oscillation case, and wins it *because* of calcification. |
+
+---
+
+## 13. Open questions
+
+1. **`clear()` scope.** Proposed: clears the caller's L1, asks the primary to clear L2, and appends a flush-all record to the ring so every worker drops its L1. That is a large cross-process side effect from an innocuous-looking call — worth a `clearLocal()` companion.
+2. **Atomic RMW** (`incr`, `cas`). Proposed out of scope for v1. With a single writer, these are actually easy to add later — the primary can serialize them trivially.
+3. **Multiple named caches.** Proposed: one arena, with `namespace` prefixed into the key before hashing. Simple, but namespaces then share one eviction budget and cannot be sized independently.
+4. **Ring capacity.** Needs a number. Too small and workers flush L1 spuriously under write bursts; too large and it wastes arena bytes. Wants measurement against a realistic write rate.
+5. ~~**L2 index structure.**~~ **Settled by the prototype** — see decision 16 and §9. Open addressing for the index, circular log with second-chance re-append for the data region.
+6. **Background compression.** Since the primary owns L2 and is off the read path, its sweeper could compress cold entries under memory pressure — keeping writes fast while recovering density only when it is actually needed. This is probably the right answer for compression, but it is unbuilt and unmeasured.
+7. **Second-chance budget.** The prototype caps re-appends at 64 per allocation, chosen arbitrarily. Needs tuning against a realistic write rate.
+
+---
+
+## 14. Assumptions
+
+| Area | Assumption |
+|---|---|
+| L1 hit | ~21ns (measured, `Map` lookup) |
+| L2 hit | 42ns @64B, 51ns @256B, 80ns @1KB, 200ns @4KB, 830ns @16KB (**measured**, uncompressed) |
+| `set` | 45ns @64B, 86ns @1KB, 620ns @16KB (**measured**, uncompressed) |
+| Cross-worker write visibility | ~1 event-loop tick |
+| Entry count | up to ~100k in L2 at typical value sizes |
+| Worker count | up to 32 |
+| Max value size | 1MB, configurable, hard-capped by arena size |
+| Durability | none — cache only; the arena dies with the primary |
+| Security | uid-scoped, mode 0600; **any same-user process can read all cached data** |
+| Maintenance | solo maintainer; one prebuild per platform, stable across Node majors |
