@@ -515,7 +515,147 @@ with 65,536 index slots (1MB of index alone) underflowed `totalBytes - dataOff`
 into a huge unsigned value and hung. Now rejected, along with a non-power-of-two
 `indexSlots`.
 
-### Architecture validation### Architecture validation
+### Comparison against the Bugsee appserver cache
+
+Measured against `Bugsee/appserver/code/components/shared/cache`, a production
+implementation of the same shape: L1 `JsonLru` per worker, L2 in the primary's
+heap reached over `cluster` IPC, plus TTL, alias refs and an L3 adapter.
+Both sized identically (L1 2MB/worker, L2 256MB), same Zipf s=1.0 workload,
+90% read / 10% write, cache-aside, shared keyspace. Harness in `bench/`.
+
+**Single process** — neither cache has an IPC peer, so this is each engine's
+in-process fast path. Values are objects, so *both* pay a JSON encode/decode at
+the application boundary (bugsee internally, turbocache in the caller).
+
+| scenario | turbocache | bugsee | hit rate (tc / bs) |
+|---|---|---|---|
+| 60k keys, exceeds L1 | 304k ops/s | **321k ops/s** | 87.4% / 58.4% |
+| 1k hot keys, fits L1 | **440k ops/s** | 392k ops/s | 99.7% / 99.7% |
+| 60k keys, **opaque string values** | **1,722k ops/s** | 530k ops/s | 87.4% / 56.8% |
+
+With object values the JSON codec dominates and the two are within ~10% — bugsee
+is actually *faster* on the large working set, because in a single process its
+misses cost nothing (no L2 to consult) while turbocache pays a real L2 lookup.
+The 3.2x gap appears only with opaque payloads, where turbocache stores bytes
+verbatim and bugsee's JSON-only API must still encode.
+
+**Cluster, 1 primary + 4 workers** — this is where the architectures separate.
+
+| workers | turbocache | hit rate | bugsee | hit rate |
+|---|---|---|---|---|
+| 1 | 212k ops/s | 82.2% | 62k ops/s | 82.2% |
+| 2 | 381k ops/s | 87.3% | 87k ops/s | 69.1% |
+| 4 | **674k ops/s** | **91.8%** | 79k ops/s | 30.6% |
+
+turbocache scales close to linearly because reads never touch the primary.
+bugsee plateaus near 80k regardless of worker count: every L1 miss is an IPC
+round-trip through one event loop, and past saturation its client either times
+out (100ms) or hits the 256-request pending cap, resolving `undefined` — which
+the application sees as a miss. Its L2 is not the problem; both L2s held exactly
+49,146 entries (62MB of 256MB), so the data was there and simply could not be
+reached in time. This is the bottleneck predicted in decision 1, measured.
+
+At 4 workers with object values: p50 4.0µs vs 56µs, p99 19µs vs 115µs,
+p99.9 173µs vs 4.7ms. With opaque string values, 1,540k vs 72k ops/s.
+
+**Caveats that matter for reading these numbers:**
+
+1. **The write paths are not equivalent.** turbocache's `set` is fire-and-forget
+   — buffered and batched to the primary, unacknowledged, visible to other
+   workers about a tick later. bugsee's `set` awaits an ack. turbocache is
+   trading write visibility for speed, and part of its margin is that trade
+   rather than pure efficiency.
+2. **bugsee is complete; turbocache is a prototype.** TTL, alias refs, an L3
+   adapter, key validation, backpressure and worker-death handling all cost work
+   per operation that turbocache simply does not do yet.
+3. **Single-process misses are unrealistically cheap here.** A miss just refills
+   from a pre-built value. In a real service a miss costs a database query, so
+   the hit-rate column would dominate throughput far more than it does above.
+
+### A tension this exposed between decisions 4 and 5
+
+Decision 4 limits values to bytes and strings; decision 5 says L1 caches the
+*decoded* value so hits skip decoding. When the application stores objects,
+these conflict: the cache only ever sees the encoded string, so L1 caches a
+string and the application re-parses it on **every hit** — exactly the cost
+decision 5 was meant to remove. It is why scenario A above shows no advantage.
+
+Options, none yet chosen: let callers supply a codec so L1 can hold decoded
+values; add an opt-in JSON mode; or accept it and document that turbocache's
+advantage is for opaque payloads and cross-process scaling, not for object
+workloads in a single process.
+
+### Architecture validation### Comparison against the Bugsee appserver cache
+
+Measured against `Bugsee/appserver/code/components/shared/cache`, a production
+implementation of the same shape: L1 `JsonLru` per worker, L2 in the primary's
+heap reached over `cluster` IPC, plus TTL, alias refs and an L3 adapter.
+Both sized identically (L1 2MB/worker, L2 256MB), same Zipf s=1.0 workload,
+90% read / 10% write, cache-aside, shared keyspace. Harness in `bench/`.
+
+**Single process** — neither cache has an IPC peer, so this is each engine's
+in-process fast path. Values are objects, so *both* pay a JSON encode/decode at
+the application boundary (bugsee internally, turbocache in the caller).
+
+| scenario | turbocache | bugsee | hit rate (tc / bs) |
+|---|---|---|---|
+| 60k keys, exceeds L1 | 304k ops/s | **321k ops/s** | 87.4% / 58.4% |
+| 1k hot keys, fits L1 | **440k ops/s** | 392k ops/s | 99.7% / 99.7% |
+| 60k keys, **opaque string values** | **1,722k ops/s** | 530k ops/s | 87.4% / 56.8% |
+
+With object values the JSON codec dominates and the two are within ~10% — bugsee
+is actually *faster* on the large working set, because in a single process its
+misses cost nothing (no L2 to consult) while turbocache pays a real L2 lookup.
+The 3.2x gap appears only with opaque payloads, where turbocache stores bytes
+verbatim and bugsee's JSON-only API must still encode.
+
+**Cluster, 1 primary + 4 workers** — this is where the architectures separate.
+
+| workers | turbocache | hit rate | bugsee | hit rate |
+|---|---|---|---|---|
+| 1 | 212k ops/s | 82.2% | 62k ops/s | 82.2% |
+| 2 | 381k ops/s | 87.3% | 87k ops/s | 69.1% |
+| 4 | **674k ops/s** | **91.8%** | 79k ops/s | 30.6% |
+
+turbocache scales close to linearly because reads never touch the primary.
+bugsee plateaus near 80k regardless of worker count: every L1 miss is an IPC
+round-trip through one event loop, and past saturation its client either times
+out (100ms) or hits the 256-request pending cap, resolving `undefined` — which
+the application sees as a miss. Its L2 is not the problem; both L2s held exactly
+49,146 entries (62MB of 256MB), so the data was there and simply could not be
+reached in time. This is the bottleneck predicted in decision 1, measured.
+
+At 4 workers with object values: p50 4.0µs vs 56µs, p99 19µs vs 115µs,
+p99.9 173µs vs 4.7ms. With opaque string values, 1,540k vs 72k ops/s.
+
+**Caveats that matter for reading these numbers:**
+
+1. **The write paths are not equivalent.** turbocache's `set` is fire-and-forget
+   — buffered and batched to the primary, unacknowledged, visible to other
+   workers about a tick later. bugsee's `set` awaits an ack. turbocache is
+   trading write visibility for speed, and part of its margin is that trade
+   rather than pure efficiency.
+2. **bugsee is complete; turbocache is a prototype.** TTL, alias refs, an L3
+   adapter, key validation, backpressure and worker-death handling all cost work
+   per operation that turbocache simply does not do yet.
+3. **Single-process misses are unrealistically cheap here.** A miss just refills
+   from a pre-built value. In a real service a miss costs a database query, so
+   the hit-rate column would dominate throughput far more than it does above.
+
+### A tension this exposed between decisions 4 and 5
+
+Decision 4 limits values to bytes and strings; decision 5 says L1 caches the
+*decoded* value so hits skip decoding. When the application stores objects,
+these conflict: the cache only ever sees the encoded string, so L1 caches a
+string and the application re-parses it on **every hit** — exactly the cost
+decision 5 was meant to remove. It is why scenario A above shows no advantage.
+
+Options, none yet chosen: let callers supply a codec so L1 can hold decoded
+values; add an opt-in JSON mode; or accept it and document that turbocache's
+advantage is for opaque payloads and cross-process scaling, not for object
+workloads in a single process.
+
+### Architecture validation
 
 | Claim | Result |
 |---|---|

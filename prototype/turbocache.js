@@ -1,0 +1,130 @@
+'use strict';
+// Thin JS layer over the L2 prototype, implementing the architecture in DESIGN.md:
+//   L1  - per-worker JS Map with a byte budget (values are decoded strings)
+//   L2  - shared arena; primary is the sole writer, workers map it read-only
+//   writes - worker buffers, then batches to the primary over cluster IPC
+//   coherence - workers drain the shared invalidation ring and drop stale L1 entries
+const cluster = require('cluster');
+const native = require('./build/Release/l2.node');
+
+const MSG = 'tc';
+
+class TurboCache {
+    #l1 = new Map();          // key -> { v, bytes, hits }
+    #byHash = new Map();      // hash hex -> key   (ring records carry hashes)
+    #l1Bytes = 0;
+    #l1Max;
+    #outbox = [];
+    #flushScheduled = false;
+    #cursor = 0;
+    #id;
+    #attached = false;
+    stats = { l1Hits: 0, l2Hits: 0, misses: 0, sets: 0, invalidated: 0, flushes: 0, sent: 0 };
+
+    constructor(opts = {}) {
+        this.#l1Max = opts.l1MaxBytes || 2 * 1024 * 1024;
+        this.#id = opts.workerId || 0;
+        this.#attached = opts.attached !== false;
+    }
+
+    // --- lifecycle -------------------------------------------------------
+    static createPrimary(name, arenaBytes, indexSlots) {
+        if (!native.create(name, arenaBytes, indexSlots, 2)) throw new Error('arena create failed');
+        native.setCompressMin(1 << 30);                 // compression off, per DESIGN.md
+        return new TurboCache({ workerId: 0 });
+    }
+    static attachWorker(name, workerId, opts = {}) {
+        if (!native.attach(name)) throw new Error('arena attach failed');
+        return new TurboCache({ ...opts, workerId });
+    }
+
+    // --- L1 --------------------------------------------------------------
+    #l1Put(key, v, hash) {
+        const bytes = key.length + v.length + 64;
+        const prev = this.#l1.get(key);
+        if (prev) this.#l1Bytes -= prev.bytes;
+        this.#l1.set(key, { v, bytes, hits: 1 });
+        this.#byHash.set(hash, key);
+        this.#l1Bytes += bytes;
+        // FIFO with second chance: Map preserves insertion order, so the oldest
+        // entry is first. A entry that has been read again gets one reprieve.
+        while (this.#l1Bytes > this.#l1Max) {
+            const it = this.#l1.entries().next();
+            if (it.done) break;
+            const [k, e] = it.value;
+            this.#l1.delete(k);
+            if (e.hits > 1) { e.hits = 1; this.#l1.set(k, e); continue; }   // re-queue
+            this.#l1Bytes -= e.bytes;
+        }
+    }
+    #l1Drop(key) {
+        const e = this.#l1.get(key);
+        if (!e) return;
+        this.#l1Bytes -= e.bytes;
+        this.#l1.delete(key);
+    }
+
+    // --- coherence -------------------------------------------------------
+    // The primary is the sole writer, so its own L1 is authoritative and it has
+    // nothing to drain. Workers check one hot counter, which is usually
+    // unchanged, before paying for a real drain.
+    #drain() {
+        if (this.#id === 0) return;
+        if (native.ringHead() === this.#cursor) return;
+        const r = native.ringRead(this.#cursor, 512);
+        if (r.wrapped) {                       // fell too far behind: flush wholesale
+            this.#l1.clear(); this.#byHash.clear(); this.#l1Bytes = 0;
+            this.#cursor = r.head;
+            return;
+        }
+        for (let i = 0; i < r.hashes.length; i++) {
+            if (r.writers[i] === this.#id) continue;      // our own write; L1 already correct
+            const k = this.#byHash.get(r.hashes[i]);
+            if (k !== undefined) { this.#l1Drop(k); this.#byHash.delete(r.hashes[i]); this.stats.invalidated++; }
+        }
+        this.#cursor = r.head;
+    }
+
+    // --- public API (synchronous) ---------------------------------------
+    get(key) {
+        this.#drain();
+        const e = this.#l1.get(key);
+        if (e !== undefined) { e.hits++; this.stats.l1Hits++; return e.v; }
+        const v = native.get(key);
+        if (v === undefined) { this.stats.misses++; return undefined; }
+        this.stats.l2Hits++;
+        this.#l1Put(key, v, native.hashKey(key));
+        return v;
+    }
+
+    set(key, value) {
+        this.stats.sets++;
+        this.#l1Put(key, value, native.hashKey(key));
+        if (this.#id === 0) { native.set(key, value, 0); return; }   // primary writes directly
+        this.#outbox.push(key, value);
+        if (!this.#flushScheduled) {
+            this.#flushScheduled = true;
+            setImmediate(() => this.flush());
+        }
+    }
+
+    flush() {
+        this.#flushScheduled = false;
+        if (!this.#outbox.length) return;
+        const batch = this.#outbox;
+        this.#outbox = [];
+        this.stats.flushes++;
+        this.stats.sent += batch.length / 2;
+        process.send({ t: MSG, id: this.#id, b: batch });
+    }
+
+    // Primary side: apply a worker's batch to L2.
+    static applyBatch(msg) {
+        const b = msg.b;
+        for (let i = 0; i < b.length; i += 2) native.set(b[i], b[i + 1], msg.id);
+    }
+    static isCacheMessage(m) { return m && m.t === MSG; }
+    static native() { return native; }
+}
+
+module.exports = { TurboCache, MSG };

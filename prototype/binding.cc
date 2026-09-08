@@ -49,7 +49,7 @@ static napi_value SetCompressMin(napi_env env, napi_callback_info info) {
 
 // set(key, value) - value is a latin1 string in this prototype
 static napi_value Set(napi_env env, napi_callback_info info) {
-  ARG(2)
+  ARG(3)
   char key[512]; size_t klen = 0;
   napi_get_value_string_latin1(env, argv[0], key, sizeof(key), &klen);
   size_t vlen = 0;
@@ -67,7 +67,10 @@ static napi_value Set(napi_env env, napi_callback_info info) {
       payload = cbuf; storedLen = (uint32_t)c; flags |= FLAG_COMPRESSED;
     }
   }
-  bool ok = storeSet(g, (const uint8_t *)key, (uint16_t)klen, payload, storedLen, rawLen, flags, 0, 0);
+  int32_t writerId = 0;
+  if (argc > 2) napi_get_value_int32(env, argv[2], &writerId);
+  bool ok = storeSet(g, (const uint8_t *)key, (uint16_t)klen, payload, storedLen, rawLen,
+                     flags, 0, (uint16_t)writerId);
   napi_value r; napi_get_boolean(env, ok, &r); return r;
 }
 
@@ -231,6 +234,58 @@ static napi_value CompactAsync(napi_env env, napi_callback_info info) {
   napi_value out; napi_create_int32(env, (int32_t)j->items.size(), &out); return out;
 }
 
+// hashKey(key) -> hex string, so JS can map ring records back to L1 entries
+static napi_value HashKey(napi_env env, napi_callback_info info) {
+  ARG(1) char key[512]; size_t klen = 0;
+  napi_get_value_string_latin1(env, argv[0], key, sizeof(key), &klen);
+  uint64_t hv = rapidhash(key, klen, 0);
+  if (hv <= HASH_TOMB) hv += 2;
+  char buf[24]; snprintf(buf, sizeof(buf), "%llx", (unsigned long long)hv);
+  napi_value r; napi_create_string_latin1(env, buf, NAPI_AUTO_LENGTH, &r); return r;
+}
+
+// ringRead(cursor, max) -> { head, wrapped, hashes: [hex...] }
+// Workers drain this to invalidate their L1. `wrapped` means the worker fell so
+// far behind that records were lost, and it must flush L1 wholesale.
+// Cheap head read: one relaxed load, no allocation. The drain fast path.
+static napi_value RingHead(napi_env env, napi_callback_info) {
+  napi_value r;
+  napi_create_double(env, (double)g.h->ringHead.load(std::memory_order_acquire), &r);
+  return r;
+}
+
+static napi_value RingRead(napi_env env, napi_callback_info info) {
+  ARG(2)
+  double cd; int32_t maxN;
+  napi_get_value_double(env, argv[0], &cd);
+  napi_get_value_int32(env, argv[1], &maxN);
+  uint64_t cursor = (uint64_t)cd;
+  Header *h = g.h;
+  uint64_t head = h->ringHead.load(std::memory_order_acquire);
+  bool wrapped = (head - cursor) > h->ringCap;
+  if (wrapped) cursor = head > h->ringCap ? head - h->ringCap : 0;
+
+  napi_value arr; napi_create_array(env, &arr);
+  napi_value writers; napi_create_array(env, &writers);
+  uint32_t n = 0;
+  for (uint64_t p = cursor; p < head && (int32_t)n < maxN; p++, n++) {
+    RingRec *r = &g.ring[p & (h->ringCap - 1)];
+    char buf[24]; snprintf(buf, sizeof(buf), "%llx", (unsigned long long)r->hash);
+    napi_value s; napi_create_string_latin1(env, buf, NAPI_AUTO_LENGTH, &s);
+    napi_set_element(env, arr, n, s);
+    napi_value w; napi_create_int32(env, r->writerId, &w);
+    napi_set_element(env, writers, n, w);
+  }
+  napi_value o; napi_create_object(env, &o);
+  put(env, o, "head", (double)(cursor + n));
+  put(env, o, "ringHead", (double)head);
+  napi_value w; napi_get_boolean(env, wrapped, &w);
+  napi_set_named_property(env, o, "wrapped", w);
+  napi_set_named_property(env, o, "hashes", arr);
+  napi_set_named_property(env, o, "writers", writers);
+  return o;
+}
+
 static napi_value ClearHints(napi_env env, napi_callback_info) {
   memset(g.hints, 0, g.h->hintsBytes); return nullptr;
 }
@@ -288,7 +343,7 @@ static napi_value Init(napi_env env, napi_value exports) {
   FN("create", Create) FN("attach", Attach) FN("set", Set) FN("get", Get)
   FN("getLen", GetLen) FN("probe", Probe) FN("stats", Stats)
   FN("destroy", Destroy) FN("poke", Poke)
-  FN("suppressRefBit", SetSuppressRefBit) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin)
+  FN("suppressRefBit", SetSuppressRefBit) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin)
   return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)
