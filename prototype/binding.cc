@@ -490,11 +490,12 @@ static napi_value RingRead(napi_env env, napi_callback_info info) {
 }
 
 static napi_value ClearHints(napi_env env, napi_callback_info) {
-  memset(g.hints, 0, g.h->hintsBytes); return nullptr;
+  for (uint64_t i = 0; i < g.h->indexSlots; i++) g.hints[i].store(0, std::memory_order_relaxed);
+  return nullptr;
 }
 static napi_value HintsSet(napi_env env, napi_callback_info) {
   uint64_t n = 0;
-  for (uint64_t i = 0; i < g.h->indexSlots; i++) if (g.hints[i]) n++;
+  for (uint64_t i = 0; i < g.h->indexSlots; i++) if (g.hints[i].load(std::memory_order_relaxed)) n++;
   napi_value r; napi_create_double(env, (double)n, &r); return r;
 }
 static napi_value SetBackwardShift(napi_env env, napi_callback_info info) {
@@ -522,6 +523,13 @@ static napi_value Poke(napi_env env, napi_callback_info) {
   napi_value r; napi_get_boolean(env, true, &r); return r;
 }
 
+// Largest value the arena can accept, so a worker can reject locally instead of
+// queuing something the primary will silently drop.
+static napi_value MaxValueBytes(napi_env env, napi_callback_info) {
+  double n = (double)(g.h->dataBytes / 2) - (double)sizeof(Entry);
+  napi_value r; napi_create_double(env, n < 0 ? 0 : n, &r); return r;
+}
+
 static napi_value Stats(napi_env env, napi_callback_info) {
   napi_value o; napi_create_object(env, &o);
   Header *h = g.h;
@@ -544,7 +552,7 @@ static napi_value Destroy(napi_env env, napi_callback_info) { g.destroy(); retur
                        napi_set_named_property(env, exports, name, f); }
 static napi_value Init(napi_env env, napi_value exports) {
   FN("create", Create) FN("attach", Attach) FN("set", Set) FN("get", Get)
-  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("probe", Probe) FN("stats", Stats)
+  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes)
   FN("destroy", Destroy) FN("poke", Poke)
   FN("suppressRefBit", SetSuppressRefBit) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin)
   return exports;

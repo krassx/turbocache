@@ -32,6 +32,10 @@ if (cluster.isPrimary) {
     cache.set('from-worker-' + id, 'w' + id);
     checks.push([cache.get('from-worker-' + id) === 'w' + id, 'worker reads its own write from L1']);
     checks.push([cache.has('from-primary') === true, 'has() works in a worker']);
+    // a worker must not report success for something the primary would drop
+    checks.push([cache.set('oversized', 'x'.repeat(80 * 1024 * 1024)) === false,
+                 'worker rejects an oversized value at the call site']);
+    checks.push([cache.set('sized-ok', 'y') === true, 'worker accepts a normal value']);
     cache.flush();                                             // push the batch to the primary
     setTimeout(() => {
         const bad = checks.find(c => !c[0]);

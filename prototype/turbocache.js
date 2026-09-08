@@ -21,6 +21,7 @@ class TurboCache {
     #flushScheduled = false;
     #cursor = 0;
     #ns = '';
+    #maxValue = 0;
     #id;
     #codec;
     #l1Decoded = true;
@@ -41,6 +42,7 @@ class TurboCache {
     // value is already opaque bytes and L1 is optimal as-is.
     constructor(opts = {}) {
         this.#ns = opts.namespace ? opts.namespace + ':' : '';
+        this.#maxValue = native.maxValueBytes();
         this.#l1Max = opts.l1MaxBytes || 2 * 1024 * 1024;
         this.#id = opts.workerId || 0;
         this.#attached = opts.attached !== false;
@@ -405,6 +407,17 @@ class TurboCache {
         // Freeze only ever applies to an object the cache owns. Freezing the
         // caller's object would be a side effect on something they still hold.
         if (this.#codec && this.#freeze) TurboCache.deepFreeze(l1Value);
+        // set() reports whether the pipeline ACCEPTED, serialised and queued the
+        // value - not that it is durably in L2. A worker's write is applied by
+        // the primary a tick later, so the size must be checked here; otherwise
+        // an oversized value would be queued, silently dropped by the primary,
+        // and reported as success.
+        const encLen = typeof enc === 'string' ? enc.length : 8;
+        if (encLen + key.length + 48 > this.#maxValue) {
+            this.stats.rejectedSize++;
+            this.lastError = `value ${encLen}B exceeds the ${this.#maxValue}B arena limit`;
+            return false;
+        }
         this.#l1Put(key, l1Value, native.hashKey(key), this.#primitives ? 0 : enc.length,
                     ttlMs > 0 ? Date.now() + ttlMs : 0);
         if (this.#id === 0) {

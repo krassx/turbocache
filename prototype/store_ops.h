@@ -32,14 +32,14 @@ static inline void indexRemove(Store &s, uint64_t i) {
   Header *h = s.h;
   if (!g_backwardShift) {               // old behaviour: leave a tombstone
     s.idx[i].hash.store(HASH_TOMB, std::memory_order_release);
-    if (s.hints) s.hints[i] = 0;
+    if (s.hints) s.hints[i].store(0, std::memory_order_relaxed);
     return;
   }
   uint64_t mask = h->indexSlots - 1;
   uint64_t j = i;
   for (;;) {
     s.idx[i].hash.store(HASH_EMPTY, std::memory_order_release);
-    if (s.hints) s.hints[i] = 0;
+    if (s.hints) s.hints[i].store(0, std::memory_order_relaxed);
     uint64_t hv;
     for (;;) {
       j = (j + 1) & mask;
@@ -51,7 +51,7 @@ static inline void indexRemove(Store &s, uint64_t i) {
     }
     uint64_t pos = s.idx[j].off.load(std::memory_order_relaxed);
     s.idx[i].off.store(pos, std::memory_order_release);
-    if (s.hints) s.hints[i] = s.hints[j];
+    if (s.hints) s.hints[i].store(s.hints[j].load(std::memory_order_relaxed), std::memory_order_relaxed);
     s.entryAt(pos)->slot = (uint32_t)i;                           // entry tracks its slot
     s.idx[i].hash.store(hv, std::memory_order_release);
     h->shiftMoves++;
@@ -91,7 +91,8 @@ static inline bool slabEvictForClass(Store &s, int cls) {
     uint64_t off = s.idx[i].off.load(std::memory_order_relaxed);
     if (off >= h->dataBytes) continue;
     Entry *e = s.entryAt(off);
-    if (s.hints[i]) { s.hints[i] = 0; continue; }        // second chance
+    if (s.hints[i].load(std::memory_order_relaxed)) {    // second chance
+      s.hints[i].store(0, std::memory_order_relaxed); continue; }
     if (slabClassFor(h, e->blockSize) != cls) continue;  // wrong class, no help
     unlinkSlot(s, i);
     return true;
@@ -142,7 +143,7 @@ static inline void logDropTail(Store &s, int *budget) {
     bool liveHere = slot < h->indexSlots &&
         s.idx[slot].off.load(std::memory_order_relaxed) == tailPos &&
         s.idx[slot].hash.load(std::memory_order_relaxed) == e->hash;
-    if (liveHere && h->mode == MODE_LOG2 && s.hints[slot] && budget && *budget > 0) {
+    if (liveHere && h->mode == MODE_LOG2 && s.hints[slot].load(std::memory_order_relaxed) && budget && *budget > 0) {
       uint64_t newPos = h->logHead;
       uint64_t hp = newPos & (h->dataBytes - 1);
       uint64_t freeBytes = h->dataBytes - (h->logHead - h->logTail);
@@ -159,7 +160,7 @@ static inline void logDropTail(Store &s, int *budget) {
         std::atomic_thread_fence(std::memory_order_release);
         memcpy((uint8_t *)dst + 8, (uint8_t *)e + 8, bsz - 8);  // everything after seq+slot
         dst->slot = slot;
-        s.hints[slot] = 0;                                      // second chance consumed
+        s.hints[slot].store(0, std::memory_order_relaxed);      // second chance consumed
         std::atomic_thread_fence(std::memory_order_release);
         dst->seq.store((dseq | 1) + 1, std::memory_order_release);
         s.idx[slot].off.store(newPos, std::memory_order_release);
@@ -256,7 +257,7 @@ static inline void compactApply(Store &s, CompactItem &it) {
 
   Entry *src = s.entryAt(it.off);
   uint32_t expiresAt = src->expiresAt;
-  uint8_t  hint      = s.hints[it.slot];
+  uint8_t  hint      = s.hints[it.slot].load(std::memory_order_relaxed);
 
   int64_t off2 = logAlloc(s, need);     // may evict - possibly our own source
   if (off2 < 0) { it.stale = true; return; }
@@ -270,7 +271,7 @@ static inline void compactApply(Store &s, CompactItem &it) {
   d->expiresAt = expiresAt; d->rawLen = it.rawLen; d->storedLen = it.compLen;
   d->blockSize = need; d->keyLen = it.keyLen;
   d->flags = FLAG_STRING | FLAG_LATIN1 | FLAG_COMPRESSED;
-  d->refBit = 0; s.hints[it.slot] = hint;
+  d->refBit = 0; s.hints[it.slot].store(hint, std::memory_order_relaxed);
   memcpy(s.keyOf(d), it.key, it.keyLen);
   memcpy(s.valOf(d), it.comp, it.compLen);
   std::atomic_thread_fence(std::memory_order_release);
@@ -342,7 +343,7 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
 
   s.idx[slot].off.store((uint64_t)off, std::memory_order_release);
   s.idx[slot].hash.store(hash, std::memory_order_release);
-  s.hints[slot] = 1;                          // a fresh entry gets one chance
+  s.hints[slot].store(1, std::memory_order_relaxed);   // a fresh entry gets one chance
   h->live++; h->liveBytes += e->blockSize;
   ringAppend(s, hash, e->version, writerId);
   return true;
@@ -367,7 +368,7 @@ static inline bool storeDelete(Store &s, const uint8_t *key, uint16_t keyLen, ui
 static inline void storeClear(Store &s, uint16_t writerId) {
   Header *h = s.h;
   memset(s.idx, 0, h->indexSlots * sizeof(IndexSlot));
-  if (s.hints) memset(s.hints, 0, h->hintsBytes);
+  if (s.hints) for (uint64_t i = 0; i < h->indexSlots; i++) s.hints[i].store(0, std::memory_order_relaxed);
   h->logTail = h->logHead;
   h->tailPub.store(h->logTail, std::memory_order_release);
   h->live = 0; h->liveBytes = 0;
@@ -442,7 +443,8 @@ static inline bool storeGet(Store &s, const uint8_t *key, uint16_t keyLen,
       // even though the rest of the segment is read-only to them. Load first:
       // a hot entry is already marked, so the store (and the cache-line
       // ping-pong between workers) is skipped.
-      if (s.hints && !g_suppressRefBit && !s.hints[i]) s.hints[i] = 1;
+      if (s.hints && !g_suppressRefBit && !s.hints[i].load(std::memory_order_relaxed))
+        s.hints[i].store(1, std::memory_order_relaxed);
       out->hit = true; out->rawLen = rl; out->storedLen = sl;
       out->flags = fl; out->buf = scratch;
       return true;

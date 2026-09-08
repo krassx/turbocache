@@ -100,8 +100,13 @@ struct Store {
   IndexSlot *idx = nullptr;
   uint8_t *data = nullptr;
   RingRec *ring = nullptr;
-  uint8_t *hints = nullptr;        // reference bits; the ONLY thing a worker may write
-  uint8_t *hintsMap = nullptr;     // separate RW mapping in workers (null in the primary)
+  // Reference bits: the ONLY thing a worker may write. Genuinely concurrent -
+  // the primary clears and relocates them while every worker sets them - so
+  // they are atomics. Relaxed is enough: a lost or stale hint costs eviction
+  // quality, never correctness, and a relaxed byte access compiles to a plain
+  // load/store. TSAN flagged the plain-uint8_t version as a data race.
+  std::atomic<uint8_t> *hints = nullptr;
+  std::atomic<uint8_t> *hintsMap = nullptr;
   size_t   hintsMapBytes = 0;
   char     name[64] = {0};
   char     hintsName[80] = {0};
@@ -210,9 +215,9 @@ struct Store {
       if (fd < 0) return false;
     }
     hintsMapBytes = h->hintsBytes;
-    hintsMap = (uint8_t *)mmap(nullptr, hintsMapBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    hintsMap = (std::atomic<uint8_t> *)mmap(nullptr, hintsMapBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
-    if (hintsMap == MAP_FAILED) { hintsMap = nullptr; return false; }
+    if (hintsMap == (void *)MAP_FAILED) { hintsMap = nullptr; return false; }
     return true;
   }
 

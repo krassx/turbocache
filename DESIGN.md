@@ -70,6 +70,13 @@ symbol, or `undefined` itself) both surface as `false`. Because a total function
 makes failure quiet, every rejection increments `stats.rejectedType` or
 `stats.rejectedSize` and records `lastError`.
 
+**`set` reports acceptance, not durability.** `true` means the value was
+accepted, successfully serialised and queued — not that it is in L2 yet, since a
+worker's write is applied by the primary about a tick later. That distinction
+forces the size check to happen at the call site: a worker now compares against
+the arena's maximum value size locally, because otherwise an oversized value
+would be queued, silently dropped by the primary, and reported as success.
+
 **There is no `clear()`.** `clearLocal()` drops this process's L1 and nothing
 else; `clearAll()` wipes the shared arena and makes every worker drop its L1 via
 a flush record on the invalidation ring. A single `clear()` would let any worker
@@ -1063,6 +1070,48 @@ The swing is nearly an order of magnitude across the diagonal: `direct` is 2.8x
 faster than `primitives` when reads dominate and 3.8x slower when writes do.
 Choose by read/write ratio and type needs, not by a global default.
 
+### ThreadSanitizer, run
+
+TSAN **cannot observe races between processes** sharing an mmap — it tracks
+happens-before within one process, and the real deployment is a writing primary
+and reading workers. So the harness models them as threads over the same arena
+code: identical atomics, fences and seqlock, with only the isolation boundary
+changed. `prototype/tsan/run_tsan.sh` builds and runs it.
+
+**It found a real bug.** The CLOCK reference bits were a plain `uint8_t` array,
+written by the primary (clearing and relocating them) while every worker
+read-modify-writes them. That is an unsynchronised concurrent access — a genuine
+data race, not a benign one. They are now `std::atomic<uint8_t>` with relaxed
+ordering: free at runtime on ARM, and well-defined. TSAN then reported zero
+races in steady state.
+
+**And it confirmed the one deliberate race.** Driven into constant log
+wrap-around, TSAN reports 20–36 races per run, all in the writer's payload
+`memcpy` (`storeSet` and `logDropTail`'s second-chance re-append) against a
+reader's payload copy. That is the defining trick of a seqlock: the copy races,
+and the sequence re-check detects the torn read afterwards. Across every
+configuration the harness observed **CORRUPT=0** — millions of reads, no torn or
+wrong value ever escaped — so the detection works. But it is undefined behaviour
+by the letter of the C++ memory model, and making it defined would require
+atomic per-word payload access instead of a vectorised `memcpy`, which is
+exactly the cost the design exists to avoid.
+
+Rather than suppress it — which would hide future bugs in those same functions —
+the gate asserts that the **set of racing sites never grows**:
+
+| scenario | corrupt | races | sites |
+|---|---|---|---|
+| steady state | 0 | 0–1 | writer payload copy |
+| constant wrap-around | 0 | 36 | `logDropTail`, writer payload copy |
+| wrap + index pressure | 0 | 36 | `logDropTail`, writer payload copy |
+| high index load factor | 0 | 21 | writer payload copy |
+
+Any site outside that allowlist, or any non-zero corrupt count, fails the run.
+Residual risk, stated plainly: a sufficiently aggressive compiler could in
+principle exploit the UB in the payload copy. The fences around it and the
+`-O1` build make that unlikely, and the pattern is used this way in production
+systems everywhere, but it is not a proof.
+
 ## 10. Why not V8 fast calls
 
 The original premise. It does not survive contact:
@@ -1175,9 +1224,11 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 
 ### Before anyone else could use this
 
-13. **TSAN has never been run** against the seqlock. ~90M clean cross-process
-    reads is strong evidence, not proof, and the seqlock is the only lock-free
-    code in the design.
+13. ~~**TSAN has never been run.**~~ **Run** — see §9. It found and fixed a real
+    race (non-atomic reference bits) and confirmed the deliberate seqlock
+    payload race, which remains UB by the standard. `run_tsan.sh` is the gate.
+    Still outstanding: TSAN cannot cover the cross-process case at all, so the
+    multi-process evidence remains empirical.
 14. **No packaging at all**: no `package.json`, no README, no CI, no prebuilds.
     The Node-API ABI check means one prebuild per platform would cover every
     Node major, but none is produced.

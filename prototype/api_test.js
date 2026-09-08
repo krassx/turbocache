@@ -43,6 +43,11 @@ c.clearAll();
 ok(c.get('a') === undefined && c.get('b') === undefined, 'clearAll wipes the arena');
 ok(c.set('c', '3') === true && c.get('c') === '3', 'cache is usable after clearAll');
 
+// set() reports acceptance, not durability - and a worker must reject an
+// oversized value locally rather than queue something the primary will drop
+ok(c.set('huge', 'x'.repeat(80 * 1024 * 1024)) === false, 'oversized value rejected at the call site');
+ok(/exceeds the/.test(c.lastError) && c.stats.rejectedSize > 0, 'size rejection is explained and counted');
+
 // set never throws and always reports
 ok(c.set('x', { a: 1 }) === false, 'unsupported value returns false');
 ok(typeof c.lastError === 'string', 'lastError explains the rejection');
