@@ -54,23 +54,40 @@ static napi_value Set(napi_env env, napi_callback_info info) {
   ARG(3)
   char key[512]; size_t klen = 0;
   napi_get_value_string_latin1(env, argv[0], key, sizeof(key), &klen);
-  // ASCII is stored one byte per char and handed back as a one-byte V8 string.
-  // Anything else is stored as UTF-8 and rebuilt with napi_create_string_utf8.
-  // Previously everything went through latin1, which silently mangled non-ASCII.
-  size_t charLen = 0, utf8Len = 0;
-  if (!strInfo(env, argv[1], &charLen, &utf8Len)) { napi_value r; napi_get_boolean(env, false, &r); return r; }
-  const bool ascii = (utf8Len == charLen);
-  size_t vlen = ascii ? charLen : utf8Len;
-  if (vlen + 1 > SCRATCH) { napi_value r; napi_get_boolean(env, false, &r); return r; }
-  size_t got = 0;
-  if (ascii) napi_get_value_string_latin1(env, argv[1], (char *)scratch, SCRATCH, &got);
-  else       napi_get_value_string_utf8(env, argv[1], (char *)scratch, SCRATCH, &got);
-  vlen = got;
+  // Encode by type, tagging the entry so the reader rebuilds the right JS
+  // value. Doubles are stored as their 8 raw bytes: exact, and no parsing.
+  napi_valuetype vt;
+  napi_typeof(env, argv[1], &vt);
+  size_t vlen = 0;
+  uint8_t flags = 0;
+  if (vt == napi_string) {
+    // ASCII is stored one byte per char and handed back as a one-byte V8
+    // string; anything else is stored as UTF-8. Everything used to go through
+    // latin1, which silently mangled non-ASCII.
+    size_t charLen = 0, utf8Len = 0;
+    if (!strInfo(env, argv[1], &charLen, &utf8Len)) { napi_value r; napi_get_boolean(env, false, &r); return r; }
+    const bool ascii = (utf8Len == charLen);
+    if ((ascii ? charLen : utf8Len) + 1 > SCRATCH) { napi_value r; napi_get_boolean(env, false, &r); return r; }
+    size_t got = 0;
+    if (ascii) napi_get_value_string_latin1(env, argv[1], (char *)scratch, SCRATCH, &got);
+    else       napi_get_value_string_utf8(env, argv[1], (char *)scratch, SCRATCH, &got);
+    vlen = got;
+    flags = FLAG_STRING | (ascii ? FLAG_LATIN1 : 0);
+  } else if (vt == napi_number) {
+    double d = 0; napi_get_value_double(env, argv[1], &d);
+    memcpy(scratch, &d, sizeof(d)); vlen = sizeof(d); flags = FLAG_NUMBER;
+  } else if (vt == napi_boolean) {
+    bool bv = false; napi_get_value_bool(env, argv[1], &bv);
+    scratch[0] = bv ? 1 : 0; vlen = 1; flags = FLAG_BOOL;
+  } else if (vt == napi_null) {
+    vlen = 0; flags = FLAG_NULL;
+  } else {
+    napi_value r; napi_get_boolean(env, false, &r); return r;   // unsupported type
+  }
 
   const uint8_t *payload = scratch;
   uint32_t storedLen = (uint32_t)vlen, rawLen = (uint32_t)vlen;
-  uint8_t flags = FLAG_STRING | (ascii ? FLAG_LATIN1 : 0);
-  if (vlen >= compressMin) {
+  if ((flags & FLAG_STRING) && vlen >= compressMin) {
     int c = LZ4_compress_fast((const char *)scratch, (char *)cbuf, (int)vlen, (int)SCRATCH, compressAccel);
     if (c > 0 && (uint32_t)c < rawLen - (rawLen >> 3)) {   // keep only if >12.5% smaller
       payload = cbuf; storedLen = (uint32_t)c; flags |= FLAG_COMPRESSED;
@@ -98,8 +115,17 @@ static napi_value Get(napi_env env, napi_callback_info info) {
     src = (const char *)cbuf;
   }
   napi_value out;
-  if (rr.flags & FLAG_LATIN1) napi_create_string_latin1(env, src, rr.rawLen, &out);
-  else                        napi_create_string_utf8(env, src, rr.rawLen, &out);
+  if (rr.flags & FLAG_NUMBER) {
+    double d = 0; memcpy(&d, src, sizeof(d)); napi_create_double(env, d, &out);
+  } else if (rr.flags & FLAG_BOOL) {
+    napi_get_boolean(env, src[0] != 0, &out);
+  } else if (rr.flags & FLAG_NULL) {
+    napi_get_null(env, &out);
+  } else if (rr.flags & FLAG_LATIN1) {
+    napi_create_string_latin1(env, src, rr.rawLen, &out);
+  } else {
+    napi_create_string_utf8(env, src, rr.rawLen, &out);
+  }
   return out;
 }
 

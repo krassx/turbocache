@@ -250,7 +250,7 @@ class TurboCache {
         this.stats.l2Hits++;
         let v = raw;
         if (this.#codec) { v = this.#codec.decode(raw); if (this.#freeze) TurboCache.deepFreeze(v); }
-        this.#l1Put(key, v, native.hashKey(key), raw.length);
+        this.#l1Put(key, v, native.hashKey(key), this.#primitives ? 0 : raw.length);
         return v;
     }
 
@@ -274,7 +274,7 @@ class TurboCache {
         // Freeze only ever applies to an object the cache owns. Freezing the
         // caller's object would be a side effect on something they still hold.
         if (this.#codec && this.#freeze) TurboCache.deepFreeze(l1Value);
-        this.#l1Put(key, l1Value, native.hashKey(key), enc.length);
+        this.#l1Put(key, l1Value, native.hashKey(key), this.#primitives ? 0 : enc.length);
         if (this.#id === 0) { native.set(key, enc, 0); return; }   // primary writes directly
         this.#outbox.push(key, enc);
         if (!this.#flushScheduled) {

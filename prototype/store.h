@@ -24,7 +24,11 @@ static const uint64_t HASH_TOMB  = 1;
 
 enum { MODE_SLAB = 0, MODE_LOG = 1, MODE_LOG2 = 2 };  // LOG2 = log + second-chance re-append
 
-enum { FLAG_COMPRESSED = 1, FLAG_STRING = 2, FLAG_LATIN1 = 4 };
+// Value type travels WITH the bytes, so a worker reading the arena directly
+// reconstructs the right JS type. Without this, non-string primitives lived
+// only in L1: lost on eviction and invisible to other processes.
+enum { FLAG_COMPRESSED = 1, FLAG_STRING = 2, FLAG_LATIN1 = 4,
+       FLAG_NUMBER = 8, FLAG_BOOL = 16, FLAG_NULL = 32 };
 
 // 40 bytes, 8-byte aligned. Key bytes then value bytes follow inline.
 struct Entry {
