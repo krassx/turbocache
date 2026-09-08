@@ -748,6 +748,59 @@ for object-heavy workloads that are dominated by L1 hits, carrying its two
 documented caveats. This keeps the safe, exactly-accountable configuration as
 the one users get without reading anything.
 
+### JSON fast paths on Node 26
+
+Measured on Node 24.15.0 and Node 26.8.1, same machine, 1.4KB payload.
+
+**The premise holds, and then some.** `JSON.stringify` of a pure-ASCII object
+went from 2324ns to **1524ns, 34% faster**. `JSON.parse` improved about 11%.
+
+**But the slow paths did not improve, so falling off one now costs more:**
+
+| variant | Node 24 | Node 26 | penalty on 24 | penalty on 26 |
+|---|---|---|---|---|
+| plain object (fast path) | 2324ns | **1524ns** | — | — |
+| 2-space indent | 3118ns | 3260ns | 1.29x | **2.11x** |
+| replacer function | 5605ns | 5409ns | 2.32x | **3.51x** |
+| all values non-ASCII | 2560ns | 3096ns | 1.10x | **2.03x** |
+
+Two things follow. A `replacer` now costs 3.5x rather than 2.3x. And a heavily
+non-ASCII payload is not merely slower than ASCII on Node 26 — it is **slower
+than the same payload was on Node 24** (3096ns vs 2560ns). The new fast path is
+ASCII-oriented, and it is evaluated per string: injecting a *single* non-ASCII
+character into a 41-string document cost nothing measurable (0.99x); only when
+most strings are non-ASCII does the 2x appear.
+
+**`JSON.parse` is insensitive to string representation.** Flat one-byte, sliced,
+cons, and strings returned from our arena all parse within 2% of each other on
+both versions. So flattening is worth doing for memory (a slice retains its
+parent) but buys nothing for parse speed.
+
+**What this requires of the cache.** The codec path must call `JSON.stringify(v)`
+and `JSON.parse(s)` with no second argument — no replacer, no space, no reviver.
+It does, and `json_fastpath_test.js` now asserts it by inspecting the source, so
+a well-meant `JSON.stringify(v, null, 2)` cannot slip in.
+
+**A real bug this surfaced.** The prototype encoded every value through
+`napi_get_value_string_latin1`, silently mangling any non-ASCII string — a
+limitation noted earlier and now fixed. Values are classified at insert:
+ASCII is stored one byte per character and rebuilt with
+`napi_create_string_latin1`; anything else is stored as UTF-8 and rebuilt with
+`napi_create_string_utf8`. This both fixes correctness and keeps ASCII values on
+the one-byte representation that the Node 26 stringify fast path favours if the
+application re-encodes them. The `FLAG_LATIN1` bit the entry format already
+reserved is what carries the classification.
+
+**End to end**, with JSON on the hot path (codec mode, 60k-key working set):
+444k ops/s on Node 24, **513k ops/s on Node 26** — a 16% gain for free.
+
+### Node-API ABI stability, verified
+
+The addon compiled against Node 24.15 headers loads and runs unmodified on Node
+26.8.1. This is decision 12 paying off directly: had the design used V8 fast
+calls it would have needed a rebuild and a new prebuild for that major, for a
+saving measured at ~6ns per call.
+
 ### Architecture validation### Can object size be measured? No - and a better estimate is not the answer
 
 **Where L1 crosses into native.** An L1 *hit* in the primary crosses nothing —
@@ -862,6 +915,59 @@ parse per hit, which is what the cluster comparison measured.
 for object-heavy workloads that are dominated by L1 hits, carrying its two
 documented caveats. This keeps the safe, exactly-accountable configuration as
 the one users get without reading anything.
+
+### JSON fast paths on Node 26
+
+Measured on Node 24.15.0 and Node 26.8.1, same machine, 1.4KB payload.
+
+**The premise holds, and then some.** `JSON.stringify` of a pure-ASCII object
+went from 2324ns to **1524ns, 34% faster**. `JSON.parse` improved about 11%.
+
+**But the slow paths did not improve, so falling off one now costs more:**
+
+| variant | Node 24 | Node 26 | penalty on 24 | penalty on 26 |
+|---|---|---|---|---|
+| plain object (fast path) | 2324ns | **1524ns** | — | — |
+| 2-space indent | 3118ns | 3260ns | 1.29x | **2.11x** |
+| replacer function | 5605ns | 5409ns | 2.32x | **3.51x** |
+| all values non-ASCII | 2560ns | 3096ns | 1.10x | **2.03x** |
+
+Two things follow. A `replacer` now costs 3.5x rather than 2.3x. And a heavily
+non-ASCII payload is not merely slower than ASCII on Node 26 — it is **slower
+than the same payload was on Node 24** (3096ns vs 2560ns). The new fast path is
+ASCII-oriented, and it is evaluated per string: injecting a *single* non-ASCII
+character into a 41-string document cost nothing measurable (0.99x); only when
+most strings are non-ASCII does the 2x appear.
+
+**`JSON.parse` is insensitive to string representation.** Flat one-byte, sliced,
+cons, and strings returned from our arena all parse within 2% of each other on
+both versions. So flattening is worth doing for memory (a slice retains its
+parent) but buys nothing for parse speed.
+
+**What this requires of the cache.** The codec path must call `JSON.stringify(v)`
+and `JSON.parse(s)` with no second argument — no replacer, no space, no reviver.
+It does, and `json_fastpath_test.js` now asserts it by inspecting the source, so
+a well-meant `JSON.stringify(v, null, 2)` cannot slip in.
+
+**A real bug this surfaced.** The prototype encoded every value through
+`napi_get_value_string_latin1`, silently mangling any non-ASCII string — a
+limitation noted earlier and now fixed. Values are classified at insert:
+ASCII is stored one byte per character and rebuilt with
+`napi_create_string_latin1`; anything else is stored as UTF-8 and rebuilt with
+`napi_create_string_utf8`. This both fixes correctness and keeps ASCII values on
+the one-byte representation that the Node 26 stringify fast path favours if the
+application re-encodes them. The `FLAG_LATIN1` bit the entry format already
+reserved is what carries the classification.
+
+**End to end**, with JSON on the hot path (codec mode, 60k-key working set):
+444k ops/s on Node 24, **513k ops/s on Node 26** — a 16% gain for free.
+
+### Node-API ABI stability, verified
+
+The addon compiled against Node 24.15 headers loads and runs unmodified on Node
+26.8.1. This is decision 12 paying off directly: had the design used V8 fast
+calls it would have needed a rebuild and a new prebuild for that major, for a
+saving measured at ~6ns per call.
 
 ### Architecture validation### Comparison against the Bugsee appserver cache
 
@@ -1048,6 +1154,59 @@ for object-heavy workloads that are dominated by L1 hits, carrying its two
 documented caveats. This keeps the safe, exactly-accountable configuration as
 the one users get without reading anything.
 
+### JSON fast paths on Node 26
+
+Measured on Node 24.15.0 and Node 26.8.1, same machine, 1.4KB payload.
+
+**The premise holds, and then some.** `JSON.stringify` of a pure-ASCII object
+went from 2324ns to **1524ns, 34% faster**. `JSON.parse` improved about 11%.
+
+**But the slow paths did not improve, so falling off one now costs more:**
+
+| variant | Node 24 | Node 26 | penalty on 24 | penalty on 26 |
+|---|---|---|---|---|
+| plain object (fast path) | 2324ns | **1524ns** | — | — |
+| 2-space indent | 3118ns | 3260ns | 1.29x | **2.11x** |
+| replacer function | 5605ns | 5409ns | 2.32x | **3.51x** |
+| all values non-ASCII | 2560ns | 3096ns | 1.10x | **2.03x** |
+
+Two things follow. A `replacer` now costs 3.5x rather than 2.3x. And a heavily
+non-ASCII payload is not merely slower than ASCII on Node 26 — it is **slower
+than the same payload was on Node 24** (3096ns vs 2560ns). The new fast path is
+ASCII-oriented, and it is evaluated per string: injecting a *single* non-ASCII
+character into a 41-string document cost nothing measurable (0.99x); only when
+most strings are non-ASCII does the 2x appear.
+
+**`JSON.parse` is insensitive to string representation.** Flat one-byte, sliced,
+cons, and strings returned from our arena all parse within 2% of each other on
+both versions. So flattening is worth doing for memory (a slice retains its
+parent) but buys nothing for parse speed.
+
+**What this requires of the cache.** The codec path must call `JSON.stringify(v)`
+and `JSON.parse(s)` with no second argument — no replacer, no space, no reviver.
+It does, and `json_fastpath_test.js` now asserts it by inspecting the source, so
+a well-meant `JSON.stringify(v, null, 2)` cannot slip in.
+
+**A real bug this surfaced.** The prototype encoded every value through
+`napi_get_value_string_latin1`, silently mangling any non-ASCII string — a
+limitation noted earlier and now fixed. Values are classified at insert:
+ASCII is stored one byte per character and rebuilt with
+`napi_create_string_latin1`; anything else is stored as UTF-8 and rebuilt with
+`napi_create_string_utf8`. This both fixes correctness and keeps ASCII values on
+the one-byte representation that the Node 26 stringify fast path favours if the
+application re-encodes them. The `FLAG_LATIN1` bit the entry format already
+reserved is what carries the classification.
+
+**End to end**, with JSON on the hot path (codec mode, 60k-key working set):
+444k ops/s on Node 24, **513k ops/s on Node 26** — a 16% gain for free.
+
+### Node-API ABI stability, verified
+
+The addon compiled against Node 24.15 headers loads and runs unmodified on Node
+26.8.1. This is decision 12 paying off directly: had the design used V8 fast
+calls it would have needed a rebuild and a new prebuild for that major, for a
+saving measured at ~6ns per call.
+
 ### Architecture validation
 
 | Claim | Result |
@@ -1102,6 +1261,7 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 | 14 | Batched, fire-and-forget writes to the primary | synchronous write-through | Keeps `set()` off the IPC critical path; costs ~1 tick of cross-worker staleness |
 | 15 | Current LTS, darwin + linux, x64 + arm64 | Windows in v1 | Windows needs `CreateFileMapping` — a second shared-memory implementation |
 | 17 | **No background compaction** | async compress-on-the-threadpool with version-validated apply | Built and proven race-safe (18k stale captures correctly discarded, 0 wrong values), but worth only +1.9 points of hit rate at 3x read latency, while doubling the arena buys +6.9 points at no cost. Restricting to cold entries removes the latency penalty *and* the entire benefit. |
+| 24 | **ASCII values stored and returned as one-byte strings; non-ASCII as UTF-8** | latin1 for everything (previous behaviour) | Fixes silent mangling of non-ASCII, and keeps ASCII on the representation Node 26's 34%-faster stringify fast path favours. Node 26 penalises all-non-ASCII payloads 2.03x, worse in absolute terms than Node 24. |
 | 23 | **`values: 'primitives'` is the default mode; codec is opt-in** | codec everywhere; JSON-always like bugsee; accept objects natively | Primitives make accounting exact (verified within 1% against measured heap), remove the aliasing hazard entirely, and need no codec. Costs ~20% for flattening plus exact sizing, and pushes object workloads onto a decode-per-hit path. Requires flattening on insert: a cached 1MB substring otherwise retains an 8MB parent. |
 | 22 | **No per-object size measurement; a post-GC heap guard instead** | native structural size walk; `v8.serialize().length`; sampling `used_heap_size` directly | V8 exposes no per-object size outside a heap snapshot. A native walk was built and is -14% to -26% accurate against +/-7% for `encodedBytes x 3`, at 5825ns versus free. Bounding live heap after a GC bounds the thing that actually matters: retained heap 445MB to 121MB where the byte budget bound nothing. |
 | 21 | **Optional caller-supplied codec; L1 caches decoded values, L2 stores bytes** | app owns the codec (L1 caches encoded strings); built-in JSON mode; accept the limitation | Resolves the decision 4/5 conflict by applying each at its own boundary. 3.6x on L1-resident object workloads, p50 1334ns to 42ns. Costs a documented aliasing contract (or 25-30% for `freeze: true`) and turns the L1 byte cap into a `heapFactor`-scaled estimate, measured at 2.79-3.21x for JSON-shaped objects. |

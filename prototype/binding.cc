@@ -16,6 +16,8 @@ static int compressAccel = 1;   // LZ4 acceleration: higher = faster, worse rati
 
 static uint32_t nowSec() { return (uint32_t)time(nullptr); }
 
+static bool strInfo(napi_env env, napi_value v, size_t *charLen, size_t *utf8Len);
+
 #define ARG(n) napi_value argv[n]; size_t argc = n; \
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
 
@@ -52,15 +54,22 @@ static napi_value Set(napi_env env, napi_callback_info info) {
   ARG(3)
   char key[512]; size_t klen = 0;
   napi_get_value_string_latin1(env, argv[0], key, sizeof(key), &klen);
-  size_t vlen = 0;
-  napi_get_value_string_latin1(env, argv[1], nullptr, 0, &vlen);
+  // ASCII is stored one byte per char and handed back as a one-byte V8 string.
+  // Anything else is stored as UTF-8 and rebuilt with napi_create_string_utf8.
+  // Previously everything went through latin1, which silently mangled non-ASCII.
+  size_t charLen = 0, utf8Len = 0;
+  if (!strInfo(env, argv[1], &charLen, &utf8Len)) { napi_value r; napi_get_boolean(env, false, &r); return r; }
+  const bool ascii = (utf8Len == charLen);
+  size_t vlen = ascii ? charLen : utf8Len;
   if (vlen + 1 > SCRATCH) { napi_value r; napi_get_boolean(env, false, &r); return r; }
   size_t got = 0;
-  napi_get_value_string_latin1(env, argv[1], (char *)scratch, SCRATCH, &got);
+  if (ascii) napi_get_value_string_latin1(env, argv[1], (char *)scratch, SCRATCH, &got);
+  else       napi_get_value_string_utf8(env, argv[1], (char *)scratch, SCRATCH, &got);
+  vlen = got;
 
   const uint8_t *payload = scratch;
   uint32_t storedLen = (uint32_t)vlen, rawLen = (uint32_t)vlen;
-  uint8_t flags = FLAG_STRING | FLAG_LATIN1;
+  uint8_t flags = FLAG_STRING | (ascii ? FLAG_LATIN1 : 0);
   if (vlen >= compressMin) {
     int c = LZ4_compress_fast((const char *)scratch, (char *)cbuf, (int)vlen, (int)SCRATCH, compressAccel);
     if (c > 0 && (uint32_t)c < rawLen - (rawLen >> 3)) {   // keep only if >12.5% smaller
@@ -89,7 +98,8 @@ static napi_value Get(napi_env env, napi_callback_info info) {
     src = (const char *)cbuf;
   }
   napi_value out;
-  napi_create_string_latin1(env, src, rr.rawLen, &out);
+  if (rr.flags & FLAG_LATIN1) napi_create_string_latin1(env, src, rr.rawLen, &out);
+  else                        napi_create_string_utf8(env, src, rr.rawLen, &out);
   return out;
 }
 
