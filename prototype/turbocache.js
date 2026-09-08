@@ -258,8 +258,9 @@ class TurboCache {
         this.stats.sets++;
         if (this.#primitives) {
             const t = typeof value;
-            if (t !== 'string' && t !== 'number' && t !== 'boolean' && value !== null)
-                throw new TypeError(`primitives mode accepts string/number/boolean/null, got ${t}`);
+            // BigInt is a primitive too, and immutable, so it belongs here.
+            if (t !== 'string' && t !== 'number' && t !== 'boolean' && t !== 'bigint' && value !== null)
+                throw new TypeError(`primitives mode accepts string/number/boolean/bigint/null, got ${t}`);
             if (t === 'string') {
                 // A V8 SlicedString keeps its parent alive: caching a 1MB
                 // substring of an 8MB document retains all 8MB (measured).

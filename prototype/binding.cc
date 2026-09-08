@@ -79,6 +79,19 @@ static napi_value Set(napi_env env, napi_callback_info info) {
   } else if (vt == napi_boolean) {
     bool bv = false; napi_get_value_bool(env, argv[1], &bv);
     scratch[0] = bv ? 1 : 0; vlen = 1; flags = FLAG_BOOL;
+  } else if (vt == napi_bigint) {
+    // Arbitrary precision: sign byte followed by 64-bit words, little-endian.
+    // Querying the word count requires BOTH sign_bit and words to be null;
+    // passing a non-null sign_bit takes the other branch and fails CHECK_ARG.
+    int sign = 0; size_t words = 0;
+    if (napi_get_value_bigint_words(env, argv[1], nullptr, &words, nullptr) != napi_ok ||
+        1 + words * 8 > SCRATCH) { napi_value r; napi_get_boolean(env, false, &r); return r; }
+    if (words && napi_get_value_bigint_words(env, argv[1], &sign, &words,
+                                             (uint64_t *)(scratch + 1)) != napi_ok) {
+      napi_value r; napi_get_boolean(env, false, &r); return r;
+    }
+    scratch[0] = (uint8_t)sign;          // written AFTER the call that fills it
+    vlen = 1 + words * 8; flags = FLAG_BIGINT;
   } else if (vt == napi_null) {
     vlen = 0; flags = FLAG_NULL;
   } else {
@@ -119,6 +132,9 @@ static napi_value Get(napi_env env, napi_callback_info info) {
     double d = 0; memcpy(&d, src, sizeof(d)); napi_create_double(env, d, &out);
   } else if (rr.flags & FLAG_BOOL) {
     napi_get_boolean(env, src[0] != 0, &out);
+  } else if (rr.flags & FLAG_BIGINT) {
+    if (napi_create_bigint_words(env, (int)src[0], (rr.rawLen - 1) / 8,
+                                 (const uint64_t *)(src + 1), &out) != napi_ok) return nullptr;
   } else if (rr.flags & FLAG_NULL) {
     napi_get_null(env, &out);
   } else if (rr.flags & FLAG_LATIN1) {
@@ -389,6 +405,10 @@ static napi_value PrimBytes(napi_env env, napi_callback_info info) {
     double d; napi_get_value_double(env, argv[0], &d);
     bool smi = d == (double)(int32_t)d && d >= -1073741824.0 && d <= 1073741823.0;
     bytes = smi ? 0 : 16;
+  } else if (t == napi_bigint) {
+    size_t words = 0;
+    napi_get_value_bigint_words(env, argv[0], nullptr, &words, nullptr);
+    bytes = (double)(16 + words * 8);
   }
   napi_value r; napi_create_double(env, bytes, &r); return r;
 }
