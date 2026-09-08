@@ -21,6 +21,7 @@ class TurboCache {
     #cursor = 0;
     #id;
     #codec;
+    #isolate = true;
     #primitives = false;
     #freeze;
     #heapFactor;
@@ -45,7 +46,19 @@ class TurboCache {
         this.#primitives = opts.values === 'primitives';
         this.#codec = this.#primitives ? null : (opts.codec || null);
         if (this.#codec && opts.allowSlowCodec !== true) TurboCache.assertFastCodec(this.#codec);
-        this.#freeze = opts.freeze === true;
+        // Safe by default, fast by choice. Without freeze, mutating what get()
+        // returned silently corrupts L1 for this worker until eviction, at
+        // which point the value reverts to L2's copy - a bug that appears and
+        // disappears on its own. Measured: freeze delivers the same
+        // immutability guarantee as re-parsing on every get (the bugsee
+        // approach) at roughly twice the throughput, 813k vs 413k ops/s.
+        this.#freeze = opts.freeze !== false;
+        // set() otherwise adopts the caller's own object into L1. Mutating a
+        // variable they still hold then corrupts the cache without any call to
+        // get(), and the value silently reverts when L1 evicts and L2's
+        // pre-mutation bytes come back. Decoding our own encoding costs one
+        // parse per set and gives L1 an object the caller has never seen.
+        this.#isolate = opts.isolate !== false;
         // A decoded object costs several times its encoded size on the V8 heap,
         // and JS cannot measure that. The budget is in encoded bytes scaled by
         // this factor; it is an estimate, not a guarantee.
@@ -256,8 +269,12 @@ class TurboCache {
         }
         // Encode once: L2 needs bytes regardless, so this is not extra work.
         const enc = this.#codec ? this.#codec.encode(value) : value;
-        if (this.#codec && this.#freeze) TurboCache.deepFreeze(value);
-        this.#l1Put(key, value, native.hashKey(key), enc.length);
+        let l1Value = value;
+        if (this.#codec && this.#isolate) l1Value = this.#codec.decode(enc);
+        // Freeze only ever applies to an object the cache owns. Freezing the
+        // caller's object would be a side effect on something they still hold.
+        if (this.#codec && this.#freeze) TurboCache.deepFreeze(l1Value);
+        this.#l1Put(key, l1Value, native.hashKey(key), enc.length);
         if (this.#id === 0) { native.set(key, enc, 0); return; }   // primary writes directly
         this.#outbox.push(key, enc);
         if (!this.#flushScheduled) {

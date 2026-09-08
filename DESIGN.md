@@ -828,7 +828,64 @@ The addon compiled against Node 24.15 headers loads and runs unmodified on Node
 calls it would have needed a rebuild and a new prebuild for that major, for a
 saving measured at ~6ns per call.
 
-### Architecture validation### Can object size be measured? No - and a better estimate is not the answer
+### Mutation safety: what the bugsee cache was buying with JSON
+
+The bugsee cache stringifies on write and parses on read at every layer. That is
+not incidental overhead — it buys two properties deliberately: **every read
+returns a fresh object, so no layer can be corrupted by a caller**, and **any
+JSON-serialisable value is accepted**. Any design that caches decoded objects to
+avoid the parse has to pay for those properties some other way.
+
+**The hazard, as originally built.** `set(key, obj)` put the *caller's own*
+object into L1. So a caller could corrupt the cache without ever calling `get`:
+
+```
+set('acct', user)          // user = { role: 'viewer' }
+user.role = 'admin'        // caller mutates a variable it still holds
+get('acct').role           -> 'admin'    L1 followed the mutation
+L2 (other workers)         -> 'viewer'   diverged; version never changed
+...L1 evicts...
+get('acct').role           -> 'viewer'   silently REVERTED
+```
+
+The revert is the worst part: the bug appears and then disappears on its own,
+at a time determined by eviction pressure.
+
+**Two fixes, both now on by default in codec mode.**
+
+- `isolate` — `set` decodes its own encoding to produce the L1 object, so the
+  cache holds something the caller has never seen. The encoding was needed for
+  L2 anyway; the extra cost is one `decode` per `set`.
+- `freeze` — the cached object is deep-frozen, so mutating a `get` result throws
+  instead of silently corrupting L1.
+
+| configuration | caller mutates its own object | caller mutates `get()` result |
+|---|---|---|
+| codec, `isolate:false` | **corrupts, then reverts** | **corrupts** |
+| codec, `isolate:true` | safe | **corrupts** |
+| **codec, isolate + freeze (default)** | safe | throws `TypeError` |
+| **primitives (default mode)** | safe | safe |
+
+**What each guarantee costs** (300k ops, 90/10 read/write):
+
+| configuration | L1-resident | exceeds L1 | guarantee |
+|---|---|---|---|
+| codec, `isolate:false` | 1,545k | 411k | none |
+| codec, `isolate:true` | 1,068k | 320k | set-side only |
+| **codec, isolate + freeze** | **813k** | 235k | full |
+| primitives / parse-per-get | 413k | 291k | full |
+
+The useful result: **freezing buys the same immutability guarantee as parsing on
+every read, at roughly twice the throughput** — 813k versus 413k on L1-resident
+data. The parse is paid once per insert instead of once per read.
+
+They differ in ergonomics, not safety. Parse-per-get hands back a **fresh mutable
+object every time**, which is the friendlier contract — the caller may do
+whatever it likes with it. Freezing hands back a **shared immutable object**, so
+a caller that needs to modify must clone it first. That is the real trade, and
+it is why primitives — where the application owns the codec and therefore gets a
+fresh object per parse, exactly as the bugsee cache does — remains the default
+mode. Codec mode is the opt-in for workloads dominated by L1 hits.### Can object size be measured? No - and a better estimate is not the answer
 
 **Where L1 crosses into native.** An L1 *hit* in the primary crosses nothing —
 it is a plain `Map` lookup, which is why it measures 42ns. A worker's L1 hit
@@ -1023,7 +1080,64 @@ The addon compiled against Node 24.15 headers loads and runs unmodified on Node
 calls it would have needed a rebuild and a new prebuild for that major, for a
 saving measured at ~6ns per call.
 
-### Architecture validation### Comparison against the Bugsee appserver cache
+### Mutation safety: what the bugsee cache was buying with JSON
+
+The bugsee cache stringifies on write and parses on read at every layer. That is
+not incidental overhead — it buys two properties deliberately: **every read
+returns a fresh object, so no layer can be corrupted by a caller**, and **any
+JSON-serialisable value is accepted**. Any design that caches decoded objects to
+avoid the parse has to pay for those properties some other way.
+
+**The hazard, as originally built.** `set(key, obj)` put the *caller's own*
+object into L1. So a caller could corrupt the cache without ever calling `get`:
+
+```
+set('acct', user)          // user = { role: 'viewer' }
+user.role = 'admin'        // caller mutates a variable it still holds
+get('acct').role           -> 'admin'    L1 followed the mutation
+L2 (other workers)         -> 'viewer'   diverged; version never changed
+...L1 evicts...
+get('acct').role           -> 'viewer'   silently REVERTED
+```
+
+The revert is the worst part: the bug appears and then disappears on its own,
+at a time determined by eviction pressure.
+
+**Two fixes, both now on by default in codec mode.**
+
+- `isolate` — `set` decodes its own encoding to produce the L1 object, so the
+  cache holds something the caller has never seen. The encoding was needed for
+  L2 anyway; the extra cost is one `decode` per `set`.
+- `freeze` — the cached object is deep-frozen, so mutating a `get` result throws
+  instead of silently corrupting L1.
+
+| configuration | caller mutates its own object | caller mutates `get()` result |
+|---|---|---|
+| codec, `isolate:false` | **corrupts, then reverts** | **corrupts** |
+| codec, `isolate:true` | safe | **corrupts** |
+| **codec, isolate + freeze (default)** | safe | throws `TypeError` |
+| **primitives (default mode)** | safe | safe |
+
+**What each guarantee costs** (300k ops, 90/10 read/write):
+
+| configuration | L1-resident | exceeds L1 | guarantee |
+|---|---|---|---|
+| codec, `isolate:false` | 1,545k | 411k | none |
+| codec, `isolate:true` | 1,068k | 320k | set-side only |
+| **codec, isolate + freeze** | **813k** | 235k | full |
+| primitives / parse-per-get | 413k | 291k | full |
+
+The useful result: **freezing buys the same immutability guarantee as parsing on
+every read, at roughly twice the throughput** — 813k versus 413k on L1-resident
+data. The parse is paid once per insert instead of once per read.
+
+They differ in ergonomics, not safety. Parse-per-get hands back a **fresh mutable
+object every time**, which is the friendlier contract — the caller may do
+whatever it likes with it. Freezing hands back a **shared immutable object**, so
+a caller that needs to modify must clone it first. That is the real trade, and
+it is why primitives — where the application owns the codec and therefore gets a
+fresh object per parse, exactly as the bugsee cache does — remains the default
+mode. Codec mode is the opt-in for workloads dominated by L1 hits.### Comparison against the Bugsee appserver cache
 
 Measured against `Bugsee/appserver/code/components/shared/cache`, a production
 implementation of the same shape: L1 `JsonLru` per worker, L2 in the primary's
@@ -1288,7 +1402,64 @@ The addon compiled against Node 24.15 headers loads and runs unmodified on Node
 calls it would have needed a rebuild and a new prebuild for that major, for a
 saving measured at ~6ns per call.
 
-### Architecture validation
+### Mutation safety: what the bugsee cache was buying with JSON
+
+The bugsee cache stringifies on write and parses on read at every layer. That is
+not incidental overhead — it buys two properties deliberately: **every read
+returns a fresh object, so no layer can be corrupted by a caller**, and **any
+JSON-serialisable value is accepted**. Any design that caches decoded objects to
+avoid the parse has to pay for those properties some other way.
+
+**The hazard, as originally built.** `set(key, obj)` put the *caller's own*
+object into L1. So a caller could corrupt the cache without ever calling `get`:
+
+```
+set('acct', user)          // user = { role: 'viewer' }
+user.role = 'admin'        // caller mutates a variable it still holds
+get('acct').role           -> 'admin'    L1 followed the mutation
+L2 (other workers)         -> 'viewer'   diverged; version never changed
+...L1 evicts...
+get('acct').role           -> 'viewer'   silently REVERTED
+```
+
+The revert is the worst part: the bug appears and then disappears on its own,
+at a time determined by eviction pressure.
+
+**Two fixes, both now on by default in codec mode.**
+
+- `isolate` — `set` decodes its own encoding to produce the L1 object, so the
+  cache holds something the caller has never seen. The encoding was needed for
+  L2 anyway; the extra cost is one `decode` per `set`.
+- `freeze` — the cached object is deep-frozen, so mutating a `get` result throws
+  instead of silently corrupting L1.
+
+| configuration | caller mutates its own object | caller mutates `get()` result |
+|---|---|---|
+| codec, `isolate:false` | **corrupts, then reverts** | **corrupts** |
+| codec, `isolate:true` | safe | **corrupts** |
+| **codec, isolate + freeze (default)** | safe | throws `TypeError` |
+| **primitives (default mode)** | safe | safe |
+
+**What each guarantee costs** (300k ops, 90/10 read/write):
+
+| configuration | L1-resident | exceeds L1 | guarantee |
+|---|---|---|---|
+| codec, `isolate:false` | 1,545k | 411k | none |
+| codec, `isolate:true` | 1,068k | 320k | set-side only |
+| **codec, isolate + freeze** | **813k** | 235k | full |
+| primitives / parse-per-get | 413k | 291k | full |
+
+The useful result: **freezing buys the same immutability guarantee as parsing on
+every read, at roughly twice the throughput** — 813k versus 413k on L1-resident
+data. The parse is paid once per insert instead of once per read.
+
+They differ in ergonomics, not safety. Parse-per-get hands back a **fresh mutable
+object every time**, which is the friendlier contract — the caller may do
+whatever it likes with it. Freezing hands back a **shared immutable object**, so
+a caller that needs to modify must clone it first. That is the real trade, and
+it is why primitives — where the application owns the codec and therefore gets a
+fresh object per parse, exactly as the bugsee cache does — remains the default
+mode. Codec mode is the opt-in for workloads dominated by L1 hits.
 
 | Claim | Result |
 |---|---|
@@ -1342,6 +1513,7 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 | 14 | Batched, fire-and-forget writes to the primary | synchronous write-through | Keeps `set()` off the IPC critical path; costs ~1 tick of cross-worker staleness |
 | 15 | Current LTS, darwin + linux, x64 + arm64 | Windows in v1 | Windows needs `CreateFileMapping` — a second shared-memory implementation |
 | 17 | **No background compaction** | async compress-on-the-threadpool with version-validated apply | Built and proven race-safe (18k stale captures correctly discarded, 0 wrong values), but worth only +1.9 points of hit rate at 3x read latency, while doubling the arena buys +6.9 points at no cost. Restricting to cold entries removes the latency penalty *and* the entire benefit. |
+| 26 | **Codec mode isolates on set and freezes by default** | adopt the caller's object; document a do-not-mutate contract; deep-copy on every get | `set` adopting the caller's object let a caller corrupt L1 without calling `get`, and the value then silently reverted when L1 evicted. Isolation costs one decode per set; freezing costs ~24% and turns a silent corruption into a `TypeError`. Freezing delivers the same guarantee as parse-per-read at roughly twice the throughput (813k vs 413k), differing in ergonomics: shared-immutable rather than fresh-mutable. |
 | 25 | **A JSON replacer/space/reviver is never permitted; enforced, not documented** | rely on code review; document the rule only | A replacer costs 3.51x on Node 26 and indentation 2.11x, and an identity replacer produces byte-identical output so no output check can catch it. Enforced by a repo-wide balanced-paren lint plus a construction-time check on the caller-supplied codec, with `allowSlowCodec: true` as the deliberate escape hatch. |
 | 24 | **ASCII values stored and returned as one-byte strings; non-ASCII as UTF-8** | latin1 for everything (previous behaviour) | Fixes silent mangling of non-ASCII, and keeps ASCII on the representation Node 26's 34%-faster stringify fast path favours. Node 26 penalises all-non-ASCII payloads 2.03x, worse in absolute terms than Node 24. |
 | 23 | **`values: 'primitives'` is the default mode; codec is opt-in** | codec everywhere; JSON-always like bugsee; accept objects natively | Primitives make accounting exact (verified within 1% against measured heap), remove the aliasing hazard entirely, and need no codec. Costs ~20% for flattening plus exact sizing, and pushes object workloads onto a decode-per-hit path. Requires flattening on insert: a cached 1MB substring otherwise retains an 8MB parent. |
