@@ -923,580 +923,6 @@ whatever it likes with it. Freezing hands back a **shared immutable object**, so
 a caller that needs to modify must clone it first. That is the real trade, and
 it is why primitives — where the application owns the codec and therefore gets a
 fresh object per parse, exactly as the bugsee cache does — remains the default
-mode. Codec mode is the opt-in for workloads dominated by L1 hits.### Can object size be measured? No - and a better estimate is not the answer
-
-**Where L1 crosses into native.** An L1 *hit* in the primary crosses nothing —
-it is a plain `Map` lookup, which is why it measures 42ns. A worker's L1 hit
-crosses once, for the `ringHead()` drain check. Every L1 *insert* already calls
-`hashKey()`, so a size measurement there would cost no extra boundary crossing.
-
-**V8 exposes no per-object size to embedders.** `GetShallowSize()` exists only
-on `HeapGraphNode` — inside a heap snapshot, which is stop-the-world. Node-API
-has nothing. Confirmed against the Node 24.15 headers.
-
-**A native structural estimate was built and is worse on both axes.** It walks
-the value through Node-API and models V8 layout (Smi 0, HeapNumber 16,
-SeqOneByteString 16+len, JSObject 16+8n, JSArray 16+16+8n), counting internalised
-property names and shared hidden classes as zero. Against ground truth (measured
-`heapUsed` delta per object, after forced GC):
-
-| estimator | 645B object | 2144B object | 7946B object | cost per call |
-|---|---|---|---|---|
-| **`encodedBytes x 3`** | **-7%** | **+4%** | **+7%** | free — length already known |
-| native structural walk | -26% | -17% | -14% | **5825ns** |
-| `v8.serialize().length` | -73% | -71% | -70% | 3506ns |
-
-The walk consistently undercounts because backing stores, allocation alignment
-and per-object bookkeeping cost more than the model, and shared property names
-cannot be attributed to any one instance. It is also ~5x more expensive than the
-`JSON.stringify` it would accompany (1191ns). Tuning its constants would only
-curve-fit toward the accuracy `encodedBytes x 3` already delivers for free.
-
-**The productive answer is to stop needing per-object accuracy.** The point of
-the byte budget is to bound memory; bound the memory directly instead. A guard
-reads `v8.getHeapStatistics()` after a GC and sheds L1 when the live set exceeds
-a configured fraction of the heap limit:
-
-| configuration | retained live heap | L1 entries kept |
-|---|---|---|
-| guard off, 1GB byte budget | 445MB (50% of limit) | 200,000 |
-| guard at 40% | 297MB (33%) | 128,998 |
-| guard at 20% | **121MB (14%)** | 46,079 |
-
-The deliberately-wrong 1GB budget bound nothing; the guard bounds what actually
-matters. Two things it is not:
-
-- **It needs the event loop to turn.** GC notifications arrive on a later tick,
-  so a fully synchronous loop never receives them. Fine for a server — and a
-  cache that never yields cannot flush its IPC write batch either.
-- **The signal must be read after a GC.** Sampling `used_heap_size` at an
-  arbitrary moment includes uncollected garbage, so shedding *raises* the
-  reading and the guard thrashes. A first attempt did exactly that, ending with
-  higher peak heap than no guard at all.
-
-So: `heapFactor` stays the sizing mechanism, and the guard is the backstop that
-makes its inaccuracy non-fatal rather than something to engineer away.
-
-### Primitives-only mode
-
-Restricting accepted values to `string | number | boolean | null` fixes, in one
-move, the three things the codec mode could not. All three verified:
-
-1. **Byte accounting becomes exact.** A flat V8 string costs `16 + len`
-   (one-byte) or `16 + 2*len` (two-byte), 8-aligned. Measured against real heap
-   usage:
-
-   | kind | len | measured | predicted | error |
-   |---|---|---|---|---|
-   | one-byte | 32 | 51B | 48B | -6% |
-   | one-byte | 1024 | 1041B | 1040B | -0% |
-   | one-byte | 8192 | 8209B | 8208B | -0% |
-   | two-byte | 1024 | 2064B | 2064B | -0% |
-
-   Smis and `true`/`false`/`null` genuinely cost nothing; a non-Smi number is a
-   16-byte HeapNumber. So `heapFactor` disappears and the budget is a real cap
-   rather than an estimate.
-2. **The aliasing hazard disappears.** Primitives are immutable, so there is
-   nothing to mutate, no do-not-mutate contract, and no need for `freeze`.
-3. **No codec to configure.**
-
-**One hole, found and closed.** A V8 `SlicedString` keeps its parent alive, so a
-cached substring can retain an arbitrarily larger document. Measured with an 8MB
-parent, keeping one derived 1MB string and dropping the parent:
-
-| kept value | retained |
-|---|---|
-| the whole 8MB parent (control) | 8.00MB |
-| **1MB substring, as-is** | **8.00MB — the entire parent** |
-| 1MB substring via `native.flatten()` | **1.00MB — exactly its own bytes** |
-
-Primitives mode therefore flattens strings on insert, in native. This costs
-nothing extra in boundary crossings because the insert path already calls
-`hashKey()`, and the flatten itself measures ~42ns for a 200-char value —
-cheaper than the hash call beside it.
-
-**The cost of the mode** is ~20% throughput for flatten plus exact sizing
-(1,542k to 1,227k ops/s on opaque payloads, still 2.4x the bugsee cache), and
-that object workloads must encode in the caller and therefore decode on every
-L1 hit — 291k versus 1,583k measured.
-
-### Three coherent value modes
-
-| mode | L1 holds | accounting | aliasing | L1 hit cost |
-|---|---|---|---|---|
-| **primitives** | the primitive | **exact** | **none** | free |
-| JSON-always (the bugsee design) | JSON string | exact | none | parse per hit |
-| codec, decoded L1 | decoded object | `heapFactor` estimate | **yes** | free |
-
-Worth stating plainly: the bugsee cache's fixed-JSON design gets exact
-accounting and freedom from aliasing for the same structural reason primitives
-mode does — its L1 holds a string. That simplicity is real, and its price is one
-parse per hit, which is what the cluster comparison measured.
-
-**Recommendation:** primitives is the default. The codec mode stays available
-for object-heavy workloads that are dominated by L1 hits, carrying its two
-documented caveats. This keeps the safe, exactly-accountable configuration as
-the one users get without reading anything.
-
-### JSON fast paths on Node 26
-
-Measured on Node 24.15.0 and Node 26.8.1, same machine, 1.4KB payload.
-
-**The premise holds, and then some.** `JSON.stringify` of a pure-ASCII object
-went from 2324ns to **1524ns, 34% faster**. `JSON.parse` improved about 11%.
-
-**But the slow paths did not improve, so falling off one now costs more:**
-
-| variant | Node 24 | Node 26 | penalty on 24 | penalty on 26 |
-|---|---|---|---|---|
-| plain object (fast path) | 2324ns | **1524ns** | — | — |
-| 2-space indent | 3118ns | 3260ns | 1.29x | **2.11x** |
-| replacer function | 5605ns | 5409ns | 2.32x | **3.51x** |
-| all values non-ASCII | 2560ns | 3096ns | 1.10x | **2.03x** |
-
-Two things follow. A `replacer` now costs 3.5x rather than 2.3x. And a heavily
-non-ASCII payload is not merely slower than ASCII on Node 26 — it is **slower
-than the same payload was on Node 24** (3096ns vs 2560ns). The new fast path is
-ASCII-oriented, and it is evaluated per string: injecting a *single* non-ASCII
-character into a 41-string document cost nothing measurable (0.99x); only when
-most strings are non-ASCII does the 2x appear.
-
-**`JSON.parse` is insensitive to string representation.** Flat one-byte, sliced,
-cons, and strings returned from our arena all parse within 2% of each other on
-both versions. So flattening is worth doing for memory (a slice retains its
-parent) but buys nothing for parse speed.
-
-**A replacer is never acceptable, and this is now enforced two ways.** The rule
-is absolute: `JSON.stringify(v)` and `JSON.parse(s)` take exactly one argument.
-
-1. **Repo-wide lint.** `json_fastpath_test.js` scans every `.js` file in the
-   project for `JSON.stringify(`/`JSON.parse(` calls with more than one
-   top-level argument, using balanced-paren scanning rather than a regex so
-   nested calls are not miscounted, and stripping comments first. A file that
-   measures the slow paths on purpose opts out with a
-   `json-fastpath-lint: allow` marker, so the exemption is visible in the file
-   rather than hidden in the linter.
-2. **Construction-time codec check.** The codec is supplied by the caller, where
-   no source lint can reach, so `assertFastCodec` inspects
-   `Function.prototype.toString` of both `encode` and `decode` and rejects any
-   `JSON.stringify`/`JSON.parse` call with a second argument. Native or bound
-   functions report `[native code]` and are accepted; codecs that are not JSON
-   at all are not affected. `allowSlowCodec: true` overrides it.
-
-Output probing alone is not sufficient, which is why the source check exists: an
-**identity replacer** — `JSON.stringify(v, (k, x) => x)` — produces byte-identical
-output while still costing 3.51x, so nothing about the result reveals it.
-
-| codec | verdict |
-|---|---|
-| `JSON.stringify` / `JSON.parse` directly | accepted |
-| `v => JSON.stringify(v)` | accepted |
-| `v => JSON.stringify(Object.assign({}, v))` (nested call) | accepted |
-| `v => JSON.stringify(v, null, 2)` | **rejected** |
-| `v => JSON.stringify(v, (k, x) => x)` | **rejected** |
-| `v => JSON.stringify(v, ['a'])` | **rejected** |
-| `s => JSON.parse(s, (k, x) => x)` | **rejected** |
-| a non-JSON codec (msgpack, protobuf) | accepted, unaffected |
-
-**A real bug this surfaced.** The prototype encoded every value through
-`napi_get_value_string_latin1`, silently mangling any non-ASCII string — a
-limitation noted earlier and now fixed. Values are classified at insert:
-ASCII is stored one byte per character and rebuilt with
-`napi_create_string_latin1`; anything else is stored as UTF-8 and rebuilt with
-`napi_create_string_utf8`. This both fixes correctness and keeps ASCII values on
-the one-byte representation that the Node 26 stringify fast path favours if the
-application re-encodes them. The `FLAG_LATIN1` bit the entry format already
-reserved is what carries the classification.
-
-**End to end**, with JSON on the hot path (codec mode, 60k-key working set):
-444k ops/s on Node 24, **513k ops/s on Node 26** — a 16% gain for free.
-
-### Node-API ABI stability, verified
-
-The addon compiled against Node 24.15 headers loads and runs unmodified on Node
-26.8.1. This is decision 12 paying off directly: had the design used V8 fast
-calls it would have needed a rebuild and a new prebuild for that major, for a
-saving measured at ~6ns per call.
-
-### Mutation safety: what the bugsee cache was buying with JSON
-
-The bugsee cache stringifies on write and parses on read at every layer. That is
-not incidental overhead — it buys two properties deliberately: **every read
-returns a fresh object, so no layer can be corrupted by a caller**, and **any
-JSON-serialisable value is accepted**. Any design that caches decoded objects to
-avoid the parse has to pay for those properties some other way.
-
-**The hazard, as originally built.** `set(key, obj)` put the *caller's own*
-object into L1. So a caller could corrupt the cache without ever calling `get`:
-
-```
-set('acct', user)          // user = { role: 'viewer' }
-user.role = 'admin'        // caller mutates a variable it still holds
-get('acct').role           -> 'admin'    L1 followed the mutation
-L2 (other workers)         -> 'viewer'   diverged; version never changed
-...L1 evicts...
-get('acct').role           -> 'viewer'   silently REVERTED
-```
-
-The revert is the worst part: the bug appears and then disappears on its own,
-at a time determined by eviction pressure.
-
-**Two fixes, both now on by default in codec mode.**
-
-- `isolate` — `set` decodes its own encoding to produce the L1 object, so the
-  cache holds something the caller has never seen. The encoding was needed for
-  L2 anyway; the extra cost is one `decode` per `set`.
-- `freeze` — the cached object is deep-frozen, so mutating a `get` result throws
-  instead of silently corrupting L1.
-
-| configuration | caller mutates its own object | caller mutates `get()` result |
-|---|---|---|
-| codec, `isolate:false` | **corrupts, then reverts** | **corrupts** |
-| codec, `isolate:true` | safe | **corrupts** |
-| **codec, isolate + freeze (default)** | safe | throws `TypeError` |
-| **primitives (default mode)** | safe | safe |
-
-**What each guarantee costs** (300k ops, 90/10 read/write):
-
-| configuration | L1-resident | exceeds L1 | guarantee |
-|---|---|---|---|
-| codec, `isolate:false` | 1,545k | 411k | none |
-| codec, `isolate:true` | 1,068k | 320k | set-side only |
-| **codec, isolate + freeze** | **813k** | 235k | full |
-| primitives / parse-per-get | 413k | 291k | full |
-
-The useful result: **freezing buys the same immutability guarantee as parsing on
-every read, at roughly twice the throughput** — 813k versus 413k on L1-resident
-data. The parse is paid once per insert instead of once per read.
-
-They differ in ergonomics, not safety. Parse-per-get hands back a **fresh mutable
-object every time**, which is the friendlier contract — the caller may do
-whatever it likes with it. Freezing hands back a **shared immutable object**, so
-a caller that needs to modify must clone it first. That is the real trade, and
-it is why primitives — where the application owns the codec and therefore gets a
-fresh object per parse, exactly as the bugsee cache does — remains the default
-mode. Codec mode is the opt-in for workloads dominated by L1 hits.### Comparison against the Bugsee appserver cache
-
-Measured against `Bugsee/appserver/code/components/shared/cache`, a production
-implementation of the same shape: L1 `JsonLru` per worker, L2 in the primary's
-heap reached over `cluster` IPC, plus TTL, alias refs and an L3 adapter.
-Both sized identically (L1 2MB/worker, L2 256MB), same Zipf s=1.0 workload,
-90% read / 10% write, cache-aside, shared keyspace. Harness in `bench/`.
-
-**Single process** — neither cache has an IPC peer, so this is each engine's
-in-process fast path. Values are objects, so *both* pay a JSON encode/decode at
-the application boundary (bugsee internally, turbocache in the caller).
-
-| scenario | turbocache | bugsee | hit rate (tc / bs) |
-|---|---|---|---|
-| 60k keys, exceeds L1 | 304k ops/s | **321k ops/s** | 87.4% / 58.4% |
-| 1k hot keys, fits L1 | **440k ops/s** | 392k ops/s | 99.7% / 99.7% |
-| 60k keys, **opaque string values** | **1,722k ops/s** | 530k ops/s | 87.4% / 56.8% |
-
-With object values the JSON codec dominates and the two are within ~10% — bugsee
-is actually *faster* on the large working set, because in a single process its
-misses cost nothing (no L2 to consult) while turbocache pays a real L2 lookup.
-The 3.2x gap appears only with opaque payloads, where turbocache stores bytes
-verbatim and bugsee's JSON-only API must still encode.
-
-**Cluster, 1 primary + 4 workers** — this is where the architectures separate.
-
-| workers | turbocache | hit rate | bugsee | hit rate |
-|---|---|---|---|---|
-| 1 | 212k ops/s | 82.2% | 62k ops/s | 82.2% |
-| 2 | 381k ops/s | 87.3% | 87k ops/s | 69.1% |
-| 4 | **674k ops/s** | **91.8%** | 79k ops/s | 30.6% |
-
-turbocache scales close to linearly because reads never touch the primary.
-bugsee plateaus near 80k regardless of worker count: every L1 miss is an IPC
-round-trip through one event loop, and past saturation its client either times
-out (100ms) or hits the 256-request pending cap, resolving `undefined` — which
-the application sees as a miss. Its L2 is not the problem; both L2s held exactly
-49,146 entries (62MB of 256MB), so the data was there and simply could not be
-reached in time. This is the bottleneck predicted in decision 1, measured.
-
-At 4 workers with object values: p50 4.0µs vs 56µs, p99 19µs vs 115µs,
-p99.9 173µs vs 4.7ms. With opaque string values, 1,540k vs 72k ops/s.
-
-**Caveats that matter for reading these numbers:**
-
-1. **The write paths are not equivalent.** turbocache's `set` is fire-and-forget
-   — buffered and batched to the primary, unacknowledged, visible to other
-   workers about a tick later. bugsee's `set` awaits an ack. turbocache is
-   trading write visibility for speed, and part of its margin is that trade
-   rather than pure efficiency.
-2. **bugsee is complete; turbocache is a prototype.** TTL, alias refs, an L3
-   adapter, key validation, backpressure and worker-death handling all cost work
-   per operation that turbocache simply does not do yet.
-3. **Single-process misses are unrealistically cheap here.** A miss just refills
-   from a pre-built value. In a real service a miss costs a database query, so
-   the hit-rate column would dominate throughput far more than it does above.
-
-### A tension this exposed between decisions 4 and 5
-
-Decision 4 limits values to bytes and strings; decision 5 says L1 caches the
-*decoded* value so hits skip decoding. When the application stores objects,
-these conflict: the cache only ever sees the encoded string, so L1 caches a
-string and the application re-parses it on **every hit** — exactly the cost
-decision 5 was meant to remove. It is why scenario A above shows no advantage.
-
-Options, none yet chosen: let callers supply a codec so L1 can hold decoded
-values; add an opt-in JSON mode; or accept it and document that turbocache's
-advantage is for opaque payloads and cross-process scaling, not for object
-workloads in a single process.
-
-### Can object size be measured? No - and a better estimate is not the answer
-
-**Where L1 crosses into native.** An L1 *hit* in the primary crosses nothing —
-it is a plain `Map` lookup, which is why it measures 42ns. A worker's L1 hit
-crosses once, for the `ringHead()` drain check. Every L1 *insert* already calls
-`hashKey()`, so a size measurement there would cost no extra boundary crossing.
-
-**V8 exposes no per-object size to embedders.** `GetShallowSize()` exists only
-on `HeapGraphNode` — inside a heap snapshot, which is stop-the-world. Node-API
-has nothing. Confirmed against the Node 24.15 headers.
-
-**A native structural estimate was built and is worse on both axes.** It walks
-the value through Node-API and models V8 layout (Smi 0, HeapNumber 16,
-SeqOneByteString 16+len, JSObject 16+8n, JSArray 16+16+8n), counting internalised
-property names and shared hidden classes as zero. Against ground truth (measured
-`heapUsed` delta per object, after forced GC):
-
-| estimator | 645B object | 2144B object | 7946B object | cost per call |
-|---|---|---|---|---|
-| **`encodedBytes x 3`** | **-7%** | **+4%** | **+7%** | free — length already known |
-| native structural walk | -26% | -17% | -14% | **5825ns** |
-| `v8.serialize().length` | -73% | -71% | -70% | 3506ns |
-
-The walk consistently undercounts because backing stores, allocation alignment
-and per-object bookkeeping cost more than the model, and shared property names
-cannot be attributed to any one instance. It is also ~5x more expensive than the
-`JSON.stringify` it would accompany (1191ns). Tuning its constants would only
-curve-fit toward the accuracy `encodedBytes x 3` already delivers for free.
-
-**The productive answer is to stop needing per-object accuracy.** The point of
-the byte budget is to bound memory; bound the memory directly instead. A guard
-reads `v8.getHeapStatistics()` after a GC and sheds L1 when the live set exceeds
-a configured fraction of the heap limit:
-
-| configuration | retained live heap | L1 entries kept |
-|---|---|---|
-| guard off, 1GB byte budget | 445MB (50% of limit) | 200,000 |
-| guard at 40% | 297MB (33%) | 128,998 |
-| guard at 20% | **121MB (14%)** | 46,079 |
-
-The deliberately-wrong 1GB budget bound nothing; the guard bounds what actually
-matters. Two things it is not:
-
-- **It needs the event loop to turn.** GC notifications arrive on a later tick,
-  so a fully synchronous loop never receives them. Fine for a server — and a
-  cache that never yields cannot flush its IPC write batch either.
-- **The signal must be read after a GC.** Sampling `used_heap_size` at an
-  arbitrary moment includes uncollected garbage, so shedding *raises* the
-  reading and the guard thrashes. A first attempt did exactly that, ending with
-  higher peak heap than no guard at all.
-
-So: `heapFactor` stays the sizing mechanism, and the guard is the backstop that
-makes its inaccuracy non-fatal rather than something to engineer away.
-
-### Primitives-only mode
-
-Restricting accepted values to `string | number | boolean | null` fixes, in one
-move, the three things the codec mode could not. All three verified:
-
-1. **Byte accounting becomes exact.** A flat V8 string costs `16 + len`
-   (one-byte) or `16 + 2*len` (two-byte), 8-aligned. Measured against real heap
-   usage:
-
-   | kind | len | measured | predicted | error |
-   |---|---|---|---|---|
-   | one-byte | 32 | 51B | 48B | -6% |
-   | one-byte | 1024 | 1041B | 1040B | -0% |
-   | one-byte | 8192 | 8209B | 8208B | -0% |
-   | two-byte | 1024 | 2064B | 2064B | -0% |
-
-   Smis and `true`/`false`/`null` genuinely cost nothing; a non-Smi number is a
-   16-byte HeapNumber. So `heapFactor` disappears and the budget is a real cap
-   rather than an estimate.
-2. **The aliasing hazard disappears.** Primitives are immutable, so there is
-   nothing to mutate, no do-not-mutate contract, and no need for `freeze`.
-3. **No codec to configure.**
-
-**One hole, found and closed.** A V8 `SlicedString` keeps its parent alive, so a
-cached substring can retain an arbitrarily larger document. Measured with an 8MB
-parent, keeping one derived 1MB string and dropping the parent:
-
-| kept value | retained |
-|---|---|
-| the whole 8MB parent (control) | 8.00MB |
-| **1MB substring, as-is** | **8.00MB — the entire parent** |
-| 1MB substring via `native.flatten()` | **1.00MB — exactly its own bytes** |
-
-Primitives mode therefore flattens strings on insert, in native. This costs
-nothing extra in boundary crossings because the insert path already calls
-`hashKey()`, and the flatten itself measures ~42ns for a 200-char value —
-cheaper than the hash call beside it.
-
-**The cost of the mode** is ~20% throughput for flatten plus exact sizing
-(1,542k to 1,227k ops/s on opaque payloads, still 2.4x the bugsee cache), and
-that object workloads must encode in the caller and therefore decode on every
-L1 hit — 291k versus 1,583k measured.
-
-### Three coherent value modes
-
-| mode | L1 holds | accounting | aliasing | L1 hit cost |
-|---|---|---|---|---|
-| **primitives** | the primitive | **exact** | **none** | free |
-| JSON-always (the bugsee design) | JSON string | exact | none | parse per hit |
-| codec, decoded L1 | decoded object | `heapFactor` estimate | **yes** | free |
-
-Worth stating plainly: the bugsee cache's fixed-JSON design gets exact
-accounting and freedom from aliasing for the same structural reason primitives
-mode does — its L1 holds a string. That simplicity is real, and its price is one
-parse per hit, which is what the cluster comparison measured.
-
-**Recommendation:** primitives is the default. The codec mode stays available
-for object-heavy workloads that are dominated by L1 hits, carrying its two
-documented caveats. This keeps the safe, exactly-accountable configuration as
-the one users get without reading anything.
-
-### JSON fast paths on Node 26
-
-Measured on Node 24.15.0 and Node 26.8.1, same machine, 1.4KB payload.
-
-**The premise holds, and then some.** `JSON.stringify` of a pure-ASCII object
-went from 2324ns to **1524ns, 34% faster**. `JSON.parse` improved about 11%.
-
-**But the slow paths did not improve, so falling off one now costs more:**
-
-| variant | Node 24 | Node 26 | penalty on 24 | penalty on 26 |
-|---|---|---|---|---|
-| plain object (fast path) | 2324ns | **1524ns** | — | — |
-| 2-space indent | 3118ns | 3260ns | 1.29x | **2.11x** |
-| replacer function | 5605ns | 5409ns | 2.32x | **3.51x** |
-| all values non-ASCII | 2560ns | 3096ns | 1.10x | **2.03x** |
-
-Two things follow. A `replacer` now costs 3.5x rather than 2.3x. And a heavily
-non-ASCII payload is not merely slower than ASCII on Node 26 — it is **slower
-than the same payload was on Node 24** (3096ns vs 2560ns). The new fast path is
-ASCII-oriented, and it is evaluated per string: injecting a *single* non-ASCII
-character into a 41-string document cost nothing measurable (0.99x); only when
-most strings are non-ASCII does the 2x appear.
-
-**`JSON.parse` is insensitive to string representation.** Flat one-byte, sliced,
-cons, and strings returned from our arena all parse within 2% of each other on
-both versions. So flattening is worth doing for memory (a slice retains its
-parent) but buys nothing for parse speed.
-
-**A replacer is never acceptable, and this is now enforced two ways.** The rule
-is absolute: `JSON.stringify(v)` and `JSON.parse(s)` take exactly one argument.
-
-1. **Repo-wide lint.** `json_fastpath_test.js` scans every `.js` file in the
-   project for `JSON.stringify(`/`JSON.parse(` calls with more than one
-   top-level argument, using balanced-paren scanning rather than a regex so
-   nested calls are not miscounted, and stripping comments first. A file that
-   measures the slow paths on purpose opts out with a
-   `json-fastpath-lint: allow` marker, so the exemption is visible in the file
-   rather than hidden in the linter.
-2. **Construction-time codec check.** The codec is supplied by the caller, where
-   no source lint can reach, so `assertFastCodec` inspects
-   `Function.prototype.toString` of both `encode` and `decode` and rejects any
-   `JSON.stringify`/`JSON.parse` call with a second argument. Native or bound
-   functions report `[native code]` and are accepted; codecs that are not JSON
-   at all are not affected. `allowSlowCodec: true` overrides it.
-
-Output probing alone is not sufficient, which is why the source check exists: an
-**identity replacer** — `JSON.stringify(v, (k, x) => x)` — produces byte-identical
-output while still costing 3.51x, so nothing about the result reveals it.
-
-| codec | verdict |
-|---|---|
-| `JSON.stringify` / `JSON.parse` directly | accepted |
-| `v => JSON.stringify(v)` | accepted |
-| `v => JSON.stringify(Object.assign({}, v))` (nested call) | accepted |
-| `v => JSON.stringify(v, null, 2)` | **rejected** |
-| `v => JSON.stringify(v, (k, x) => x)` | **rejected** |
-| `v => JSON.stringify(v, ['a'])` | **rejected** |
-| `s => JSON.parse(s, (k, x) => x)` | **rejected** |
-| a non-JSON codec (msgpack, protobuf) | accepted, unaffected |
-
-**A real bug this surfaced.** The prototype encoded every value through
-`napi_get_value_string_latin1`, silently mangling any non-ASCII string — a
-limitation noted earlier and now fixed. Values are classified at insert:
-ASCII is stored one byte per character and rebuilt with
-`napi_create_string_latin1`; anything else is stored as UTF-8 and rebuilt with
-`napi_create_string_utf8`. This both fixes correctness and keeps ASCII values on
-the one-byte representation that the Node 26 stringify fast path favours if the
-application re-encodes them. The `FLAG_LATIN1` bit the entry format already
-reserved is what carries the classification.
-
-**End to end**, with JSON on the hot path (codec mode, 60k-key working set):
-444k ops/s on Node 24, **513k ops/s on Node 26** — a 16% gain for free.
-
-### Node-API ABI stability, verified
-
-The addon compiled against Node 24.15 headers loads and runs unmodified on Node
-26.8.1. This is decision 12 paying off directly: had the design used V8 fast
-calls it would have needed a rebuild and a new prebuild for that major, for a
-saving measured at ~6ns per call.
-
-### Mutation safety: what the bugsee cache was buying with JSON
-
-The bugsee cache stringifies on write and parses on read at every layer. That is
-not incidental overhead — it buys two properties deliberately: **every read
-returns a fresh object, so no layer can be corrupted by a caller**, and **any
-JSON-serialisable value is accepted**. Any design that caches decoded objects to
-avoid the parse has to pay for those properties some other way.
-
-**The hazard, as originally built.** `set(key, obj)` put the *caller's own*
-object into L1. So a caller could corrupt the cache without ever calling `get`:
-
-```
-set('acct', user)          // user = { role: 'viewer' }
-user.role = 'admin'        // caller mutates a variable it still holds
-get('acct').role           -> 'admin'    L1 followed the mutation
-L2 (other workers)         -> 'viewer'   diverged; version never changed
-...L1 evicts...
-get('acct').role           -> 'viewer'   silently REVERTED
-```
-
-The revert is the worst part: the bug appears and then disappears on its own,
-at a time determined by eviction pressure.
-
-**Two fixes, both now on by default in codec mode.**
-
-- `isolate` — `set` decodes its own encoding to produce the L1 object, so the
-  cache holds something the caller has never seen. The encoding was needed for
-  L2 anyway; the extra cost is one `decode` per `set`.
-- `freeze` — the cached object is deep-frozen, so mutating a `get` result throws
-  instead of silently corrupting L1.
-
-| configuration | caller mutates its own object | caller mutates `get()` result |
-|---|---|---|
-| codec, `isolate:false` | **corrupts, then reverts** | **corrupts** |
-| codec, `isolate:true` | safe | **corrupts** |
-| **codec, isolate + freeze (default)** | safe | throws `TypeError` |
-| **primitives (default mode)** | safe | safe |
-
-**What each guarantee costs** (300k ops, 90/10 read/write):
-
-| configuration | L1-resident | exceeds L1 | guarantee |
-|---|---|---|---|
-| codec, `isolate:false` | 1,545k | 411k | none |
-| codec, `isolate:true` | 1,068k | 320k | set-side only |
-| **codec, isolate + freeze** | **813k** | 235k | full |
-| primitives / parse-per-get | 413k | 291k | full |
-
-The useful result: **freezing buys the same immutability guarantee as parsing on
-every read, at roughly twice the throughput** — 813k versus 413k on L1-resident
-data. The parse is paid once per insert instead of once per read.
-
-They differ in ergonomics, not safety. Parse-per-get hands back a **fresh mutable
-object every time**, which is the friendlier contract — the caller may do
-whatever it likes with it. Freezing hands back a **shared immutable object**, so
-a caller that needs to modify must clone it first. That is the real trade, and
-it is why primitives — where the application owns the codec and therefore gets a
-fresh object per parse, exactly as the bugsee cache does — remains the default
 mode. Codec mode is the opt-in for workloads dominated by L1 hits.
 
 | Claim | Result |
@@ -1506,6 +932,136 @@ mode. Codec mode is the opt-in for workloads dominated by L1 hits.
 
 Seqlock correctness needs TSAN before this is trusted in production — 22M clean
 reads is strong evidence, not proof.
+
+### Type conversion between L1 and L2
+
+Two conversions on the path, answering different questions.
+
+```
+  app value ──codec.encode──► string ──native set──► arena bytes + type flags
+   (L1 holds THIS form)                               (L2 holds this)
+```
+
+The **codec layer (JS)** converts application value to string, and exists only in
+codec modes. L1 holds the value on the *application* side of that arrow, which is
+what makes an L1 hit free of decoding. The **native layer (C++)** converts a JS
+value to arena bytes, and this is where type must be preserved — L2 is read by
+other processes that share no JS state.
+
+| JS value | stored in the arena | flags | rebuilt as |
+|---|---|---|---|
+| ASCII string | one byte per char | `STRING\|LATIN1` | `create_string_latin1` |
+| non-ASCII string | UTF-8 | `STRING` | `create_string_utf8` |
+| number | the 8 raw bytes of the double | `NUMBER` | `create_double` |
+| boolean | one byte | `BOOL` | `get_boolean` |
+| null | zero bytes | `NULL` | `get_null` |
+| BigInt | sign byte + 64-bit words | `BIGINT` | `create_bigint_words` |
+
+Doubles are stored raw rather than as text: exact, no parsing, verified to
+round-trip `-0`, `NaN`, `±Infinity`, subnormals and `MAX_VALUE`. A stored `null`
+stays distinguishable from a miss.
+
+Two bugs this analysis found, before the type tags existed: **numbers and
+booleans never reached L2 at all** (they lived in L1 only, vanished on eviction,
+were invisible to other workers — while `get` looked correct until then), and
+**`null` threw** on both paths from taking `.length` of it.
+
+### Type support across the three modes
+
+Measured end to end — set, forced L1 eviction, read back through the arena.
+
+| input | `primitives` | codec: JSON | codec: `v8.serialize` |
+|---|---|---|---|
+| string / number / boolean / null | exact | exact | exact |
+| `BigInt` | exact | rejected | exact |
+| `Date` | rejected | **`string`** | `Date` |
+| `Array` / `Object` | rejected | exact | exact |
+| `Map` / `Set` | rejected | **`{}`** | preserved |
+| `Uint8Array` | rejected | **plain object** | `Uint8Array` |
+| `RegExp` | rejected | **`{}`** | `RegExp` |
+
+Primitives rejects loudly; JSON converts silently. A cache that quietly changes
+your types is worse than one that refuses them.
+
+### structuredClone for L1: measured, rejected for isolation
+
+Cloning the cached object per read is the obvious way to hand back something
+mutable. It is the slowest option, and Node 26 widens the gap because it sped up
+JSON and not structured cloning:
+
+| payload | freeze (shared) | `structuredClone` | `JSON.parse(str)` |
+|---|---|---|---|
+| 201B | 8ns | 1675ns | 604ns |
+| 1411B | 4ns | 9533ns | 4133ns |
+| 7311B | 4ns | 44026ns | 18046ns |
+
+2.0–2.4x slower than parsing the equivalent string, and parsing needs that string
+kept in L1 beside the object. Freezing is three orders of magnitude cheaper than
+either. V8 structured serialization still earns a place — not as a per-read
+clone, but as a **codec**, where it encodes to bytes for L2 exactly as JSON does.
+
+### Storage modes
+
+`storage: 'primitives' | 'direct' | 'safe'`.
+
+| | `primitives` (default) | `direct` | `safe` |
+|---|---|---|---|
+| accepts | scalars only, rejects rest | any structured-cloneable value | any JSON value |
+| encoding | none — the app owns it | `v8.serialize` | `JSON.stringify` |
+| L1 holds | the primitive | the **decoded, frozen** value | the **encoded string** |
+| per read | nothing | nothing | one `JSON.parse` |
+| result | immutable by nature | shared and frozen | **fresh and mutable** |
+| byte accounting | **exact** | estimated (`heapFactor`) | encoded length |
+
+`safe` means *mutation*-safe: every read is a fresh object, so a caller can do
+anything to it. It is not type-safe — it is precisely the mode that turns a
+`Date` into a string. `direct` is the type-faithful one. Different safeties, both
+real, and the docs must say which.
+
+**A hole in `direct` that JS cannot close.** `Object.freeze` throws on an
+ArrayBuffer view with elements, and `ArrayBuffer.prototype.transferToImmutable`
+exists in neither Node 24 nor 26 (checked). So the object graph is frozen but
+typed-array **contents** stay writable: a caller writing into one corrupts L1 for
+its own process until eviction returns the arena's copy. Values holding typed
+arrays want `safe` mode, or a defensive copy.
+
+### Mode scorecard
+
+From `bench/modes_report.js`, which is repeatable.
+
+**Validity** — 18 types incl. `-0`, `NaN`, cycles:
+
+| | exact | silently converted | rejected | lost |
+|---|---|---|---|---|
+| `primitives` | 11/18 | **0** | 7 | 0 |
+| `direct` | **18/18** | **0** | 0 | 0 |
+| `safe` | 9/18 | **8** | 1 | 0 |
+
+**Safety** — can a caller corrupt the cache?
+
+| vector | `primitives` | `direct` | `safe` |
+|---|---|---|---|
+| mutate the object passed to `set` | n/a | safe | safe |
+| mutate the `get()` result | n/a | throws | safe |
+| mutate a nested object in the result | n/a | throws | safe |
+| write into a typed array in the result | n/a | **CORRUPTED** | n/a |
+| survives L1 eviction unchanged | safe | safe | safe |
+
+**Consistency** — 6,000 randomised ops over 300 keys, identical stream per mode:
+zero mismatches between what L1 serves and what the arena serves after eviction,
+in every mode; a read-only worker reads 200/200 correctly in every mode.
+
+**Performance** — 200k ops, throughput / p50:
+
+| workload | `primitives` | `direct` | `safe` |
+|---|---|---|---|
+| reads dominate, fits L1 | 431k / 1209ns | **1196k / 42ns** | 430k / 1208ns |
+| mixed 90/10, exceeds L1 | **351k** / 1875ns | 174k / 2917ns | 318k / 2000ns |
+| write-heavy 50/50 | **445k** / 1458ns | 118k / 5375ns | 322k / 2000ns |
+
+The swing is nearly an order of magnitude across the diagonal: `direct` is 2.8x
+faster than `primitives` when reads dominate and 3.8x slower when writes do.
+Choose by read/write ratio and type needs, not by a global default.
 
 ## 10. Why not V8 fast calls
 
@@ -1570,17 +1126,64 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 
 ---
 
-## 13. Open questions
+## 13. What is still open
 
-1. **`clear()` scope.** Proposed: clears the caller's L1, asks the primary to clear L2, and appends a flush-all record to the ring so every worker drops its L1. That is a large cross-process side effect from an innocuous-looking call — worth a `clearLocal()` companion.
-2. **Atomic RMW** (`incr`, `cas`). Proposed out of scope for v1. With a single writer, these are actually easy to add later — the primary can serialize them trivially.
-3. **Multiple named caches.** Proposed: one arena, with `namespace` prefixed into the key before hashing. Simple, but namespaces then share one eviction budget and cannot be sized independently.
-4. **Ring capacity.** Needs a number. Too small and workers flush L1 spuriously under write bursts; too large and it wastes arena bytes. Wants measurement against a realistic write rate.
-5. ~~**L2 index structure.**~~ **Settled by the prototype** — see decision 16 and §9. Open addressing for the index, circular log with second-chance re-append for the data region.
-6. **Background compression.** Since the primary owns L2 and is off the read path, its sweeper could compress cold entries under memory pressure — keeping writes fast while recovering density only when it is actually needed. This is probably the right answer for compression, but it is unbuilt and unmeasured.
-7. **Second-chance budget.** The prototype caps re-appends at 64 per allocation, chosen arbitrarily. Needs tuning against a realistic write rate.
+### Decisions that need a call
 
----
+1. **Atomic read-modify-write** (`incr`, `cas`). Out of scope so far. With a
+   single writer these are genuinely easy — the primary can serialise them — but
+   the API shape (return the new value? a `Promise` for a worker, since the write
+   is batched?) has not been decided.
+2. **Namespaces share one eviction budget.** `namespace` is implemented as a key
+   prefix, so a hot namespace can evict a cold one and neither can be sized or
+   cleared independently. Fine for one application; wrong if two subsystems with
+   different working sets share a process.
+3. **Ring capacity** is hard-coded at 8192 records, and the **second-chance
+   budget** at 64 re-appends per allocation. Both were picked arbitrarily and
+   neither has been measured against a realistic write rate. Too small a ring
+   makes workers flush L1 spuriously under write bursts.
+
+### Known limitations, accepted and documented
+
+4. **Capacity is quantised to powers of two.** The log masks offsets with
+   `dataBytes - 1`, so a 24MB, 26MB, 28MB or 32MB arena all yield exactly 16MB of
+   data. Capacity can only be doubled, not tuned, which makes the §7 sizing
+   formulas misleading. Fixable with a comparison instead of a mask on the
+   allocation path.
+5. **`direct` mode cannot protect typed-array contents** — JS offers no way to
+   freeze them. Documented, asserted in `storage_modes_test.js`.
+6. **The L1 byte budget is an estimate whenever a codec is in use**
+   (`heapFactor`, measured at 2.79–3.21x but shape-dependent). The post-GC heap
+   guard is the backstop, and it needs the event loop to turn.
+7. **`safe` mode silently converts 8 of 18 types.** Inherent to JSON, not a bug,
+   but it is the reason the mode is not the default.
+
+### Unbuilt
+
+8. **`Buffer` / `Uint8Array` / `ArrayBuffer` as first-class values.** Decision 4
+   lists them; the native layer handles only strings and scalars, so
+   `primitives` mode rejects them today.
+9. **The L3 (Valkey) seam.** Nothing exists. It is the reason the async method
+   variants were reserved.
+10. **TTL sweeping.** Expiry is lazy on read in both tiers, so an expired entry
+    occupies arena space until the tail reaches it and `live` drifts high. No
+    background sweep.
+11. **Primary-crash detection.** The `heartbeatNs` header field exists and is
+    never written or read, so a worker cannot tell a stale arena from a live one.
+12. **Windows.** Needs `CreateFileMapping` — a second shared-memory
+    implementation.
+
+### Before anyone else could use this
+
+13. **TSAN has never been run** against the seqlock. ~90M clean cross-process
+    reads is strong evidence, not proof, and the seqlock is the only lock-free
+    code in the design.
+14. **No packaging at all**: no `package.json`, no README, no CI, no prebuilds.
+    The Node-API ABI check means one prebuild per platform would cover every
+    Node major, but none is produced.
+15. **Two vendored-in-name-only dependencies.** `lz4` is linked from a Homebrew
+    path in `binding.gyp`, and `rapidhash.h` is a transcription rather than the
+    upstream header. Both need vendoring before this builds anywhere else.
 
 ## 14. Assumptions
 
