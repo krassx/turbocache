@@ -11,6 +11,7 @@ const v8ser = require('v8');
 const { PerformanceObserver } = require('perf_hooks');
 
 const MSG = 'tc';
+let storeReady = false;      // the native store is a per-process singleton
 
 class TurboCache {
     #l1 = new Map();          // key -> { v, bytes, hits }
@@ -21,6 +22,7 @@ class TurboCache {
     #flushScheduled = false;
     #cursor = 0;
     #ns = '';
+    #nsId = 0;
     #maxValue = 0;
     #id;
     #codec;
@@ -41,7 +43,16 @@ class TurboCache {
     // entirely - which is what decision 5 was actually for. Without a codec the
     // value is already opaque bytes and L1 is optimal as-is.
     constructor(opts = {}) {
-        this.#ns = opts.namespace ? opts.namespace + ':' : '';
+        // A namespace is a key prefix AND an arena-level identity, so it can
+        // carry a byte quota that eviction respects.
+        const nsOpt = typeof opts.namespace === 'string' ? { name: opts.namespace } : opts.namespace;
+        if (nsOpt && nsOpt.name) {
+            this.#ns = nsOpt.name + ':';
+            // #id is assigned further down, so read the option directly: only the
+            // primary may register a namespace; a worker must find it already there.
+            this.#nsId = native.nsResolve(nsOpt.name, nsOpt.quotaBytes || 0, (opts.workerId || 0) === 0);
+            if (this.#nsId < 0) throw new Error(`namespace table full (max ${16}) or not registered by the primary`);
+        }
         this.#maxValue = native.maxValueBytes();
         this.#l1Max = opts.l1MaxBytes || 2 * 1024 * 1024;
         this.#id = opts.workerId || 0;
@@ -227,8 +238,13 @@ class TurboCache {
     // the primary (create the arena) or a worker (attach to it), and sizes
     // everything from the machine. createPrimary/attachWorker remain for tests
     // and for callers that want to pin the numbers.
+    // Second and later calls in the same process bind another namespace to the
+    // arena this process already created or attached, rather than trying to
+    // create it again. Several namespaces in one process is a normal thing to
+    // want and there was previously no way to express it.
     static open(opts = {}) {
         const cluster = require('cluster');
+        if (storeReady) return new TurboCache({ workerId: cluster.isWorker ? cluster.worker.id : 0, ...opts });
         const auto = TurboCache.autoSize();
         const arenaBytes = opts.arenaBytes || auto.arenaBytes;
         const indexSlots = opts.indexSlots || auto.indexSlots;
@@ -256,10 +272,12 @@ class TurboCache {
     static createPrimary(name, arenaBytes, indexSlots, opts = {}) {
         if (!native.create(name, arenaBytes, indexSlots, 2)) throw new Error('arena create failed');
         native.setCompressMin(1 << 30);                 // compression off, per DESIGN.md
+        storeReady = true;
         return new TurboCache({ ...opts, workerId: 0 });
     }
     static attachWorker(name, workerId, opts = {}) {
         if (!native.attach(name)) throw new Error('arena attach failed');
+        storeReady = true;
         return new TurboCache({ ...opts, workerId });
     }
 
@@ -421,11 +439,11 @@ class TurboCache {
         this.#l1Put(key, l1Value, native.hashKey(key), this.#primitives ? 0 : enc.length,
                     ttlMs > 0 ? Date.now() + ttlMs : 0);
         if (this.#id === 0) {
-            const ok = native.set(key, enc, 0, ttlMs);
+            const ok = native.set(key, enc, 0, ttlMs, this.#nsId);
             if (!ok) { this.stats.rejectedSize++; this.lastError = 'value does not fit the arena'; this.#l1Drop(key); }
             return ok;
         }
-        this.#outbox.push('s', key, enc, ttlMs);
+        this.#outbox.push('s', key, enc, ttlMs, this.#nsId);
         this.#schedule();
         return true;                      // queued; capacity is decided by the primary
     }
@@ -454,7 +472,7 @@ class TurboCache {
         this.stats.deletes++;
         this.#l1Drop(key);
         if (this.#id === 0) return native.del(key, 0);
-        this.#outbox.push('d', key, null, 0);
+        this.#outbox.push('d', key, null, 0, this.#nsId);
         this.#schedule();
         return true;
     }
@@ -471,13 +489,25 @@ class TurboCache {
     clearAll() {
         this.clearLocal();
         if (this.#id === 0) { native.clearAll(0); return; }
-        this.#outbox.push('c', '', null, 0);
+        this.#outbox.push('c', '', null, 0, this.#nsId);
         this.#schedule();
     }
 
+    // Drops every entry of THIS cache's namespace, leaving other namespaces
+    // untouched. The blunt clearAll() wipes the whole arena.
+    clearNamespace() {
+        this.clearLocal();
+        if (this.#id === 0) return native.clearNamespace(this.#nsId, 0);
+        this.#outbox.push('n', '', null, 0, this.#nsId);
+        this.#schedule();
+        return true;
+    }
+
+    static namespaceStats() { return native.nsStats(); }
+
     close() {
         this.stopGuard();
-        if (this.#id === 0) native.destroy();
+        if (this.#id === 0 && storeReady) { native.destroy(); storeReady = false; }
     }
 
     get l1Size() { return this.#l1.size; }
@@ -490,18 +520,19 @@ class TurboCache {
         const batch = this.#outbox;
         this.#outbox = [];
         this.stats.flushes++;
-        this.stats.sent += batch.length / 4;
+        this.stats.sent += batch.length / 5;
         process.send({ t: MSG, id: this.#id, b: batch });
     }
 
     // Primary side: apply a worker's batch to L2.
     static applyBatch(msg) {
         const b = msg.b;
-        for (let i = 0; i < b.length; i += 4) {
+        for (let i = 0; i < b.length; i += 5) {
             const op = b[i];
-            if (op === 's') native.set(b[i + 1], b[i + 2], msg.id, b[i + 3]);
+            if (op === 's') native.set(b[i + 1], b[i + 2], msg.id, b[i + 3], b[i + 4]);
             else if (op === 'd') native.del(b[i + 1], msg.id);
             else if (op === 'c') native.clearAll(msg.id);
+            else if (op === 'n') native.clearNamespace(b[i + 4], msg.id);
         }
     }
     static isCacheMessage(m) { return m && m.t === MSG; }

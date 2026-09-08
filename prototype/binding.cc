@@ -17,6 +17,7 @@ static int compressAccel = 1;   // LZ4 acceleration: higher = faster, worse rati
 static uint32_t nowSec() { return (uint32_t)time(nullptr); }
 
 static bool strInfo(napi_env env, napi_value v, size_t *charLen, size_t *utf8Len);
+static void put(napi_env env, napi_value o, const char *k, double v);
 
 #define ARG(n) napi_value argv[n]; size_t argc = n; \
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
@@ -51,7 +52,7 @@ static napi_value SetCompressMin(napi_env env, napi_callback_info info) {
 
 // set(key, value) - value is a latin1 string in this prototype
 static napi_value Set(napi_env env, napi_callback_info info) {
-  ARG(4)
+  ARG(5)
   char key[512]; size_t klen = 0;
   napi_get_value_string_latin1(env, argv[0], key, sizeof(key), &klen);
   // Encode by type, tagging the entry so the reader rebuilds the right JS
@@ -106,12 +107,13 @@ static napi_value Set(napi_env env, napi_callback_info info) {
       payload = cbuf; storedLen = (uint32_t)c; flags |= FLAG_COMPRESSED;
     }
   }
-  int32_t writerId = 0, ttlMs = 0;
+  int32_t writerId = 0, ttlMs = 0, ns = 0;
   if (argc > 2) napi_get_value_int32(env, argv[2], &writerId);
   if (argc > 3) napi_get_value_int32(env, argv[3], &ttlMs);
+  if (argc > 4) napi_get_value_int32(env, argv[4], &ns);
   uint32_t expiresAt = ttlMs > 0 ? nowSec() + (uint32_t)((ttlMs + 999) / 1000) : 0;
   bool ok = storeSet(g, (const uint8_t *)key, (uint16_t)klen, payload, storedLen, rawLen,
-                     flags, expiresAt, (uint16_t)writerId);
+                     flags, expiresAt, (uint16_t)writerId, (uint8_t)ns);
   napi_value r; napi_get_boolean(env, ok, &r); return r;
 }
 
@@ -177,6 +179,40 @@ static napi_value Del(napi_env env, napi_callback_info info) {
   napi_value r;
   napi_get_boolean(env, storeDelete(g, (const uint8_t *)key, (uint16_t)klen, (uint16_t)writerId), &r);
   return r;
+}
+
+// nsResolve(name, quotaBytes, create) -> id, or -1 if the table is full
+static napi_value NsResolve(napi_env env, napi_callback_info info) {
+  ARG(3) char nm[64]; size_t n = 0;
+  napi_get_value_string_latin1(env, argv[0], nm, sizeof(nm), &n);
+  double quota = 0; napi_get_value_double(env, argv[1], &quota);
+  bool create = false; napi_get_value_bool(env, argv[2], &create);
+  napi_value r; napi_create_int32(env, nsResolve(g, nm, (uint64_t)quota, create), &r); return r;
+}
+
+static napi_value ClearNamespace(napi_env env, napi_callback_info info) {
+  ARG(2) int32_t ns = 0, writerId = 0;
+  napi_get_value_int32(env, argv[0], &ns);
+  if (argc > 1) napi_get_value_int32(env, argv[1], &writerId);
+  napi_value r;
+  napi_create_double(env, (double)storeClearNamespace(g, (uint8_t)ns, (uint16_t)writerId), &r);
+  return r;
+}
+
+static napi_value NsStats(napi_env env, napi_callback_info) {
+  napi_value arr; napi_create_array(env, &arr);
+  for (uint32_t i = 0; i < g.h->nsCount; i++) {
+    napi_value o; napi_create_object(env, &o);
+    napi_value nm; napi_create_string_latin1(env, g.h->nsName[i], NAPI_AUTO_LENGTH, &nm);
+    napi_set_named_property(env, o, "name", nm);
+    put(env, o, "id", i);
+    put(env, o, "bytes", (double)g.h->nsBytes[i]);
+    put(env, o, "quota", (double)g.h->nsQuota[i]);
+    put(env, o, "protected", (double)g.h->nsProtected[i]);
+    put(env, o, "dropped", (double)g.h->nsDropped[i]);
+    napi_set_element(env, arr, i, o);
+  }
+  return arr;
 }
 
 static napi_value ClearAll(napi_env env, napi_callback_info info) {
@@ -287,7 +323,7 @@ static napi_value CompactAsync(napi_env env, napi_callback_info info) {
     // Compressing a hot entry taxes every future read of it. Only compress
     // entries that have not been touched since their last second chance -
     // the ones about to be evicted anyway.
-    if (coldOnly && e->refBit) continue;
+    if (coldOnly && g.hints[e->slot].load(std::memory_order_relaxed)) continue;
     if (e->keyLen > 256) continue;
     uint32_t slot = e->slot;
     if (slot >= h->indexSlots) continue;
@@ -501,6 +537,17 @@ static napi_value HintsSet(napi_env env, napi_callback_info) {
 static napi_value SetBackwardShift(napi_env env, napi_callback_info info) {
   ARG(1) bool v; napi_get_value_bool(env, argv[0], &v); g_backwardShift = v; return nullptr;
 }
+static napi_value SetSecondChanceBudget(napi_env env, napi_callback_info info) {
+  ARG(1) int32_t v; napi_get_value_int32(env, argv[0], &v); g_secondChanceBudget = v; return nullptr;
+}
+// How far the ring head has run ahead, and its capacity: enough to tell whether
+// a worker would have lost records.
+static napi_value RingStats(napi_env env, napi_callback_info) {
+  napi_value o; napi_create_object(env, &o);
+  put(env, o, "head", (double)g.h->ringHead.load(std::memory_order_acquire));
+  put(env, o, "capacity", (double)g.h->ringCap);
+  return o;
+}
 static napi_value SetSuppressRefBit(napi_env env, napi_callback_info info) {
   ARG(1) bool v; napi_get_value_bool(env, argv[0], &v); g_suppressRefBit = v; return nullptr;
 }
@@ -537,6 +584,11 @@ static napi_value Stats(napi_env env, napi_callback_info) {
   put(env, o, "live", (double)h->live);
   put(env, o, "inserts", (double)h->inserts);
   put(env, o, "evictions", (double)h->evictions);
+  put(env, o, "reappends", (double)h->reappends);
+  put(env, o, "reappendSkippedNoRoom", (double)h->reappendSkippedNoRoom);
+  put(env, o, "dropped", (double)h->dropped);
+  put(env, o, "tailAdvances", (double)h->tailAdvances);
+  put(env, o, "tailLive", (double)h->tailLive);
   put(env, o, "liveBytes", (double)h->liveBytes);
   put(env, o, "dataBytes", (double)h->dataBytes);
   put(env, o, "bumpPtr", (double)h->bumpPtr);
@@ -552,9 +604,9 @@ static napi_value Destroy(napi_env env, napi_callback_info) { g.destroy(); retur
                        napi_set_named_property(env, exports, name, f); }
 static napi_value Init(napi_env env, napi_value exports) {
   FN("create", Create) FN("attach", Attach) FN("set", Set) FN("get", Get)
-  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes)
+  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("nsResolve", NsResolve) FN("clearNamespace", ClearNamespace) FN("nsStats", NsStats) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes)
   FN("destroy", Destroy) FN("poke", Poke)
-  FN("suppressRefBit", SetSuppressRefBit) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin)
+  FN("suppressRefBit", SetSuppressRefBit) FN("secondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin)
   return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)

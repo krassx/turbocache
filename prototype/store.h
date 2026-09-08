@@ -44,7 +44,7 @@ struct Entry {
   uint32_t blockSize;          // total bytes incl. header (slab class size, or log record size)
   uint16_t keyLen;
   uint8_t  flags;
-  uint8_t  refBit;
+  uint8_t  ns;          // namespace id, 0 = default
 };
 
 struct IndexSlot {
@@ -64,6 +64,8 @@ static const double MAX_LOAD = 0.75;
 static const uint64_t MIN_DATA_BYTES = 1u << 16;
 
 #define NCLASS 32
+#define NS_MAX 16
+#define NS_NAMELEN 24
 
 struct Header {
   uint32_t magic, layout;
@@ -90,6 +92,19 @@ struct Header {
   // stats
   uint64_t inserts, evictions, live, liveBytes, allocBytes;
   uint64_t maxLive, indexEvictions, shiftMoves;
+
+  // Namespaces. Without quotas a hot namespace evicts a cold one and neither
+  // can be sized or cleared on its own. Quotas are SOFT and enforced through
+  // the second-chance path: at the tail, an entry of an under-quota namespace
+  // gets another lap, an over-quota one is dropped. Progress is guaranteed
+  // whenever the quotas sum to no more than capacity, since a full arena then
+  // always contains at least one over-quota namespace.
+  uint32_t nsCount;
+  char     nsName[NS_MAX][NS_NAMELEN];
+  uint64_t nsBytes[NS_MAX];
+  uint64_t nsQuota[NS_MAX];          // 0 = no quota, competes freely
+  uint64_t nsProtected[NS_MAX], nsDropped[NS_MAX];
+  uint64_t reappends, reappendSkippedNoRoom, dropped, tailAdvances, tailLive;
 };
 
 struct Store {
@@ -136,7 +151,19 @@ struct Store {
     h->indexSlots = indexSlots;
     uint64_t indexBytes = indexSlots * sizeof(IndexSlot);
     h->ringOff = h->indexOff + indexBytes;
-    h->ringCap = 8192;
+    // Ring capacity is a TIME budget, not a count. A worker that fails to drain
+    // before the head laps it must flush its entire L1, and the head is
+    // appended only by the primary, so its rate is the primary's apply rate -
+    // measured at ~650k records/s. 8192 records was therefore only ~12.7ms of
+    // headroom, about one minor GC; a major GC would flush every worker's L1.
+    // 65536 records is 1MB and ~100ms, which covers a major GC, capped at 4% of
+    // the arena so a small arena does not spend itself on the ring.
+    {
+        uint64_t want = 65536, byArena = (uint64_t)(totalBytes * 0.04) / sizeof(RingRec);
+        uint64_t cap = want < byArena ? want : byArena;
+        uint64_t p = 8192; while (p * 2 <= cap && p < 262144) p *= 2;
+        h->ringCap = p;
+    }
     uint64_t ringBytes = h->ringCap * sizeof(RingRec);
     uint64_t pg = (uint64_t)sysconf(_SC_PAGESIZE);
     h->hintsBytes = (indexSlots + pg - 1) & ~(pg - 1);      // one byte per index slot

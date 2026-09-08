@@ -1112,6 +1112,87 @@ principle exploit the UB in the payload copy. The fences around it and the
 `-O1` build make that unlikely, and the pattern is used this way in production
 systems everywhere, but it is not a proof.
 
+### Tuning the two arbitrary constants — and a bug they exposed
+
+**The second-chance budget was capping a mechanism that had already stopped
+working.** Instrumenting how often re-append actually fires, with live hot
+entries at the tail:
+
+| budget | tail meets live entry | re-appended | **skipped, no room** |
+|---|---|---|---|
+| 64 | 36,713 | 512 (1.4%) | **35,681 (97%)** |
+
+The `freeBytes >= bsz` guard added earlier to fix a corruption bug was blocking
+97% of second chances — because `logDropTail` is *called from* the eviction loop,
+so free space is short by definition. Second chance was effectively dead in a
+full arena, which is exactly when eviction matters.
+
+*Fixed with a zero-copy path.* When the log is full the head lands on the tail's
+own bytes (`hp == phys`). The record does not need to move at all: positions are
+monotonic, so re-publishing it at the new position and advancing both pointers
+grants another lap for free — no `memcpy`, no free space required. Re-appends
+went from 512 to 30,283 at budget 8, and **`LOG2`'s advantage over `LOG` grew
+from ~2.5 to 4.4 points** (76.3% vs 71.9%), so decision 16 now rests on a
+mechanism that actually runs.
+
+*Budget value.* Hit rate saturates at 8 and is flat to 8192:
+
+| budget | 0 | 1 | 8 | 32 | 64 | 1024 | 8192 |
+|---|---|---|---|---|---|---|---|
+| hit rate | 85.6% | 85.9% | **86.3%** | 86.3% | 86.3% | 86.3% | 86.3% |
+
+Default is now **16** — saturated with margin, at no measured cost.
+
+**Ring capacity is a time budget, not a count.** A worker that fails to drain
+before the head laps it must flush its entire L1. The ring is appended *only by
+the primary*, so its rate is the primary's apply throughput — measured at
+**647k records/s**:
+
+| ring records | bytes | headroom |
+|---|---|---|
+| 8192 (old default) | 128KB | **12.7ms** |
+| 65536 | 1MB | 101ms |
+| 262144 | 4MB | 405ms |
+
+12.7ms is roughly one *minor* GC. A major GC (10–100ms) would flush every
+worker's L1. Capacity is now derived from the arena — 64KB records or 4% of the
+arena, whichever is smaller — giving ~100ms on the default 128MB arena for 0.8%
+of it, and degrading gracefully on small arenas (4MB arena keeps 3.1% and 13ms).
+
+### Namespaces: soft quotas through the eviction path
+
+The problem was concrete: with `namespace` as nothing but a key prefix, a hot
+namespace evicts a cold one entirely.
+
+| | cold survivors | cold bytes | hot bytes |
+|---|---|---|---|
+| no quotas | **0 / 1000** | 0KB | 4096KB |
+| cold 1MB / hot 2MB | **942 / 1000** | 508KB | 3588KB |
+
+*(8MB arena, ~4MB data region. `cold` writes 1000x500B once; `hot` then writes
+30000x500B — about 20x the arena.)*
+
+The solution needs no new structure, because the zero-copy second chance made
+protection free. Each entry carries a namespace id; the header tracks live bytes
+and a quota per namespace. At the tail:
+
+- namespace **has a quota and is under it** → protected, given another lap
+- namespace **has a quota and is over it** → dropped
+- namespace **has no quota** → the plain CLOCK reference bit decides, competing freely
+
+Progress is guaranteed whenever the quotas sum to no more than capacity: a full
+arena then necessarily contains at least one over-quota namespace, so something
+is always droppable. The budget cap is the backstop if they are over-committed.
+
+`clearNamespace()` drops one namespace's entries by scanning the index — O(slots),
+and clearing is rare. Quotas are **soft**: a namespace may exceed its quota while
+space is free, and is only pushed back under pressure, which is the behaviour you
+want from a cache.
+
+This also exposed a missing capability: there was no way to bind a *second*
+namespace in one process. `open()` now returns an additional handle onto the
+arena the process already has, rather than trying to create it twice.
+
 ## 10. Why not V8 fast calls
 
 The original premise. It does not survive contact:
@@ -1183,14 +1264,14 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
    single writer these are genuinely easy — the primary can serialise them — but
    the API shape (return the new value? a `Promise` for a worker, since the write
    is batched?) has not been decided.
-2. **Namespaces share one eviction budget.** `namespace` is implemented as a key
-   prefix, so a hot namespace can evict a cold one and neither can be sized or
-   cleared independently. Fine for one application; wrong if two subsystems with
-   different working sets share a process.
-3. **Ring capacity** is hard-coded at 8192 records, and the **second-chance
-   budget** at 64 re-appends per allocation. Both were picked arbitrarily and
-   neither has been measured against a realistic write rate. Too small a ring
-   makes workers flush L1 spuriously under write bursts.
+2. ~~**Namespaces share one eviction budget.**~~ **Solved** — soft per-namespace
+   quotas enforced through the eviction path, plus `clearNamespace()`. See §9.
+   Remaining: the namespace table is a fixed 16 entries, and quotas are not
+   validated against arena capacity, so over-committing them silently falls back
+   to the budget cap for progress.
+3. ~~**Ring capacity and second-chance budget are arbitrary.**~~ **Measured and
+   set** — see §9. The ring is now derived from arena size as a ~100ms time
+   budget; the second-chance budget is 16, where hit rate saturates at 8.
 
 ### Known limitations, accepted and documented
 
