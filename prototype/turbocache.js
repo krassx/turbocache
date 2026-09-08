@@ -7,6 +7,7 @@
 const cluster = require('cluster');
 const native = require('./build/Release/l2.node');
 const v8 = require('v8');
+const v8ser = require('v8');
 const { PerformanceObserver } = require('perf_hooks');
 
 const MSG = 'tc';
@@ -21,6 +22,7 @@ class TurboCache {
     #cursor = 0;
     #id;
     #codec;
+    #l1Decoded = true;
     #isolate = true;
     #primitives = false;
     #freeze;
@@ -43,6 +45,31 @@ class TurboCache {
         // than a heapFactor estimate, no aliasing hazard (primitives are
         // immutable), and no codec to configure. Costs the caller a decode on
         // every L1 hit if its values are really objects.
+        // Storage modes. Each names the tradeoff it accepts:
+        //
+        //   primitives - scalars only, rejects anything else LOUDLY.
+        //                Exact byte accounting, no aliasing, no codec.
+        //   direct     - value stored as-is with full JS type fidelity
+        //                (v8 structured serialization). One serialize +
+        //                deserialize per write; reads are free because L1 hands
+        //                back the frozen decoded object. Mutation throws.
+        //   safe       - everything through JSON. Every read parses, so callers
+        //                get a fresh mutable object and cannot corrupt anything.
+        //                Cheap writes, and JSON's silent type conversions apply:
+        //                Date becomes a string, Map/Set become {}.
+        const preset = opts.storage;
+        if (preset === 'direct') {
+            opts = { isolate: true, freeze: true, ...opts,
+                     codec: opts.codec || TurboCache.V8_CODEC };
+        } else if (preset === 'safe') {
+            opts = { ...opts, codec: opts.codec || TurboCache.JSON_CODEC, l1Decoded: false };
+        } else if (preset === 'primitives') {
+            opts = { ...opts, values: 'primitives' };
+        }
+        this.storage = preset || (opts.codec ? 'codec' : 'primitives');
+        // safe mode keeps the ENCODED form in L1 and decodes on every read, so
+        // each caller gets its own object. direct keeps the decoded object.
+        this.#l1Decoded = opts.l1Decoded !== false;
         this.#primitives = opts.values === 'primitives';
         this.#codec = this.#primitives ? null : (opts.codec || null);
         if (this.#codec && opts.allowSlowCodec !== true) TurboCache.assertFastCodec(this.#codec);
@@ -62,7 +89,8 @@ class TurboCache {
         // A decoded object costs several times its encoded size on the V8 heap,
         // and JS cannot measure that. The budget is in encoded bytes scaled by
         // this factor; it is an estimate, not a guarantee.
-        this.#heapFactor = this.#primitives ? 1 : (opts.heapFactor || (this.#codec ? 3 : 1));
+        this.#heapFactor = (this.#primitives || !this.#l1Decoded) ? 1
+            : (opts.heapFactor || (this.#codec ? 3 : 1));
         // Per-object size cannot be measured: V8 exposes no such API, and a
         // structural estimate is both less accurate than encodedBytes*3 and far
         // more expensive. So do not try. Bound the thing that actually matters -
@@ -155,8 +183,22 @@ class TurboCache {
             `Pass allowSlowCodec: true to override.`);
     }
 
+    static get JSON_CODEC() { return { encode: JSON.stringify, decode: JSON.parse }; }
+    static get V8_CODEC() {
+        return { encode: v => v8ser.serialize(v).toString('latin1'),
+                 decode: s => v8ser.deserialize(Buffer.from(s, 'latin1')) };
+    }
+
+    // KNOWN HOLE: Object.freeze throws on an ArrayBuffer view with elements,
+    // and JS offers no way to make one immutable (ArrayBuffer
+    // transferToImmutable does not exist in Node 24 or 26). So in 'direct' mode
+    // the object graph is frozen but typed-array CONTENTS stay writable, and a
+    // caller that writes into one corrupts L1 for its own process until the
+    // entry is evicted, at which point the arena's copy comes back. Values
+    // holding typed arrays want 'safe' mode, or a defensive copy by the caller.
     static deepFreeze(o) {
         if (o === null || typeof o !== 'object' || Object.isFrozen(o)) return o;
+        if (ArrayBuffer.isView(o) || o instanceof ArrayBuffer) return o;   // cannot be frozen
         Object.freeze(o);
         for (const k in o) TurboCache.deepFreeze(o[k]);
         return o;
@@ -244,10 +286,19 @@ class TurboCache {
     get(key) {
         this.#drain();
         const e = this.#l1.get(key);
-        if (e !== undefined) { e.hits++; this.stats.l1Hits++; return e.v; }   // no decode
+        if (e !== undefined) {
+            e.hits++; this.stats.l1Hits++;
+            // l1Decoded: hand back the cached object (free, but shared/frozen).
+            // Otherwise decode per read, giving each caller a fresh mutable one.
+            return this.#l1Decoded ? e.v : this.#codec.decode(e.v);
+        }
         const raw = native.get(key);
         if (raw === undefined) { this.stats.misses++; return undefined; }
         this.stats.l2Hits++;
+        if (this.#codec && !this.#l1Decoded) {          // safe mode: cache the encoded form
+            this.#l1Put(key, raw, native.hashKey(key), raw.length);
+            return this.#codec.decode(raw);
+        }
         let v = raw;
         if (this.#codec) { v = this.#codec.decode(raw); if (this.#freeze) TurboCache.deepFreeze(v); }
         this.#l1Put(key, v, native.hashKey(key), this.#primitives ? 0 : raw.length);
@@ -271,7 +322,8 @@ class TurboCache {
         // Encode once: L2 needs bytes regardless, so this is not extra work.
         const enc = this.#codec ? this.#codec.encode(value) : value;
         let l1Value = value;
-        if (this.#codec && this.#isolate) l1Value = this.#codec.decode(enc);
+        if (this.#codec && !this.#l1Decoded) l1Value = enc;             // safe: keep the encoded form
+        else if (this.#codec && this.#isolate) l1Value = this.#codec.decode(enc);
         // Freeze only ever applies to an object the cache owns. Freezing the
         // caller's object would be a side effect on something they still hold.
         if (this.#codec && this.#freeze) TurboCache.deepFreeze(l1Value);
