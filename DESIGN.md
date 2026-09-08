@@ -572,20 +572,66 @@ p99.9 173µs vs 4.7ms. With opaque string values, 1,540k vs 72k ops/s.
    from a pre-built value. In a real service a miss costs a database query, so
    the hit-rate column would dominate throughput far more than it does above.
 
-### A tension this exposed between decisions 4 and 5
+### Resolving the decision 4 / decision 5 tension
 
 Decision 4 limits values to bytes and strings; decision 5 says L1 caches the
-*decoded* value so hits skip decoding. When the application stores objects,
-these conflict: the cache only ever sees the encoded string, so L1 caches a
-string and the application re-parses it on **every hit** — exactly the cost
-decision 5 was meant to remove. It is why scenario A above shows no advantage.
+*decoded* value so hits skip decoding. With object workloads these conflicted:
+the cache only ever saw an encoded string, so L1 cached a string and the
+application re-parsed it on **every hit** — exactly the cost decision 5 exists
+to remove.
 
-Options, none yet chosen: let callers supply a codec so L1 can hold decoded
-values; add an opt-in JSON mode; or accept it and document that turbocache's
-advantage is for opaque payloads and cross-process scaling, not for object
-workloads in a single process.
+**Resolution: the two decisions apply at different boundaries, bridged by an
+optional caller-supplied codec.**
 
-### Architecture validation### Comparison against the Bugsee appserver cache
+```js
+new Cache({ codec: { encode, decode } })     // e.g. JSON, msgpack, protobuf
+```
+
+- Decision 4 holds at the **L2 and wire boundary**: L2 stores only bytes, IPC
+  carries only bytes, and the arena format is unchanged.
+- Decision 5 holds at **L1**: with a codec, `set` encodes once (L2 needs bytes
+  regardless, so this is not extra work) while L1 keeps the **decoded** value,
+  and an L1 hit returns it with no decoding at all.
+- With **no** codec the value is already opaque bytes, L1 stores it as-is, and
+  decision 5 is satisfied trivially. This stays the fastest configuration.
+
+| scenario | app-side codec | **cache-owned codec** | bugsee |
+|---|---|---|---|
+| 1k hot keys, fits L1 | 426k ops/s | **1,529k ops/s** | 382k ops/s |
+| 60k keys, exceeds L1 | 291k ops/s | **366k ops/s** | 285k ops/s |
+| cluster, 4 workers | 661k ops/s | **778k ops/s** | 79k ops/s |
+
+On an L1 hit, p50 goes from 1334ns to **42ns**. The gain tracks L1 hit rate, so
+it is largest exactly where a cache is meant to spend its time.
+
+**Three consequences, all real:**
+
+1. **Aliasing is now a live hazard.** L1 returns the same object reference on
+   every hit. Decision 7 got away with sharing because strings are immutable;
+   objects are not, so one caller mutating a returned object corrupts the cache
+   for every other reader in that worker. Default is a documented do-not-mutate
+   contract, matching decision 7's treatment of strings. `freeze: true`
+   deep-freezes at insert instead, turning mutation into a thrown error —
+   measured cost 25–30% (1,529k → 1,125k ops/s).
+2. **The L1 byte budget becomes an estimate, not a cap.** JS cannot measure an
+   object's heap footprint, so the budget counts encoded bytes scaled by
+   `heapFactor`. Measured against real heap usage for JSON-shaped objects:
+
+   | encoded size | heap per object | ratio |
+   |---|---|---|
+   | 200B | 641B | 3.21x |
+   | 741B | 2142B | 2.89x |
+   | 2846B | 7942B | 2.79x |
+
+   A default of 3 is therefore calibrated rather than guessed, but it is
+   shape-dependent — objects dominated by long strings or typed arrays will sit
+   well below it. The "hard byte cap" claim in section 4 is weakened to an
+   estimate whenever a codec is in use.
+3. **Effective L1 capacity drops by `heapFactor`**, so on a working set larger
+   than L1 more reads fall through to L2 (161k L1 hits becomes 132k in the 60k-key
+   scenario). Net throughput still improves, but by 26% rather than 3.6x.
+
+### Architecture validation### Architecture validation### Comparison against the Bugsee appserver cache
 
 Measured against `Bugsee/appserver/code/components/shared/cache`, a production
 implementation of the same shape: L1 `JsonLru` per worker, L2 in the primary's
@@ -709,6 +755,7 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 | 14 | Batched, fire-and-forget writes to the primary | synchronous write-through | Keeps `set()` off the IPC critical path; costs ~1 tick of cross-worker staleness |
 | 15 | Current LTS, darwin + linux, x64 + arm64 | Windows in v1 | Windows needs `CreateFileMapping` — a second shared-memory implementation |
 | 17 | **No background compaction** | async compress-on-the-threadpool with version-validated apply | Built and proven race-safe (18k stale captures correctly discarded, 0 wrong values), but worth only +1.9 points of hit rate at 3x read latency, while doubling the arena buys +6.9 points at no cost. Restricting to cold entries removes the latency penalty *and* the entire benefit. |
+| 21 | **Optional caller-supplied codec; L1 caches decoded values, L2 stores bytes** | app owns the codec (L1 caches encoded strings); built-in JSON mode; accept the limitation | Resolves the decision 4/5 conflict by applying each at its own boundary. 3.6x on L1-resident object workloads, p50 1334ns to 42ns. Costs a documented aliasing contract (or 25-30% for `freeze: true`) and turns the L1 byte cap into a `heapFactor`-scaled estimate, measured at 2.79-3.21x for JSON-shaped objects. |
 | 20 | **Arena sizing and `indexSlots` validated at create time** | trust the caller | A too-small segment underflowed into a hang; a non-power-of-two slot count breaks the probe mask |
 | 19 | **Index slots hold the monotonic log position, not a physical offset** | physical offsets + seqlock alone | A seqlock cannot detect log reuse: once the head wraps over an evicted entry, its `seq` field is another record's payload. A monotonic position lets a reader prove liveness with `tailPub <= pos`. Closes a silent stale/torn-read bug. |
 | 18 | **Reference bits live in a separate hints segment**, workers map it `O_RDWR` while the arena fd stays `O_RDONLY` | reference bit inside the entry | Workers do the reads but cannot write the arena, so in-entry bits were never set and second chance never fired. Isolation is preserved at descriptor level; a bad worker can only degrade eviction quality. |

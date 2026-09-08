@@ -26,10 +26,13 @@ const tcObj = c => ({ sync: true,
     get: k => { const s = c.get(k); return s === undefined ? undefined : JSON.parse(s); },
     set: (k, v) => c.set(k, JSON.stringify(v)) });
 const tcStr = c => ({ sync: true, get: k => c.get(k), set: (k, v) => c.set(k, v) });
+// codec mode: the cache owns encode/decode, so L1 holds the decoded object and
+// an L1 hit skips JSON entirely. L2 still stores bytes only.
+const JSONC = { encode: JSON.stringify, decode: JSON.parse };
 const bs = c => ({ sync: false, get: k => c.get(k), set: (k, v) => c.set(k, v) });
 
 let n = 0;
-const fresh = () => TurboCache.createPrimary('/tc-sng-' + process.pid + '-' + (n++), L2, 1 << 20);
+const fresh = (opts) => TurboCache.createPrimary('/tc-sng-' + process.pid + '-' + (n++), L2, 1 << 20, opts);
 
 (async () => {
     console.log(`single process: ops=${OPS} zipf s=1.0, 90% read / 10% write, cache-aside`);
@@ -52,6 +55,16 @@ const fresh = () => TurboCache.createPrimary('/tc-sng-' + process.pid + '-' + (n
         const a = tcObj(tc);
         report('turbocache (awaited)', await run({ sync: false, get: async k => a.get(k), set: async (k, v) => a.set(k, v) }, plan, 256, NOYIELD));
         TurboCache.native().destroy();
+
+        tc = fresh({ codec: JSONC, l1MaxBytes: L1 });
+        report('turbocache (codec)', await run(tcStr(tc), plan, 256, NOYIELD),
+               `L1hit=${tc.stats.l1Hits} L2hit=${tc.stats.l2Hits}`);
+        TurboCache.native().destroy();
+
+        tc = fresh({ codec: JSONC, l1MaxBytes: L1, freeze: true });
+        report('turbocache (codec, frozen)', await run(tcStr(tc), plan, 256, NOYIELD));
+        TurboCache.native().destroy();
+
         report('bugsee (L1 only)', await run(bs(new bugsee.Cache({ l1MaxBytes: L1, enableIpc: false })), plan, 256, NOYIELD));
     }
 

@@ -10,14 +10,17 @@ const IMPL    = (process.env.IMPL || 'turbo');
 const WORKERS = Number(process.env.WORKERS || 4);
 const OPS     = Number(process.env.OPS || 150000);
 const NKEYS   = Number(process.env.NKEYS || 60000);
-const MODE    = process.env.MODE || 'object';       // object | string
+const MODE    = process.env.MODE || 'object';       // object | string | codec
+const JSONC = { encode: JSON.stringify, decode: JSON.parse };
 const L1 = 2 * 1024 * 1024;
 const L2 = 256 * 1024 * 1024;
 const ARENA = '/tc-cluster-' + process.pid;
 
 function jsonAdapter(impl, c) {
     if (impl === 'turbo') {
-        return MODE === 'string'
+        // 'codec': the cache owns encode/decode so L1 holds decoded objects.
+        // 'string'/'codec' both pass values straight through the adapter.
+        return (MODE === 'string' || MODE === 'codec')
             ? { sync: true, get: k => c.get(k), set: (k, v) => c.set(k, v) }
             : { sync: true,
                 get: k => { const s = c.get(k); return s === undefined ? undefined : JSON.parse(s); },
@@ -89,7 +92,8 @@ if (cluster.isPrimary) {
         let c;
         if (IMPL === 'turbo') {
             const { TurboCache } = require('../prototype/turbocache');
-            c = TurboCache.attachWorker(process.env.TC_ARENA, id, { l1MaxBytes: L1 });
+            c = TurboCache.attachWorker(process.env.TC_ARENA, id,
+                    { l1MaxBytes: L1, codec: MODE === 'codec' ? JSONC : null });
         } else {
             c = new (require(BUGSEE).Cache)({ l1MaxBytes: L1 });
         }

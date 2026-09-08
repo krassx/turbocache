@@ -18,20 +18,41 @@ class TurboCache {
     #flushScheduled = false;
     #cursor = 0;
     #id;
+    #codec;
+    #freeze;
+    #heapFactor;
     #attached = false;
     stats = { l1Hits: 0, l2Hits: 0, misses: 0, sets: 0, invalidated: 0, flushes: 0, sent: 0 };
 
+    // Resolves the decision 4 / decision 5 tension. L2 still stores bytes only
+    // (decision 4 holds at the wire and arena boundary). But when a codec is
+    // supplied, L1 holds the DECODED value, so an L1 hit skips decoding
+    // entirely - which is what decision 5 was actually for. Without a codec the
+    // value is already opaque bytes and L1 is optimal as-is.
     constructor(opts = {}) {
         this.#l1Max = opts.l1MaxBytes || 2 * 1024 * 1024;
         this.#id = opts.workerId || 0;
         this.#attached = opts.attached !== false;
+        this.#codec = opts.codec || null;
+        this.#freeze = opts.freeze === true;
+        // A decoded object costs several times its encoded size on the V8 heap,
+        // and JS cannot measure that. The budget is in encoded bytes scaled by
+        // this factor; it is an estimate, not a guarantee.
+        this.#heapFactor = opts.heapFactor || (this.#codec ? 3 : 1);
+    }
+
+    static deepFreeze(o) {
+        if (o === null || typeof o !== 'object' || Object.isFrozen(o)) return o;
+        Object.freeze(o);
+        for (const k in o) TurboCache.deepFreeze(o[k]);
+        return o;
     }
 
     // --- lifecycle -------------------------------------------------------
-    static createPrimary(name, arenaBytes, indexSlots) {
+    static createPrimary(name, arenaBytes, indexSlots, opts = {}) {
         if (!native.create(name, arenaBytes, indexSlots, 2)) throw new Error('arena create failed');
         native.setCompressMin(1 << 30);                 // compression off, per DESIGN.md
-        return new TurboCache({ workerId: 0 });
+        return new TurboCache({ ...opts, workerId: 0 });
     }
     static attachWorker(name, workerId, opts = {}) {
         if (!native.attach(name)) throw new Error('arena attach failed');
@@ -39,8 +60,8 @@ class TurboCache {
     }
 
     // --- L1 --------------------------------------------------------------
-    #l1Put(key, v, hash) {
-        const bytes = key.length + v.length + 64;
+    #l1Put(key, v, hash, encodedLen) {
+        const bytes = (key.length + encodedLen + 64) * this.#heapFactor;
         const prev = this.#l1.get(key);
         if (prev) this.#l1Bytes -= prev.bytes;
         this.#l1.set(key, { v, bytes, hits: 1 });
@@ -89,19 +110,24 @@ class TurboCache {
     get(key) {
         this.#drain();
         const e = this.#l1.get(key);
-        if (e !== undefined) { e.hits++; this.stats.l1Hits++; return e.v; }
-        const v = native.get(key);
-        if (v === undefined) { this.stats.misses++; return undefined; }
+        if (e !== undefined) { e.hits++; this.stats.l1Hits++; return e.v; }   // no decode
+        const raw = native.get(key);
+        if (raw === undefined) { this.stats.misses++; return undefined; }
         this.stats.l2Hits++;
-        this.#l1Put(key, v, native.hashKey(key));
+        let v = raw;
+        if (this.#codec) { v = this.#codec.decode(raw); if (this.#freeze) TurboCache.deepFreeze(v); }
+        this.#l1Put(key, v, native.hashKey(key), raw.length);
         return v;
     }
 
     set(key, value) {
         this.stats.sets++;
-        this.#l1Put(key, value, native.hashKey(key));
-        if (this.#id === 0) { native.set(key, value, 0); return; }   // primary writes directly
-        this.#outbox.push(key, value);
+        // Encode once: L2 needs bytes regardless, so this is not extra work.
+        const enc = this.#codec ? this.#codec.encode(value) : value;
+        if (this.#codec && this.#freeze) TurboCache.deepFreeze(value);
+        this.#l1Put(key, value, native.hashKey(key), enc.length);
+        if (this.#id === 0) { native.set(key, enc, 0); return; }   // primary writes directly
+        this.#outbox.push(key, enc);
         if (!this.#flushScheduled) {
             this.#flushScheduled = true;
             setImmediate(() => this.flush());
