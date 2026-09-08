@@ -54,8 +54,7 @@ for (const storage of ['direct', 'safe']) {
 // --- primitives still rejects non-primitives loudly
 {
     const c = mk('primitives');
-    let threw = false; try { c.set('o', { a: 1 }); } catch (e) { threw = e instanceof TypeError; }
-    ok(threw, 'primitives: rejects objects with TypeError');
+    ok(c.set('o', { a: 1 }) === false, 'primitives: rejects objects (returns false)');
     c.set('b', 2n ** 70n);
     ok(c.get('b') === 2n ** 70n, 'primitives: BigInt round-trips');
     TurboCache.native().destroy();

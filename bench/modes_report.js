@@ -52,7 +52,7 @@ function validity() {
             const prim = mode === 'primitives';
             let verdict;
             try {
-                c.set('t', val);
+                if (c.set('t', val) === false) { TurboCache.native().destroy(); res[mode][name] = 'rejected'; continue; }
                 evictL1(c, prim);
                 const got = c.get('t');
                 verdict = got === undefined ? 'LOST' : (deepEq(val, got) ? 'exact' : 'CONVERTED');
@@ -101,7 +101,7 @@ function safety() {
         },
         'write into typed array in result': (c, prim) => {
             if (prim) return 'n/a';
-            try { c.set('s', { b: new Uint8Array([1, 2]) }); } catch { return 'rejected'; }
+            if (c.set('s', { b: new Uint8Array([1, 2]) }) === false) return 'rejected';
             const g = c.get('s');
             if (!(g.b instanceof Uint8Array)) return 'n/a (converted)';
             try { g.b[0] = 99; } catch { return 'throws'; }

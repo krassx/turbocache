@@ -19,34 +19,72 @@
 
 ## 2. Public API (v1)
 
-```ts
-type CacheValue = string | Buffer | Uint8Array | ArrayBuffer;
+```js
+const { Cache } = require('turbocache');
+const cluster = require('cluster');
 
+// Primary. Sizes itself from the machine, names its own segment, and passes
+// the name to workers through the environment.
+const cache = new Cache({ storage: 'primitives' });
+Cache.install(cluster);          // the entire primary-side wiring
+
+// Worker. Same call; it detects that it is a worker and attaches.
+const cache = new Cache({ storage: 'primitives' });
+```
+
+```ts
 class Cache {
   constructor(opts?: {
-    l1Bytes?: number;       // default: auto from worker heap limit
-    l2Bytes?: number;       // default: auto from total RAM (primary only)
-    namespace?: string;     // prefixed into the key before hashing
-    compress?: boolean;         // default FALSE - see Measurements
-    compressMinBytes?: number;  // default 256, only relevant when compress:true
-    externMinBytes?: number;    // default 1024
+    storage?: 'primitives' | 'direct' | 'safe';   // default 'primitives'
+    namespace?: string;        // prefixed into the key
+    l1MaxBytes?: number;       // default: heapLimit x 0.5%, clamped 512KB..2MB
+    arenaBytes?: number;       // default: totalRAM x 1%, clamped 16MB..128MB
+    indexSlots?: number;       // default: derived from arenaBytes
+    codec?: { encode, decode };// overrides the storage preset's codec
+    freeze?: boolean;          // codec modes; default true
+    heapGuard?: false | { maxHeapFraction?: number };
   });
 
-  get(key: string): CacheValue | undefined;   // synchronous
-  set(key: string, value: CacheValue, opts?: { ttlMs?: number }): void;
+  get(key: string): Value | undefined;
+  set(key: string, value: Value, opts?: { ttlMs?: number }): boolean;
   has(key: string): boolean;
   delete(key: string): boolean;
-  clear(): void;
+  clearLocal(): void;          // this process's L1 only
+  clearAll(): void;            // the shared arena AND every worker's L1
+  close(): void;
 
-  readonly stats: { l1Hits, l2Hits, misses, l1Bytes, l2Bytes, evictions, ... };
+  readonly stats: { l1Hits, l2Hits, misses, sets, deletes, invalidated,
+                    rejectedType, rejectedSize, flushes, sent };
+  readonly lastError: string | null;
+
+  static install(cluster): void;
 }
 ```
 
-**Everything is synchronous.** L1 and L2 are both memory accesses; there is nothing to await. When L3 lands it arrives as *separate* methods (`getAsync`), and the sync methods keep meaning "L1+L2 only". No existing call site changes.
+Four API decisions worth stating, because each rejects a plausible alternative:
 
-**Return semantics.** String values are returned **by reference** — the same immutable V8 string on every hit, zero copy. `Buffer`/`Uint8Array` values are **copied** on every `get`, because handing out a shared mutable buffer lets one caller silently corrupt the cache for every other reader.
+**`set` returns a boolean and never throws — for anything.** Not merely for
+capacity: a codec that throws (JSON on a BigInt or a cycle) and a codec that
+returns `undefined` rather than throwing (`JSON.stringify` of a function, a
+symbol, or `undefined` itself) both surface as `false`. Because a total function
+makes failure quiet, every rejection increments `stats.rejectedType` or
+`stats.rejectedSize` and records `lastError`.
 
----
+**There is no `clear()`.** `clearLocal()` drops this process's L1 and nothing
+else; `clearAll()` wipes the shared arena and makes every worker drop its L1 via
+a flush record on the invalidation ring. A single `clear()` would let any worker
+wipe a shared cache for the whole cluster with a call that reads as local.
+
+**`has` is a pure probe.** No decode, no promotion into L1, not counted as a hit,
+and it does not set the CLOCK reference bit — so an existence check cannot
+distort hit-rate statistics or eviction order. It matters more than it sounds:
+because `null` is a storable value, `get(k) === undefined` is not an existence
+check, and `has` is the only way to ask the question.
+
+**TTL is enforced in both tiers.** The arena expires lazily on read, but an L1
+hit never reaches the arena, so L1 entries carry their own expiry. Without that,
+an expired value is served from L1 indefinitely — which is exactly what the
+first implementation did.
 
 ## 3. Architecture
 

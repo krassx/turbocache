@@ -21,6 +21,8 @@ static const uint32_t TC_MAGIC = 0x54430001;
 static const uint32_t TC_LAYOUT = 1;
 static const uint64_t HASH_EMPTY = 0;
 static const uint64_t HASH_TOMB  = 1;
+// Ring sentinel: 'drop your entire L1', used by clearAll.
+static const uint64_t RING_FLUSH_ALL = 0xFFFFFFFFFFFFFFFFull;
 
 enum { MODE_SLAB = 0, MODE_LOG = 1, MODE_LOG2 = 2 };  // LOG2 = log + second-chance re-append
 

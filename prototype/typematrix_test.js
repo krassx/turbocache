@@ -38,7 +38,8 @@ function describe(v) {
 
 function probe(cache, make) {
     let orig;
-    try { orig = make(); cache.set('t', orig); } catch (e) { return 'set THROWS ' + e.constructor.name; }
+    try { orig = make(); if (cache.set('t', orig) === false) return 'rejected'; }
+    catch (e) { return 'set THROWS ' + e.constructor.name; }
     // force through L2 so we test the real round trip, not just L1
     for (let i = 0; i < 250; i++) cache.set('p' + i, 'x'.repeat(200));
     let got;

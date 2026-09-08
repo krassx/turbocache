@@ -6,9 +6,8 @@ c.set('s', 'hello'); c.set('n', 42); c.set('b', true);
 ok(c.get('s') === 'hello', 'string roundtrip');
 ok(c.get('n') === '42' || c.get('n') === 42, 'number roundtrip (stored as text)');
 ok(c.get('miss') === undefined, 'miss');
-let threw = false;
-try { c.set('o', { a: 1 }); } catch (e) { threw = e instanceof TypeError; }
-ok(threw, 'objects rejected with TypeError');
+ok(c.set('o', { a: 1 }) === false, 'objects rejected (returns false, never throws)');
+ok(c.stats.rejectedType === 1 && /primitives mode/.test(c.lastError), 'rejection is recorded in stats + lastError');
 const big = new Array(200000).fill('abcdefgh').join('');
 c.set('slice', big.substring(0, 1000));
 ok(c.get('slice').length === 1000, 'substring cached and flattened');

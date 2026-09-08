@@ -20,6 +20,7 @@ class TurboCache {
     #outbox = [];
     #flushScheduled = false;
     #cursor = 0;
+    #ns = '';
     #id;
     #codec;
     #l1Decoded = true;
@@ -29,7 +30,9 @@ class TurboCache {
     #heapFactor;
     #guardMax = 0; #guardShed = 0.25; #gcObserver = null; liveHeapFraction = 0;
     #attached = false;
-    stats = { l1Hits: 0, l2Hits: 0, misses: 0, sets: 0, invalidated: 0, flushes: 0, sent: 0 };
+    stats = { l1Hits: 0, l2Hits: 0, misses: 0, sets: 0, deletes: 0, invalidated: 0,
+              flushes: 0, sent: 0, rejectedType: 0, rejectedSize: 0 };
+    lastError = null;
 
     // Resolves the decision 4 / decision 5 tension. L2 still stores bytes only
     // (decision 4 holds at the wire and arena boundary). But when a codec is
@@ -37,6 +40,7 @@ class TurboCache {
     // entirely - which is what decision 5 was actually for. Without a codec the
     // value is already opaque bytes and L1 is optimal as-is.
     constructor(opts = {}) {
+        this.#ns = opts.namespace ? opts.namespace + ':' : '';
         this.#l1Max = opts.l1MaxBytes || 2 * 1024 * 1024;
         this.#id = opts.workerId || 0;
         this.#attached = opts.attached !== false;
@@ -205,6 +209,48 @@ class TurboCache {
     }
 
     // --- lifecycle -------------------------------------------------------
+    // Sizing per DESIGN.md section 7, computed once at startup.
+    static autoSize() {
+        const os = require('os'), v8m = require('v8');
+        const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+        const arena = clamp(Math.floor(os.totalmem() * 0.01), 16 << 20, 128 << 20);
+        const l1 = clamp(Math.floor(v8m.getHeapStatistics().heap_size_limit * 0.005), 512 * 1024, 2 << 20);
+        // One index slot per ~512 bytes of arena, kept under the 75% load
+        // ceiling and rounded up to a power of two for the probe mask.
+        let slots = 1 << Math.ceil(Math.log2(Math.max(1024, (arena / 512) / 0.75)));
+        return { arenaBytes: arena, l1MaxBytes: l1, indexSlots: Math.min(slots, 1 << 22) };
+    }
+
+    // The ordinary entry point: figures out on its own whether this process is
+    // the primary (create the arena) or a worker (attach to it), and sizes
+    // everything from the machine. createPrimary/attachWorker remain for tests
+    // and for callers that want to pin the numbers.
+    static open(opts = {}) {
+        const cluster = require('cluster');
+        const auto = TurboCache.autoSize();
+        const arenaBytes = opts.arenaBytes || auto.arenaBytes;
+        const indexSlots = opts.indexSlots || auto.indexSlots;
+        const o = { l1MaxBytes: auto.l1MaxBytes, ...opts };
+        if (cluster.isWorker && process.env.TURBOCACHE_ARENA) {
+            return TurboCache.attachWorker(process.env.TURBOCACHE_ARENA, cluster.worker.id, o);
+        }
+        const name = opts.name || ('/turbocache-' + process.pid);
+        process.env.TURBOCACHE_ARENA = name;      // inherited by workers forked later
+        return TurboCache.createPrimary(name, arenaBytes, indexSlots, o);
+    }
+
+    // Wire the primary's side of the worker write path. Without this, worker
+    // writes never reach L2.
+    static install(cluster) {
+        cluster.on('online', w => w.on('message', m => {
+            if (TurboCache.isCacheMessage(m)) TurboCache.applyBatch(m);
+        }));
+        for (const id in cluster.workers) {
+            const w = cluster.workers[id];
+            w.on('message', m => { if (TurboCache.isCacheMessage(m)) TurboCache.applyBatch(m); });
+        }
+    }
+
     static createPrimary(name, arenaBytes, indexSlots, opts = {}) {
         if (!native.create(name, arenaBytes, indexSlots, 2)) throw new Error('arena create failed');
         native.setCompressMin(1 << 30);                 // compression off, per DESIGN.md
@@ -216,7 +262,7 @@ class TurboCache {
     }
 
     // --- L1 --------------------------------------------------------------
-    #l1Put(key, v, hash, encodedLen) {
+    #l1Put(key, v, hash, encodedLen, expiresAt = 0) {
         // In primitives mode the cost is known exactly; otherwise it is the
         // encoded length scaled by heapFactor, which is only an estimate.
         const bytes = this.#primitives
@@ -224,7 +270,7 @@ class TurboCache {
             : (key.length + encodedLen + 64) * this.#heapFactor;
         const prev = this.#l1.get(key);
         if (prev) this.#l1Bytes -= prev.bytes;
-        this.#l1.set(key, { v, bytes, hits: 1 });
+        this.#l1.set(key, { v, bytes, hits: 1, exp: expiresAt });
         this.#byHash.set(hash, key);
         this.#l1Bytes += bytes;
 
@@ -275,6 +321,9 @@ class TurboCache {
             return;
         }
         for (let i = 0; i < r.hashes.length; i++) {
+            if (r.hashes[i] === 'ffffffffffffffff') {     // clearAll sentinel
+                this.clearLocal(); this.#cursor = r.head; return;
+            }
             if (r.writers[i] === this.#id) continue;      // our own write; L1 already correct
             const k = this.#byHash.get(r.hashes[i]);
             if (k !== undefined) { this.#l1Drop(k); this.#byHash.delete(r.hashes[i]); this.stats.invalidated++; }
@@ -285,8 +334,13 @@ class TurboCache {
     // --- public API (synchronous) ---------------------------------------
     get(key) {
         this.#drain();
+        key = this.#ns + key;
         const e = this.#l1.get(key);
-        if (e !== undefined) {
+        // TTL must be enforced in L1 too. The arena expires lazily on read, but
+        // an L1 hit never reaches the arena, so without this an expired value
+        // is served indefinitely from L1.
+        if (e !== undefined && e.exp && e.exp <= Date.now()) { this.#l1Drop(key); }
+        else if (e !== undefined) {
             e.hits++; this.stats.l1Hits++;
             // l1Decoded: hand back the cached object (free, but shared/frozen).
             // Otherwise decode per read, giving each caller a fresh mutable one.
@@ -305,13 +359,21 @@ class TurboCache {
         return v;
     }
 
-    set(key, value) {
+    // Always returns a boolean and never throws, so a caller may ignore the
+    // result. Because that makes failure quiet, every rejection also bumps a
+    // stats counter and records lastError.
+    set(key, value, opts) {
         this.stats.sets++;
+        key = this.#ns + key;
+        const ttlMs = (opts && opts.ttlMs) | 0;
         if (this.#primitives) {
             const t = typeof value;
             // BigInt is a primitive too, and immutable, so it belongs here.
-            if (t !== 'string' && t !== 'number' && t !== 'boolean' && t !== 'bigint' && value !== null)
-                throw new TypeError(`primitives mode accepts string/number/boolean/bigint/null, got ${t}`);
+            if (t !== 'string' && t !== 'number' && t !== 'boolean' && t !== 'bigint' && value !== null) {
+                this.stats.rejectedType++;
+                this.lastError = `primitives mode accepts string/number/boolean/bigint/null, got ${t}`;
+                return false;
+            }
             if (t === 'string') {
                 // A V8 SlicedString keeps its parent alive: caching a 1MB
                 // substring of an 8MB document retains all 8MB (measured).
@@ -320,20 +382,89 @@ class TurboCache {
             }
         }
         // Encode once: L2 needs bytes regardless, so this is not extra work.
-        const enc = this.#codec ? this.#codec.encode(value) : value;
+        // A codec can throw on values it cannot represent (JSON on a BigInt or
+        // a cycle). set() promises never to throw, so that surfaces as false.
+        let enc;
+        try { enc = this.#codec ? this.#codec.encode(value) : value; }
+        catch (e) {
+            this.stats.rejectedType++;
+            this.lastError = `codec.encode failed: ${e.message}`;
+            return false;
+        }
+        // JSON.stringify returns undefined (rather than throwing) for a
+        // function, a symbol or undefined itself, so a successful encode is not
+        // proof of a usable result.
+        if (this.#codec && typeof enc !== 'string') {
+            this.stats.rejectedType++;
+            this.lastError = `codec.encode produced ${typeof enc}, not a string (value type ${typeof value})`;
+            return false;
+        }
         let l1Value = value;
         if (this.#codec && !this.#l1Decoded) l1Value = enc;             // safe: keep the encoded form
         else if (this.#codec && this.#isolate) l1Value = this.#codec.decode(enc);
         // Freeze only ever applies to an object the cache owns. Freezing the
         // caller's object would be a side effect on something they still hold.
         if (this.#codec && this.#freeze) TurboCache.deepFreeze(l1Value);
-        this.#l1Put(key, l1Value, native.hashKey(key), this.#primitives ? 0 : enc.length);
-        if (this.#id === 0) { native.set(key, enc, 0); return; }   // primary writes directly
-        this.#outbox.push(key, enc);
-        if (!this.#flushScheduled) {
-            this.#flushScheduled = true;
-            setImmediate(() => this.flush());
+        this.#l1Put(key, l1Value, native.hashKey(key), this.#primitives ? 0 : enc.length,
+                    ttlMs > 0 ? Date.now() + ttlMs : 0);
+        if (this.#id === 0) {
+            const ok = native.set(key, enc, 0, ttlMs);
+            if (!ok) { this.stats.rejectedSize++; this.lastError = 'value does not fit the arena'; this.#l1Drop(key); }
+            return ok;
         }
+        this.#outbox.push('s', key, enc, ttlMs);
+        this.#schedule();
+        return true;                      // queued; capacity is decided by the primary
+    }
+
+    #schedule() {
+        if (this.#flushScheduled) return;
+        this.#flushScheduled = true;
+        setImmediate(() => this.flush());
+    }
+
+    // Existence check only: no decode, no promotion into L1, not counted as a
+    // hit, and it deliberately leaves the CLOCK reference bit alone.
+    has(key) {
+        this.#drain();
+        key = this.#ns + key;
+        const e = this.#l1.get(key);
+        if (e !== undefined) {
+            if (!e.exp || e.exp > Date.now()) return true;
+            this.#l1Drop(key);
+        }
+        return native.has(key);
+    }
+
+    delete(key) {
+        key = this.#ns + key;
+        this.stats.deletes++;
+        this.#l1Drop(key);
+        if (this.#id === 0) return native.del(key, 0);
+        this.#outbox.push('d', key, null, 0);
+        this.#schedule();
+        return true;
+    }
+
+    // Drops only this process's L1. The shared arena is untouched, so the next
+    // read simply repopulates it.
+    clearLocal() {
+        this.#l1.clear(); this.#byHash.clear(); this.#l1Bytes = 0;
+    }
+
+    // Wipes the shared arena AND every worker's L1, via a flush record on the
+    // invalidation ring. Deliberately not called clear(): this is a
+    // cluster-wide side effect and the name should say so.
+    clearAll() {
+        this.clearLocal();
+        if (this.#id === 0) { native.clearAll(0); return; }
+        this.#outbox.push('c', '', null, 0);
+        this.#schedule();
+    }
+
+    close() {
+        this.stopGuard();
+        if (this.#id === 0) native.destroy();
     }
 
     get l1Size() { return this.#l1.size; }
@@ -346,14 +477,19 @@ class TurboCache {
         const batch = this.#outbox;
         this.#outbox = [];
         this.stats.flushes++;
-        this.stats.sent += batch.length / 2;
+        this.stats.sent += batch.length / 4;
         process.send({ t: MSG, id: this.#id, b: batch });
     }
 
     // Primary side: apply a worker's batch to L2.
     static applyBatch(msg) {
         const b = msg.b;
-        for (let i = 0; i < b.length; i += 2) native.set(b[i], b[i + 1], msg.id);
+        for (let i = 0; i < b.length; i += 4) {
+            const op = b[i];
+            if (op === 's') native.set(b[i + 1], b[i + 2], msg.id, b[i + 3]);
+            else if (op === 'd') native.del(b[i + 1], msg.id);
+            else if (op === 'c') native.clearAll(msg.id);
+        }
     }
     static isCacheMessage(m) { return m && m.t === MSG; }
     static native() { return native; }

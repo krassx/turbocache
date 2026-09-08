@@ -348,6 +348,49 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
   return true;
 }
 
+// Remove a key. Sole-writer path, like storeSet.
+static inline bool storeDelete(Store &s, const uint8_t *key, uint16_t keyLen, uint16_t writerId) {
+  Header *h = s.h;
+  uint64_t hash = rapidhash(key, keyLen, 0);
+  if (hash <= HASH_TOMB) hash += 2;
+  int64_t slot = s.findSlot(hash, key, keyLen);
+  if (slot < 0) return false;
+  unlinkSlot(s, (uint64_t)slot);
+  ringAppend(s, hash, ++h->inserts, writerId);
+  return true;
+}
+
+// Drop everything. The log is NOT rewound: logTail is advanced to logHead so
+// every previously published position becomes stale under the 
+// liveness rule. Rewinding to zero would move the tail BACKWARDS and let a
+// reader trust a stale position pointing at reused bytes.
+static inline void storeClear(Store &s, uint16_t writerId) {
+  Header *h = s.h;
+  memset(s.idx, 0, h->indexSlots * sizeof(IndexSlot));
+  if (s.hints) memset(s.hints, 0, h->hintsBytes);
+  h->logTail = h->logHead;
+  h->tailPub.store(h->logTail, std::memory_order_release);
+  h->live = 0; h->liveBytes = 0;
+  for (int i = 0; i < NCLASS; i++) h->freeHead[i] = 0;
+  h->bumpPtr = 0;
+  ringAppend(s, RING_FLUSH_ALL, ++h->inserts, writerId);   // tells workers to drop L1
+}
+
+// Existence check: index probe plus key compare plus expiry, with no value copy
+// and no promotion. Deliberately does not touch the CLOCK reference bit.
+static inline bool storeHas(Store &s, const uint8_t *key, uint16_t keyLen, uint32_t nowSec) {
+  Header *h = s.h;
+  uint64_t hash = rapidhash(key, keyLen, 0);
+  if (hash <= HASH_TOMB) hash += 2;
+  int64_t slot = s.findSlot(hash, key, keyLen);
+  if (slot < 0) return false;
+  uint64_t pos = s.idx[slot].off.load(std::memory_order_acquire);
+  Entry *e = s.entryAt(pos);
+  uint32_t exp = e->expiresAt;
+  if (h->mode != MODE_SLAB && h->tailPub.load(std::memory_order_seq_cst) > pos) return false;
+  return !(exp && exp <= nowSec);
+}
+
 // Reader path. Safe against a concurrent writer reusing the block underneath us:
 // copy first, then re-check the sequence, and discard a torn read.
 static inline bool storeGet(Store &s, const uint8_t *key, uint16_t keyLen,

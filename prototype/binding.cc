@@ -51,7 +51,7 @@ static napi_value SetCompressMin(napi_env env, napi_callback_info info) {
 
 // set(key, value) - value is a latin1 string in this prototype
 static napi_value Set(napi_env env, napi_callback_info info) {
-  ARG(3)
+  ARG(4)
   char key[512]; size_t klen = 0;
   napi_get_value_string_latin1(env, argv[0], key, sizeof(key), &klen);
   // Encode by type, tagging the entry so the reader rebuilds the right JS
@@ -106,10 +106,12 @@ static napi_value Set(napi_env env, napi_callback_info info) {
       payload = cbuf; storedLen = (uint32_t)c; flags |= FLAG_COMPRESSED;
     }
   }
-  int32_t writerId = 0;
+  int32_t writerId = 0, ttlMs = 0;
   if (argc > 2) napi_get_value_int32(env, argv[2], &writerId);
+  if (argc > 3) napi_get_value_int32(env, argv[3], &ttlMs);
+  uint32_t expiresAt = ttlMs > 0 ? nowSec() + (uint32_t)((ttlMs + 999) / 1000) : 0;
   bool ok = storeSet(g, (const uint8_t *)key, (uint16_t)klen, payload, storedLen, rawLen,
-                     flags, 0, (uint16_t)writerId);
+                     flags, expiresAt, (uint16_t)writerId);
   napi_value r; napi_get_boolean(env, ok, &r); return r;
 }
 
@@ -158,6 +160,29 @@ static napi_value GetLen(napi_env env, napi_callback_info info) {
     n = (int32_t)rr.rawLen;
   }
   napi_value out; napi_create_int32(env, n, &out); return out;
+}
+
+static napi_value Has(napi_env env, napi_callback_info info) {
+  ARG(1) char key[512]; size_t klen = 0;
+  napi_get_value_string_latin1(env, argv[0], key, sizeof(key), &klen);
+  napi_value r;
+  napi_get_boolean(env, storeHas(g, (const uint8_t *)key, (uint16_t)klen, nowSec()), &r);
+  return r;
+}
+
+static napi_value Del(napi_env env, napi_callback_info info) {
+  ARG(2) char key[512]; size_t klen = 0;
+  napi_get_value_string_latin1(env, argv[0], key, sizeof(key), &klen);
+  int32_t writerId = 0; if (argc > 1) napi_get_value_int32(env, argv[1], &writerId);
+  napi_value r;
+  napi_get_boolean(env, storeDelete(g, (const uint8_t *)key, (uint16_t)klen, (uint16_t)writerId), &r);
+  return r;
+}
+
+static napi_value ClearAll(napi_env env, napi_callback_info info) {
+  ARG(1) int32_t writerId = 0; if (argc > 0) napi_get_value_int32(env, argv[0], &writerId);
+  storeClear(g, (uint16_t)writerId);
+  return nullptr;
 }
 
 // probe(key) -> int  (index probe + memcmp only; no value copy, no decompress)
@@ -519,7 +544,7 @@ static napi_value Destroy(napi_env env, napi_callback_info) { g.destroy(); retur
                        napi_set_named_property(env, exports, name, f); }
 static napi_value Init(napi_env env, napi_value exports) {
   FN("create", Create) FN("attach", Attach) FN("set", Set) FN("get", Get)
-  FN("getLen", GetLen) FN("probe", Probe) FN("stats", Stats)
+  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("probe", Probe) FN("stats", Stats)
   FN("destroy", Destroy) FN("poke", Poke)
   FN("suppressRefBit", SetSuppressRefBit) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin)
   return exports;
