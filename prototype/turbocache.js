@@ -19,6 +19,8 @@ class TurboCache {
     #l1Bytes = 0;
     #l1Max;
     #outbox = [];
+    #outboxBytes = 0;
+    #outboxMaxBytes = 1 << 20;      // flush eagerly past this, bounding worker memory
     #flushScheduled = false;
     #cursor = 0;
     #ns = '';
@@ -55,6 +57,7 @@ class TurboCache {
         }
         this.#maxValue = native.maxValueBytes();
         this.#l1Max = opts.l1MaxBytes || 2 * 1024 * 1024;
+        this.#outboxMaxBytes = opts.outboxMaxBytes || (1 << 20);
         this.#id = opts.workerId || 0;
         this.#attached = opts.attached !== false;
         // 'primitives' mode: accept only string/number/boolean/null. Buys three
@@ -252,13 +255,25 @@ class TurboCache {
         if (cluster.isWorker && process.env.TURBOCACHE_ARENA) {
             return TurboCache.attachWorker(process.env.TURBOCACHE_ARENA, cluster.worker.id, o);
         }
-        const name = opts.name || ('/turbocache-' + process.pid);
+        // A pid-based name leaks: create() unlinks any prior segment, but a
+        // crashed run's segment has a name nothing will ever reuse, so it
+        // survives until reboot. Deriving the name from the application's
+        // identity instead means a restart reclaims its own segment, while two
+        // different apps on one host still get different ones.
+        const name = opts.name || TurboCache.defaultName();
         process.env.TURBOCACHE_ARENA = name;      // inherited by workers forked later
         return TurboCache.createPrimary(name, arenaBytes, indexSlots, o);
     }
 
     // Wire the primary's side of the worker write path. Without this, worker
     // writes never reach L2.
+    // Stable per-application shm name, <= 31 chars for darwin's SHM_NAME_MAX.
+    static defaultName() {
+        const crypto = require('crypto');
+        const id = (process.argv[1] || process.cwd()) + '|' + (process.env.TURBOCACHE_ID || '');
+        return '/tc-' + crypto.createHash('sha1').update(id).digest('hex').slice(0, 16);
+    }
+
     static install(cluster) {
         cluster.on('online', w => w.on('message', m => {
             if (TurboCache.isCacheMessage(m)) TurboCache.applyBatch(m);
@@ -444,11 +459,18 @@ class TurboCache {
             return ok;
         }
         this.#outbox.push('s', key, enc, ttlMs, this.#nsId);
-        this.#schedule();
+        this.#schedule(encLen + key.length + 48);
         return true;                      // queued; capacity is decided by the primary
     }
 
-    #schedule() {
+    // Batching normally waits for the next tick, but a worker doing a long
+    // SYNCHRONOUS burst never turns the event loop, so setImmediate never fires
+    // and the outbox grows without bound - measured at 50MB of worker heap for
+    // 60k sets. Flush eagerly once it exceeds a byte cap: process.send can be
+    // called at any time, the tick is only there to batch.
+    #schedule(addedBytes) {
+        this.#outboxBytes += addedBytes;
+        if (this.#outboxBytes >= this.#outboxMaxBytes) { this.flush(); return; }
         if (this.#flushScheduled) return;
         this.#flushScheduled = true;
         setImmediate(() => this.flush());
@@ -473,7 +495,7 @@ class TurboCache {
         this.#l1Drop(key);
         if (this.#id === 0) return native.del(key, 0);
         this.#outbox.push('d', key, null, 0, this.#nsId);
-        this.#schedule();
+        this.#schedule(key.length + 48);
         return true;
     }
 
@@ -490,7 +512,7 @@ class TurboCache {
         this.clearLocal();
         if (this.#id === 0) { native.clearAll(0); return; }
         this.#outbox.push('c', '', null, 0, this.#nsId);
-        this.#schedule();
+        this.#schedule(48);
     }
 
     // Drops every entry of THIS cache's namespace, leaving other namespaces
@@ -499,7 +521,7 @@ class TurboCache {
         this.clearLocal();
         if (this.#id === 0) return native.clearNamespace(this.#nsId, 0);
         this.#outbox.push('n', '', null, 0, this.#nsId);
-        this.#schedule();
+        this.#schedule(48);
         return true;
     }
 
@@ -519,9 +541,28 @@ class TurboCache {
         if (!this.#outbox.length) return;
         const batch = this.#outbox;
         this.#outbox = [];
+        this.#outboxBytes = 0;
         this.stats.flushes++;
         this.stats.sent += batch.length / 5;
-        process.send({ t: MSG, id: this.#id, b: batch });
+        // The channel can already be gone: a scheduled flush firing after the
+        // primary exited threw EPIPE and killed the worker with an unhandled
+        // 'error' event. Losing a batch during shutdown is acceptable; crashing
+        // the worker over it is not.
+        if (!process.connected) { this.stats.flushDropped = (this.stats.flushDropped || 0) + 1; return; }
+        // The write fails ASYNCHRONOUSLY, so try/catch cannot see it; without a
+        // callback Node emits an unhandled 'error' event that kills the process.
+        // Passing a callback routes the failure here instead.
+        const self = this;
+        try {
+            process.send({ t: MSG, id: this.#id, b: batch }, err => {
+                if (!err) return;
+                self.stats.flushDropped = (self.stats.flushDropped || 0) + 1;
+                self.lastError = `flush failed: ${err.code || err.message}`;
+            });
+        } catch (e) {
+            this.stats.flushDropped = (this.stats.flushDropped || 0) + 1;
+            this.lastError = `flush failed: ${e.code || e.message}`;
+        }
     }
 
     // Primary side: apply a worker's batch to L2.

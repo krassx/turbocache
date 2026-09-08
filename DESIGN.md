@@ -1193,6 +1193,38 @@ This also exposed a missing capability: there was no way to bind a *second*
 namespace in one process. `open()` now returns an additional handle onto the
 arena the process already has, rather than trying to create it twice.
 
+### Three operational bugs found by auditing what was still open
+
+**The worker outbox was unbounded.** Writes batch until `setImmediate` fires, but
+a worker doing a long *synchronous* burst never turns the event loop, so nothing
+flushed. 60,000 sets produced **zero flushes and 37.5MB of retained worker heap**.
+`process.send` can be called at any time — the tick is only there to batch — so
+the outbox now flushes eagerly past a byte cap (1MB default):
+
+| outbox cap | flushes | retained worker heap |
+|---|---|---|
+| unbounded | 0 | **+37.5MB** |
+| 1MB | 31 | **+7.2MB** |
+
+**A flush racing primary shutdown killed the worker.** The scheduled flush fired
+after the primary had gone, and `process.send` failed with `EPIPE`. The failure
+is *asynchronous*, so a `try/catch` around the call cannot see it — Node emits an
+unhandled `'error'` event that terminates the process. Passing a callback to
+`process.send` routes the failure to the callback instead; the dropped batch is
+counted in `stats.flushDropped`. Losing a batch during shutdown is acceptable;
+crashing the worker over it is not.
+
+**A crashed primary leaked its shared-memory segment permanently.** `create()`
+unlinks any prior segment of the same name, but the name was pid-derived, so a
+crashed run's segment had a name nothing would ever reuse — verified: after a
+`SIGKILL` the segment and its contents were still there, and there is no portable
+way to enumerate POSIX shm on darwin, so the leak is invisible until reboot. At
+the 128MB default that is roughly 500 crashes to exhaust 64GB. The name is now
+derived from the application's identity (`argv[1]`/cwd, plus an optional
+`TURBOCACHE_ID`), so a restart reclaims its own segment while different
+applications on one host still get different ones. Verified: after a crash, a
+restart finds the previous run's data gone.
+
 ## 10. Why not V8 fast calls
 
 The original premise. It does not survive contact:
@@ -1302,6 +1334,21 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
     never written or read, so a worker cannot tell a stale arena from a live one.
 12. **Windows.** Needs `CreateFileMapping` — a second shared-memory
     implementation.
+
+### Operational, still open
+
+16. **Quotas are not validated against arena capacity.** Over-committing them
+    silently falls back to the second-chance budget cap for progress rather than
+    reporting the misconfiguration. The namespace table is also a fixed 16.
+17. **No dead-code removal.** The rejected background-compaction machinery, the
+    `SLAB` allocator that decision 16 did not choose, and the native size
+    estimator that lost to `encodedBytes x 3` are all still compiled in, along
+    with test-only hooks (`poke`, `suppressRefBit`, `backwardShift`,
+    `clearHints`, `probe`) that sit on the same surface as `get` and `set`.
+18. **`primitives` mode copies every string value on `set`.** `flatten` is
+    unconditional because Node-API cannot tell a flat string from a slice, and a
+    slice of any size can retain an arbitrarily large parent. That is the right
+    default for correctness, but it is an allocation per write.
 
 ### Before anyone else could use this
 
