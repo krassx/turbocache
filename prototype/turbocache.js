@@ -44,6 +44,7 @@ class TurboCache {
         // every L1 hit if its values are really objects.
         this.#primitives = opts.values === 'primitives';
         this.#codec = this.#primitives ? null : (opts.codec || null);
+        if (this.#codec && opts.allowSlowCodec !== true) TurboCache.assertFastCodec(this.#codec);
         this.#freeze = opts.freeze === true;
         // A decoded object costs several times its encoded size on the V8 heap,
         // and JS cannot measure that. The budget is in encoded bytes scaled by
@@ -71,6 +72,74 @@ class TurboCache {
             this.#gcObserver.observe({ entryTypes: ['gc'] });
             if (this.#gcObserver.disconnect) { /* caller may stop() */ }
         }
+    }
+
+    // A JSON codec MUST call JSON.stringify/parse with no second argument.
+    // Measured on Node 26: a replacer costs 3.51x and 2-space indent 2.11x,
+    // because Node 26 sped up the fast path (34%) without speeding up the slow
+    // ones - so falling off is worse now than it was on Node 24.
+    //
+    // The codec comes from the caller, so a source-level lint cannot see it.
+    // Probe it instead: if it emits something JSON-shaped that is not byte-
+    // identical to canonical JSON.stringify, it is on a slow path. Codecs that
+    // are not JSON at all (msgpack, protobuf) do not emit a leading '{' and are
+    // left alone. Opt out with allowSlowCodec: true.
+    // Counts top-level arguments of each `name(...)` call in `src`, using
+    // balanced-paren scanning so nested calls and object literals do not
+    // confuse it the way a regex would.
+    static callArgCounts(src, name) {
+        const out = [];
+        let i = 0;
+        while ((i = src.indexOf(name + '(', i)) !== -1) {
+            let d = 0, args = 1, j = i + name.length, empty = true;
+            for (; j < src.length; j++) {
+                const c = src[j];
+                if (c === '(' || c === '[' || c === '{') d++;
+                else if (c === ')' || c === ']' || c === '}') { d--; if (d === 0) break; }
+                else if (c === ',' && d === 1) args++;
+                else if (d === 1 && !/\s/.test(c)) empty = false;
+            }
+            out.push({ index: i, args: empty ? 0 : args, text: src.slice(i, j + 1) });
+            i = j + 1;
+        }
+        return out;
+    }
+
+    static assertFastCodec(codec) {
+        // An identity replacer - JSON.stringify(v, (k, x) => x) - produces
+        // byte-identical output, so probing cannot see it, yet it still costs
+        // 3.51x. Read the function source instead. Native or bound functions
+        // report [native code] and are left alone.
+        for (const [which, fn] of [['encode', codec.encode], ['decode', codec.decode]]) {
+            let src = '';
+            try { src = Function.prototype.toString.call(fn); } catch { continue; }
+            if (src.includes('[native code]')) continue;
+            const name = which === 'encode' ? 'JSON.stringify' : 'JSON.parse';
+            for (const call of TurboCache.callArgCounts(src, name)) {
+                if (call.args > 1) {
+                    throw new Error(
+                        `codec.${which} is not on V8's JSON fast path: ${call.text.slice(0, 60)} ` +
+                        `passes ${call.args} arguments. ${name} must take exactly one ` +
+                        `(a replacer costs 3.51x and indentation 2.11x on Node 26). ` +
+                        `Pass allowSlowCodec: true to override.`);
+                }
+            }
+        }
+
+        const probe = { b: 1, a: 'x', n: [1, 2] };
+        let enc;
+        try { enc = codec.encode(probe); } catch { return; }
+        if (typeof enc !== 'string' || enc[0] !== '{') return;   // not a JSON codec
+        const canonical = JSON.stringify(probe);
+        if (enc === canonical) return;
+        const why = /\n|\n\s/.test(enc) || /: /.test(enc)
+            ? 'it indents or spaces its output'
+            : 'it filters or reorders keys';
+        throw new Error(
+            `codec.encode is not on V8's JSON fast path: ${why}. ` +
+            `Use JSON.stringify(value) with no replacer and no space argument ` +
+            `(a replacer costs 3.51x and indentation 2.11x on Node 26). ` +
+            `Pass allowSlowCodec: true to override.`);
     }
 
     static deepFreeze(o) {

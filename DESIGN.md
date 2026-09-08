@@ -776,10 +776,37 @@ cons, and strings returned from our arena all parse within 2% of each other on
 both versions. So flattening is worth doing for memory (a slice retains its
 parent) but buys nothing for parse speed.
 
-**What this requires of the cache.** The codec path must call `JSON.stringify(v)`
-and `JSON.parse(s)` with no second argument — no replacer, no space, no reviver.
-It does, and `json_fastpath_test.js` now asserts it by inspecting the source, so
-a well-meant `JSON.stringify(v, null, 2)` cannot slip in.
+**A replacer is never acceptable, and this is now enforced two ways.** The rule
+is absolute: `JSON.stringify(v)` and `JSON.parse(s)` take exactly one argument.
+
+1. **Repo-wide lint.** `json_fastpath_test.js` scans every `.js` file in the
+   project for `JSON.stringify(`/`JSON.parse(` calls with more than one
+   top-level argument, using balanced-paren scanning rather than a regex so
+   nested calls are not miscounted, and stripping comments first. A file that
+   measures the slow paths on purpose opts out with a
+   `json-fastpath-lint: allow` marker, so the exemption is visible in the file
+   rather than hidden in the linter.
+2. **Construction-time codec check.** The codec is supplied by the caller, where
+   no source lint can reach, so `assertFastCodec` inspects
+   `Function.prototype.toString` of both `encode` and `decode` and rejects any
+   `JSON.stringify`/`JSON.parse` call with a second argument. Native or bound
+   functions report `[native code]` and are accepted; codecs that are not JSON
+   at all are not affected. `allowSlowCodec: true` overrides it.
+
+Output probing alone is not sufficient, which is why the source check exists: an
+**identity replacer** — `JSON.stringify(v, (k, x) => x)` — produces byte-identical
+output while still costing 3.51x, so nothing about the result reveals it.
+
+| codec | verdict |
+|---|---|
+| `JSON.stringify` / `JSON.parse` directly | accepted |
+| `v => JSON.stringify(v)` | accepted |
+| `v => JSON.stringify(Object.assign({}, v))` (nested call) | accepted |
+| `v => JSON.stringify(v, null, 2)` | **rejected** |
+| `v => JSON.stringify(v, (k, x) => x)` | **rejected** |
+| `v => JSON.stringify(v, ['a'])` | **rejected** |
+| `s => JSON.parse(s, (k, x) => x)` | **rejected** |
+| a non-JSON codec (msgpack, protobuf) | accepted, unaffected |
 
 **A real bug this surfaced.** The prototype encoded every value through
 `napi_get_value_string_latin1`, silently mangling any non-ASCII string — a
@@ -944,10 +971,37 @@ cons, and strings returned from our arena all parse within 2% of each other on
 both versions. So flattening is worth doing for memory (a slice retains its
 parent) but buys nothing for parse speed.
 
-**What this requires of the cache.** The codec path must call `JSON.stringify(v)`
-and `JSON.parse(s)` with no second argument — no replacer, no space, no reviver.
-It does, and `json_fastpath_test.js` now asserts it by inspecting the source, so
-a well-meant `JSON.stringify(v, null, 2)` cannot slip in.
+**A replacer is never acceptable, and this is now enforced two ways.** The rule
+is absolute: `JSON.stringify(v)` and `JSON.parse(s)` take exactly one argument.
+
+1. **Repo-wide lint.** `json_fastpath_test.js` scans every `.js` file in the
+   project for `JSON.stringify(`/`JSON.parse(` calls with more than one
+   top-level argument, using balanced-paren scanning rather than a regex so
+   nested calls are not miscounted, and stripping comments first. A file that
+   measures the slow paths on purpose opts out with a
+   `json-fastpath-lint: allow` marker, so the exemption is visible in the file
+   rather than hidden in the linter.
+2. **Construction-time codec check.** The codec is supplied by the caller, where
+   no source lint can reach, so `assertFastCodec` inspects
+   `Function.prototype.toString` of both `encode` and `decode` and rejects any
+   `JSON.stringify`/`JSON.parse` call with a second argument. Native or bound
+   functions report `[native code]` and are accepted; codecs that are not JSON
+   at all are not affected. `allowSlowCodec: true` overrides it.
+
+Output probing alone is not sufficient, which is why the source check exists: an
+**identity replacer** — `JSON.stringify(v, (k, x) => x)` — produces byte-identical
+output while still costing 3.51x, so nothing about the result reveals it.
+
+| codec | verdict |
+|---|---|
+| `JSON.stringify` / `JSON.parse` directly | accepted |
+| `v => JSON.stringify(v)` | accepted |
+| `v => JSON.stringify(Object.assign({}, v))` (nested call) | accepted |
+| `v => JSON.stringify(v, null, 2)` | **rejected** |
+| `v => JSON.stringify(v, (k, x) => x)` | **rejected** |
+| `v => JSON.stringify(v, ['a'])` | **rejected** |
+| `s => JSON.parse(s, (k, x) => x)` | **rejected** |
+| a non-JSON codec (msgpack, protobuf) | accepted, unaffected |
 
 **A real bug this surfaced.** The prototype encoded every value through
 `napi_get_value_string_latin1`, silently mangling any non-ASCII string — a
@@ -1182,10 +1236,37 @@ cons, and strings returned from our arena all parse within 2% of each other on
 both versions. So flattening is worth doing for memory (a slice retains its
 parent) but buys nothing for parse speed.
 
-**What this requires of the cache.** The codec path must call `JSON.stringify(v)`
-and `JSON.parse(s)` with no second argument — no replacer, no space, no reviver.
-It does, and `json_fastpath_test.js` now asserts it by inspecting the source, so
-a well-meant `JSON.stringify(v, null, 2)` cannot slip in.
+**A replacer is never acceptable, and this is now enforced two ways.** The rule
+is absolute: `JSON.stringify(v)` and `JSON.parse(s)` take exactly one argument.
+
+1. **Repo-wide lint.** `json_fastpath_test.js` scans every `.js` file in the
+   project for `JSON.stringify(`/`JSON.parse(` calls with more than one
+   top-level argument, using balanced-paren scanning rather than a regex so
+   nested calls are not miscounted, and stripping comments first. A file that
+   measures the slow paths on purpose opts out with a
+   `json-fastpath-lint: allow` marker, so the exemption is visible in the file
+   rather than hidden in the linter.
+2. **Construction-time codec check.** The codec is supplied by the caller, where
+   no source lint can reach, so `assertFastCodec` inspects
+   `Function.prototype.toString` of both `encode` and `decode` and rejects any
+   `JSON.stringify`/`JSON.parse` call with a second argument. Native or bound
+   functions report `[native code]` and are accepted; codecs that are not JSON
+   at all are not affected. `allowSlowCodec: true` overrides it.
+
+Output probing alone is not sufficient, which is why the source check exists: an
+**identity replacer** — `JSON.stringify(v, (k, x) => x)` — produces byte-identical
+output while still costing 3.51x, so nothing about the result reveals it.
+
+| codec | verdict |
+|---|---|
+| `JSON.stringify` / `JSON.parse` directly | accepted |
+| `v => JSON.stringify(v)` | accepted |
+| `v => JSON.stringify(Object.assign({}, v))` (nested call) | accepted |
+| `v => JSON.stringify(v, null, 2)` | **rejected** |
+| `v => JSON.stringify(v, (k, x) => x)` | **rejected** |
+| `v => JSON.stringify(v, ['a'])` | **rejected** |
+| `s => JSON.parse(s, (k, x) => x)` | **rejected** |
+| a non-JSON codec (msgpack, protobuf) | accepted, unaffected |
 
 **A real bug this surfaced.** The prototype encoded every value through
 `napi_get_value_string_latin1`, silently mangling any non-ASCII string — a
@@ -1261,6 +1342,7 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 | 14 | Batched, fire-and-forget writes to the primary | synchronous write-through | Keeps `set()` off the IPC critical path; costs ~1 tick of cross-worker staleness |
 | 15 | Current LTS, darwin + linux, x64 + arm64 | Windows in v1 | Windows needs `CreateFileMapping` — a second shared-memory implementation |
 | 17 | **No background compaction** | async compress-on-the-threadpool with version-validated apply | Built and proven race-safe (18k stale captures correctly discarded, 0 wrong values), but worth only +1.9 points of hit rate at 3x read latency, while doubling the arena buys +6.9 points at no cost. Restricting to cold entries removes the latency penalty *and* the entire benefit. |
+| 25 | **A JSON replacer/space/reviver is never permitted; enforced, not documented** | rely on code review; document the rule only | A replacer costs 3.51x on Node 26 and indentation 2.11x, and an identity replacer produces byte-identical output so no output check can catch it. Enforced by a repo-wide balanced-paren lint plus a construction-time check on the caller-supplied codec, with `allowSlowCodec: true` as the deliberate escape hatch. |
 | 24 | **ASCII values stored and returned as one-byte strings; non-ASCII as UTF-8** | latin1 for everything (previous behaviour) | Fixes silent mangling of non-ASCII, and keeps ASCII on the representation Node 26's 34%-faster stringify fast path favours. Node 26 penalises all-non-ASCII payloads 2.03x, worse in absolute terms than Node 24. |
 | 23 | **`values: 'primitives'` is the default mode; codec is opt-in** | codec everywhere; JSON-always like bugsee; accept objects natively | Primitives make accounting exact (verified within 1% against measured heap), remove the aliasing hazard entirely, and need no codec. Costs ~20% for flattening plus exact sizing, and pushes object workloads onto a decode-per-hit path. Requires flattening on insert: a cached 1MB substring otherwise retains an 8MB parent. |
 | 22 | **No per-object size measurement; a post-GC heap guard instead** | native structural size walk; `v8.serialize().length`; sampling `used_heap_size` directly | V8 exposes no per-object size outside a heap snapshot. A native walk was built and is -14% to -26% accurate against +/-7% for `encodedBytes x 3`, at 5825ns versus free. Bounding live heap after a GC bounds the thing that actually matters: retained heap 445MB to 121MB where the byte budget bound nothing. |

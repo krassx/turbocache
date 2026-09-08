@@ -1,4 +1,5 @@
 'use strict';
+// json-fastpath-lint: allow - this benchmark measures the slow paths on purpose.
 // Which string representations hit V8's fast JSON.parse path, and does our
 // cache hand back one of them?
 const native = require('../prototype/build/Release/l2.node');
