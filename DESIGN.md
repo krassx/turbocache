@@ -20,16 +20,21 @@
 ## 2. Public API (v1)
 
 ```js
-const { Cache } = require('turbocache');
+const { Cache } = require('turbocache');   // alias of TurboCache
 const cluster = require('cluster');
 
-// Primary. Sizes itself from the machine, names its own segment, and passes
-// the name to workers through the environment.
-const cache = new Cache({ storage: 'primitives' });
+// Primary, BEFORE forking. Sizes itself from the machine, names its own
+// segment, and passes the name to workers through the environment.
+const cache = Cache.open({ storage: 'primitives' });
 Cache.install(cluster);          // the entire primary-side wiring
 
-// Worker. Same call; it detects that it is a worker and attaches.
-const cache = new Cache({ storage: 'primitives' });
+// Worker. Same call; it detects that it is a worker and attaches. Throws if the
+// primary has not opened the arena yet: a worker must never create one, or it
+// silently shadows the primary's.
+const cache = Cache.open({ storage: 'primitives' });
+
+// A second namespace in the same process binds to the arena already open.
+const other = Cache.open({ namespace: { name: 'sessions', quotaBytes: 32 << 20 } });
 ```
 
 ```ts
@@ -51,14 +56,23 @@ class Cache {
   delete(key: string): boolean;
   clearLocal(): void;          // this process's L1 only
   clearAll(): void;            // the shared arena AND every worker's L1
+  clearNamespace(): void;      // just this cache's namespace
   close(): void;
 
   readonly stats: { l1Hits, l2Hits, misses, sets, deletes, invalidated,
                     rejectedType, rejectedSize, flushes, sent };
   readonly lastError: string | null;
 
+  static open(opts?): Cache;   // create (primary) or attach (worker)
   static install(cluster): void;
+  static namespaceStats(): Array<{name, id, bytes, quota, protected, dropped}>;
 }
+```
+
+Keys are UTF-8 and capped at **1024 bytes**; longer keys are rejected. They were
+previously read into a fixed `char[512]` as latin1, so a 512-byte key was
+truncated to its prefix and any character above U+00FF folded to its low byte —
+distinct keys collided and returned *each other's values*.
 ```
 
 Four API decisions worth stating, because each rejects a plausible alternative:
@@ -101,9 +115,10 @@ first implementation did.
 │    ├── header (magic, layout ver, heartbeat, sizes)          │
 │    ├── invalidation ring buffer                              │
 │    ├── hash index (open addressing)                          │
-│    └── slab arena (entries: LZ4-compressed above threshold)  │
+│    ├── hints (separate shm segment, workers map it O_RDWR)   │
+│    └── circular log + second-chance re-append (LOG2)         │
 │  IPC receiver  ← batched writes from workers                 │
-│  background sweeper (TTL expiry, CLOCK eviction)             │
+│  eviction on the write path (no background sweeper exists)   │
 └──────────────────────────────────────────────────────────────┘
         ▲ writes (batched IPC)        │ mmap READ-ONLY
         │                             ▼
@@ -171,14 +186,15 @@ struct Entry {
   uint32_t seq;         // seqlock: even = stable, odd = write in progress
   uint64_t hash;        // rapidhash64(namespace + key)
   uint32_t version;     // bumped per write; matches invalidation ring
-  uint32_t expiresAt;   // seconds from arena epoch; 0 = no TTL
+  uint32_t expiresAt;   // MILLISECONDS from the arena epoch; 0 = no TTL
   uint32_t rawLen;      // uncompressed length
   uint32_t storedLen;   // on-disk length (== rawLen if uncompressed)
+  uint32_t blockSize;   // total bytes of this record, for the tail walk
   uint16_t keyLen;
-  uint8_t  flags;       // COMPRESSED | IS_STRING | IS_LATIN1
-  uint8_t  refBit;      // CLOCK
+  uint8_t  flags;       // COMPRESSED | STRING | LATIN1 | NUMBER | BOOL | NULL | BIGINT
+  uint8_t  ns;          // namespace id (CLOCK bits live in the hints segment)
   // ... keyLen bytes of key text, then storedLen bytes of value
-};  // 32-byte header
+};  // 40-byte header
 ```
 
 **Key text is stored.** It costs bytes, and it buys three things: exact `memcmp` verification (so a 64-bit hash is *exactly* correct, no collision risk, rather than probabilistic); key enumeration remains possible; and the future L3 can use real Redis keys instead of opaque hash hex.
@@ -196,7 +212,7 @@ Plain FIFO eviction, though, is frequency-blind, which costs it real hit rate.
 So when the tail reaches a live entry whose CLOCK reference bit is set, the
 entry is **re-appended at the head** and its bit cleared, rather than dropped —
 CLOCK's second chance, expressed on a log. Re-appends are capped (64 per
-allocation in the prototype) so a fully-hot arena still makes progress.
+allocation, measured to saturate at 8) so a fully-hot arena still makes progress.
 
 A record must not straddle the wrap point, so the tail of the buffer is filled
 with a pad record when the next entry will not fit. Note that masking also
@@ -275,7 +291,7 @@ Both overridable via constructor options.
 |---|---|
 | Worker `SIGKILL`ed | Arena untouched — worker had no write permission. Its unflushed outbox is lost. |
 | Worker killed mid-read | Nothing held; no lock, no cleanup. |
-| Primary crashes | Arena goes stale. Primary bumps a `heartbeatNs` header field; a worker seeing it stale beyond threshold degrades to L1-only. Under `cluster` the workers usually die with it anyway. |
+| Primary crashes | **Not handled.** `heartbeatNs` exists but is never written or read, so a worker cannot tell a stale arena from a live one. Under `cluster` workers usually die with the primary, which is the only thing saving this today. The segment is reclaimed on restart because its name derives from the application's identity, not its pid. |
 | Ring wrap | Lagging worker flushes its whole L1. |
 | Layout change across versions | `magic` + `layoutVersion` in the header; mismatch refuses to attach rather than misreading. |
 | Corrupt length field | Bounds-checked before every `memcpy`. |
@@ -324,14 +340,25 @@ Crossover ~1KB. Caching the handle in a `Map` beats both at every size.
 
 | bytes | probe | getLen | get (full) | set | JS `Map.get` |
 |---|---|---|---|---|---|
-| 64 | 26 | 36 | **42** | 45 | 17 |
-| 256 | 31 | 40 | **51** | 55 | 17 |
-| 1024 | 32 | 54 | **80** | 86 | 17 |
-| 4096 | 32 | 122 | **200** | 250 | 17 |
-| 16384 | 35 | 335 | **830** | 620 | 17 |
+| 64 | 26 | 36 | 42 | 45 | 17 |
+| 1024 | 32 | 54 | 80 | 86 | 17 |
+| 16384 | 35 | 335 | 830 | 620 | 17 |
 
-An L2 hit is only ~2.5x an L1 hit for small values. The index probe is ~32ns and
-essentially flat — the cost is all in copying and decoding the value.
+**Those are a best case and were wrongly used as the headline.** They cycle 2000
+keys in order, so index and entries (~200KB) stay cache-resident. Measured across
+access order and keyspace (`bench/l2_latency.js`):
+
+| value | keyspace | order | L2 hit | full `get()` |
+|---|---|---|---|---|
+| 64B | 2,000 | sequential | 42ns | 51ns |
+| 64B | 2,000 | random | 57ns | 65ns |
+| 64B | 200,000 | sequential | 91ns | 101ns |
+| **64B** | **200,000** | **random** | **265ns** | **298ns** |
+| 1KB | 200,000 | sequential | 156ns | 187ns |
+| **1KB** | **200,000** | **random** | **445ns** | **497ns** |
+
+The realistic figure is **~300–500ns**, not 42ns — a 7–12x correction. §6's
+"150–400ns" was closer to the truth than §9's own headline.
 
 ### LZ4 on realistic data — the case against compression
 
@@ -503,8 +530,8 @@ scans — 45ns → 342ns at **3% load factor**, and up to ~33µs with a larger l
 
 *Fixed* with **backward-shift deletion** (Knuth 6.4 Algorithm R), which closes
 the gap by relocating entries instead of leaving a marker, plus a **75% index
-load ceiling** so the index can never saturate before the data region (which
-previously caused inserts to fail silently).
+load ceiling**. The claim that this meant the index "can never saturate" was
+**false**; see the review findings below.
 
 | cumulative inserts | live | before | after |
 |---|---|---|---|
@@ -1225,6 +1252,45 @@ derived from the application's identity (`argv[1]`/cwd, plus an optional
 applications on one host still get different ones. Verified: after a crash, a
 restart finds the previous run's data gone.
 
+### Adversarial review — findings and fixes
+
+An independent adversarial review attacked the six load-bearing invariants, ran
+ASan and UBSan for the first time, and audited the benchmarks. It found **six
+severity-1 defects**. All are fixed; `prototype/review_regression_test.js` pins
+every one.
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | **Keys truncated at 511 bytes and folded to latin1**, so distinct keys returned *each other's values*. `get(K×511+'A')` → `"value-B"`; a never-set key returned data; `'中'` aliased `'-'`. L1 masked it within a process, so it surfaced only on L1 misses and cross-worker. | Keys are read as UTF-8 and capped at 1024 bytes; longer keys are rejected rather than truncated. |
+| 2 | **Index saturation permanently bricked the arena.** The load-ceiling loop gave up after a fixed 4096 iterations, so under overwrite-heavy traffic `live` crept to 100%; `logAlloc` ran *before* `findFreeSlot`, so a failed insert left an uninitialised header whose garbage `blockSize` desynced the tail walk and orphaned the whole index. Repro ended with 60,000/60,000 sets failing and nothing readable, permanently. | Bound the loop by real progress (`logTail < logHead`) rather than a count; allocate, then secure the slot, then unlink the old entry; write a PAD record if the slot cannot be secured. |
+| 3 | **TTL was lost whenever L1 refilled from L2** — the refill path never carried the entry's expiry, so any expiring value read once through L2 became immortal in that worker. | The arena reports the entry's expiry (`lastExpiresAt`), and the refill carries it into L1. |
+| 4 | **The own-write ring skip served deleted values.** "Our own write, L1 is already correct" was false when L1 had been refilled from L2 between queuing and apply: a worker that deleted a key then read it in the same tick served the deleted value forever. | Own records are no longer skipped; the cost is one L2 refetch after each own write. |
+| 5 | **The primary's L1 was never invalidated by worker writes.** `applyBatch` wrote the arena directly and the primary's drain is a no-op, so a primary that also reads served its own stale value indefinitely. | `applyBatch` drops the affected key from every cache instance in the process. |
+| 6 | **A worker forked before the primary opened the arena silently created a second, writable one** and `shm_unlink`ed the primary's — total silent cache failure. | A worker never creates; it throws a message naming the ordering requirement. |
+
+Severity 2, also fixed: `#byHash` grew without bound (32MB per 300k distinct
+keys); a failed `set` destroyed the previous value; the worker-side size check
+compared UTF-16 units against a UTF-8 limit and ignored the 4MB scratch cap;
+`install()` attached twice if called between `fork()` and `'online'`;
+`namespaceStats()` before an arena and any use after `close()` were hard
+SIGSEGVs; `ringAppend` published the head before writing the record, leaving a
+window in which a reader could permanently miss one invalidation.
+
+Severity 3, also fixed: `ttlMs` near `INT32_MAX` overflowed and expired
+immediately; TTL is now **millisecond**-precise rather than rounded up to whole
+seconds (a 1ms TTL could be served for up to 2s); namespace names longer than 23
+bytes silently shared one id and quota; the slab free-list link was a misaligned
+`uint64_t` store (UBSan); compaction adjusted `liveBytes` but not `nsBytes`.
+
+**What survived.** The reviewer could not break the `tailPub <= pos` liveness
+proof, backward-shift deletion under concurrent probes, the zero-copy second
+chance, or namespace quota accounting (`Σ nsBytes == liveBytes` exactly after
+300k churn ops, no underflow, over-commit still made progress). ARM ordering
+checks out. ASan+UBSan across ~100M reads produced no reports, and are now part
+of `run_sanitizers.sh`. The TSAN gate was also flaky — its allowlist named only
+writer-side frames, but TSAN attributes the deliberate race to whichever thread
+detects it, so reader frames appear intermittently; both sides are now allowed.
+
 ## 10. Why not V8 fast calls
 
 The original premise. It does not survive contact:
@@ -1240,7 +1306,7 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 ## 11. Testing
 
 - **Unit (native):** hash table probing and tombstones, slab allocator, LZ4 round-trip, seqlock under a deliberately racing writer.
-- **Sanitizers:** ASAN + UBSAN builds in CI; **TSAN specifically for the seqlock**, which is the only lock-free code in the design.
+- **Sanitizers:** `prototype/tsan/run_sanitizers.sh` runs TSAN across four arena configurations and ASan+UBSan across three, asserting zero torn values, zero sanitizer reports, and that the set of TSAN race sites never grows beyond the known seqlock payload copy. There is no CI to run it in.
 - **Multi-process integration:** fork N workers, run randomized op streams against a JS `Map` reference model, assert every read is either correct-current or correct-stale-within-bound.
 - **Crash tests:** `SIGKILL` a worker mid-`set`; assert the arena stays readable and self-consistent, and that surviving workers are unaffected.
 - **Fuzzing:** feed the entry decoder adversarial arena bytes (corrupt lengths, torn seq values) and assert no out-of-bounds access.
@@ -1369,12 +1435,13 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 | Area | Assumption |
 |---|---|
 | L1 hit | ~21ns (measured, `Map` lookup) |
-| L2 hit | 42ns @64B, 51ns @256B, 80ns @1KB, 200ns @4KB, 830ns @16KB (**measured**, uncompressed) |
+| L2 hit | **265ns @64B, 445ns @1KB** on a 200k-key random workload; 42–80ns only for a small in-order working set |
 | `set` | 45ns @64B, 86ns @1KB, 620ns @16KB (**measured**, uncompressed) |
 | Cross-worker write visibility | ~1 event-loop tick |
 | Entry count | up to ~100k in L2 at typical value sizes |
 | Worker count | up to 32 |
-| Max value size | 1MB, configurable, hard-capped by arena size |
+| Max key size | **1024 bytes** UTF-8; longer keys are rejected |
+| Max value size | `min(dataBytes/2 - overhead, 4MB scratch)`, reported by `maxValueBytes()` |
 | Durability | none — cache only; the arena dies with the primary |
 | Security | uid-scoped, mode 0600; **any same-user process can read all cached data** |
 | Maintenance | solo maintainer; one prebuild per platform, stable across Node majors |

@@ -92,8 +92,13 @@ if (cluster.isPrimary) {
         let c;
         if (IMPL === 'turbo') {
             const { TurboCache } = require('../prototype/turbocache');
-            c = TurboCache.attachWorker(process.env.TC_ARENA, id,
-                    { l1MaxBytes: L1, codec: MODE === 'codec' ? JSONC : null });
+            // Was passing codec:null with no storage preset, which selects the
+            // un-nameable "raw" mode and skips the flatten that 'primitives'
+            // pays - so the headline number omitted ~20% of the default mode's
+            // cost. Use the real presets.
+            c = TurboCache.attachWorker(process.env.TC_ARENA, id, MODE === 'codec'
+                ? { l1MaxBytes: L1, codec: JSONC }
+                : { l1MaxBytes: L1, storage: 'primitives' });
         } else {
             c = new (require(BUGSEE).Cache)({ l1MaxBytes: L1 });
         }

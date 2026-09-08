@@ -7,8 +7,16 @@ static bool g_suppressRefBit = false;
 
 static inline uint64_t align8(uint64_t v) { return (v + 7) & ~7ull; }
 
+// Milliseconds since this arena was created. uint32 gives ~49 days of TTL range.
+static inline uint32_t nowRelMs(const Store &s) {
+  struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+  uint64_t nowMs = (uint64_t)ts.tv_sec * 1000ull + ts.tv_nsec / 1000000ull;
+  return (uint32_t)(nowMs - s.h->epochMs);
+}
+
 struct ReadResult {
   bool     hit = false;
+  uint32_t expiresAt = 0;
   uint32_t rawLen = 0, storedLen = 0;
   uint8_t  flags = 0;
   uint8_t *buf = nullptr;   // caller-owned scratch, filled with stored bytes
@@ -89,7 +97,10 @@ static inline void unlinkSlot(Store &s, uint64_t slot) {
   if (h->mode == MODE_SLAB) {
     int cls = slabClassFor(h, e->blockSize);
     if (cls >= 0) {
-      *(uint64_t *)((uint8_t *)e + sizeof(std::atomic<uint32_t>)) = h->freeHead[cls];
+      // memcpy, not a cast: the free-list link sits at offset 4 inside the
+      // entry, so a direct uint64_t store is misaligned (UBSAN flagged it).
+      uint64_t next = h->freeHead[cls];
+      memcpy((uint8_t *)e + sizeof(std::atomic<uint32_t>), &next, sizeof(next));
       h->freeHead[cls] = pos + 1;
     }
   }
@@ -131,7 +142,9 @@ static inline int64_t slabAlloc(Store &s, uint32_t need) {
     if (h->freeHead[cls]) {
       uint64_t off = h->freeHead[cls] - 1;
       Entry *e = s.entryAt(off);
-      h->freeHead[cls] = *(uint64_t *)((uint8_t *)e + sizeof(std::atomic<uint32_t>));
+      uint64_t next = 0;
+      memcpy(&next, (uint8_t *)e + sizeof(std::atomic<uint32_t>), sizeof(next));
+      h->freeHead[cls] = next;
       return (int64_t)off;
     }
     if (h->bumpPtr + bsz <= h->dataBytes) {
@@ -343,15 +356,23 @@ static inline void compactApply(Store &s, CompactItem &it) {
   s.idx[it.slot].off.store((uint64_t)off2, std::memory_order_release);
   h->liveBytes -= it.oldBlockSize;
   h->liveBytes += need;
+  h->nsBytes[d->ns] -= it.oldBlockSize;      // was only adjusting liveBytes
+  h->nsBytes[d->ns] += need;
   it.applied = true;
 }
 
 // ----------------------------------------------------------------- ops ----
+// Single writer, so the head is bumped with a plain load/release-store rather
+// than fetch_add. The record must be written BEFORE the head is published:
+// publishing first left a window in which a reader saw the slot's previous lap
+// (or zeros) and permanently missed one invalidation.
 static inline void ringAppend(Store &s, uint64_t hash, uint32_t version, uint16_t writerId) {
   Header *h = s.h;
-  uint64_t pos = h->ringHead.fetch_add(1, std::memory_order_acq_rel);
+  uint64_t pos = h->ringHead.load(std::memory_order_relaxed);
   RingRec *r = &s.ring[pos & (h->ringCap - 1)];
   r->hash = hash; r->version = version; r->writerId = writerId;
+  std::atomic_thread_fence(std::memory_order_release);
+  h->ringHead.store(pos + 1, std::memory_order_release);
 }
 
 // Sole-writer path. Returns false if the value could not be allocated.
@@ -363,26 +384,47 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
   uint64_t hash = rapidhash(key, keyLen, 0);
   if (hash <= HASH_TOMB) hash += 2;   // reserve 0/1 as sentinels
 
-  int64_t existing = s.findSlot(hash, key, keyLen);
-  if (existing >= 0) unlinkSlot(s, (uint64_t)existing);
-
-  // Keep the index below its load ceiling, so it can never saturate before the
-  // data region does. Previously this silently failed inserts.
+  // Keep the index below its load ceiling. The old loop gave up after a fixed
+  // 4096 iterations, so under an overwrite-heavy workload (where the tail is
+  // mostly dead records and `live` does not fall) it expired with the index
+  // still full, and `live` crept to 100%. Bound by real progress instead:
+  // logDropTail always advances the tail, so this terminates when the tail
+  // catches the head.
   if (h->mode != MODE_SLAB) {
-    for (int guard = 0; h->live >= h->maxLive && guard < 4096; guard++) {
-      uint64_t before = h->live;
+    while (h->live >= h->maxLive && h->logTail < h->logHead) {
       logDropTail(s, nullptr);                 // null budget: drop, never re-append
       h->indexEvictions++;
-      if (h->live == before && h->logTail >= h->logHead) break;
     }
   }
 
   uint32_t need = (uint32_t)align8(sizeof(Entry) + keyLen + storedLen);
   int64_t off = (h->mode == MODE_SLAB) ? slabAlloc(s, need) : logAlloc(s, need);
-  if (off < 0) return false;
+  if (off < 0) return false;                   // nothing touched yet
 
+  // The slot must be secured BEFORE the old entry is unlinked, and the log
+  // block must not be left unwritten. Previously the existing entry was
+  // unlinked first, so a later failure destroyed the old value; and a failed
+  // findFreeSlot returned with `need` bytes of never-initialised header at the
+  // head, whose garbage blockSize desynced the tail walk and bricked the arena.
   int64_t slot = s.findFreeSlot(hash);
-  if (slot < 0) return false;
+  if (slot < 0) {
+    if (h->mode != MODE_SLAB) {                // leave a skippable PAD record
+      Entry *p = s.entryAt((uint64_t)off);
+      uint32_t pseq = p->seq.load(std::memory_order_relaxed);
+      p->seq.store(pseq | 1, std::memory_order_release);
+      p->slot = SLOT_PAD; p->blockSize = (uint32_t)align8(need);
+      p->keyLen = 0; p->hash = 0; p->storedLen = 0; p->rawLen = 0;
+      p->seq.store((pseq | 1) + 1, std::memory_order_release);
+    }
+    return false;
+  }
+
+  int64_t existing = s.findSlot(hash, key, keyLen);
+  if (existing >= 0) {
+    unlinkSlot(s, (uint64_t)existing);
+    slot = s.findFreeSlot(hash);               // the unlink may have shifted slots
+    if (slot < 0) return false;
+  }
 
   Entry *e = s.entryAt((uint64_t)off);
   uint32_t seq = e->seq.load(std::memory_order_relaxed);
@@ -458,7 +500,7 @@ static inline void storeClear(Store &s, uint16_t writerId) {
 
 // Existence check: index probe plus key compare plus expiry, with no value copy
 // and no promotion. Deliberately does not touch the CLOCK reference bit.
-static inline bool storeHas(Store &s, const uint8_t *key, uint16_t keyLen, uint32_t nowSec) {
+static inline bool storeHas(Store &s, const uint8_t *key, uint16_t keyLen, uint32_t nowMs) {
   Header *h = s.h;
   uint64_t hash = rapidhash(key, keyLen, 0);
   if (hash <= HASH_TOMB) hash += 2;
@@ -468,14 +510,14 @@ static inline bool storeHas(Store &s, const uint8_t *key, uint16_t keyLen, uint3
   Entry *e = s.entryAt(pos);
   uint32_t exp = e->expiresAt;
   if (h->mode != MODE_SLAB && h->tailPub.load(std::memory_order_seq_cst) > pos) return false;
-  return !(exp && exp <= nowSec);
+  return !(exp && exp <= nowMs);
 }
 
 // Reader path. Safe against a concurrent writer reusing the block underneath us:
 // copy first, then re-check the sequence, and discard a torn read.
 static inline bool storeGet(Store &s, const uint8_t *key, uint16_t keyLen,
                             uint8_t *scratch, size_t scratchCap, ReadResult *out,
-                            uint32_t nowSec) {
+                            uint32_t nowMs) {
   Header *h = s.h;
   uint64_t hash = rapidhash(key, keyLen, 0);
   if (hash <= HASH_TOMB) hash += 2;
@@ -517,14 +559,14 @@ static inline bool storeGet(Store &s, const uint8_t *key, uint16_t keyLen,
       // proves the record was live for the whole copy (tail only increases).
       // seq_cst so the copy cannot be reordered after this load.
       if (h->mode != MODE_SLAB && h->tailPub.load(std::memory_order_seq_cst) > pos) return false;
-      if (exp && exp <= nowSec) return false;                // lazily expired
+      if (exp && exp <= nowMs) return false;                 // lazily expired
       // Reference bit lives in the hints region, which workers map READ-WRITE
       // even though the rest of the segment is read-only to them. Load first:
       // a hot entry is already marked, so the store (and the cache-line
       // ping-pong between workers) is skipped.
       if (s.hints && !g_suppressRefBit && !s.hints[i].load(std::memory_order_relaxed))
         s.hints[i].store(1, std::memory_order_relaxed);
-      out->hit = true; out->rawLen = rl; out->storedLen = sl;
+      out->hit = true; out->rawLen = rl; out->storedLen = sl; out->expiresAt = exp;
       out->flags = fl; out->buf = scratch;
       return true;
     }

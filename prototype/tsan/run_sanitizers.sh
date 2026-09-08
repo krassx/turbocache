@@ -13,7 +13,10 @@
 # grows. Anything new is a regression.
 set -u
 cd "$(dirname "$0")"
-ALLOWED='logDropTail|storeSet|writer'      # writer-side payload copies only
+# TSAN attributes the SUMMARY to whichever thread detects the race, so the
+# READER side of the deliberate payload copy shows up intermittently too.
+# Naming only the writer frames made the gate flaky.
+ALLOWED='logDropTail|storeSet|writer|storeGet|reader'
 
 clang++ -std=c++17 -fsanitize=thread -O1 -g -o seqlock_tsan seqlock_tsan.cc || exit 1
 
@@ -37,5 +40,26 @@ run 6 5 320  4096  "constant wrap-around"
 run 8 5 256  2048  "wrap + index pressure"
 run 2 5 1024 1024  "high index load factor"
 
-[ $fail -eq 0 ] && echo "  PASS: no torn values, and no race sites outside the known seqlock payload copy"
+# ASAN + UBSAN: different tools, different bugs. TSAN finds races; these find
+# out-of-bounds, use-after-free, misaligned access and integer UB.
+echo
+echo "  ASan + UBSan"
+clang++ -std=c++17 -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+        -O1 -g -o seqlock_asan seqlock_tsan.cc || exit 1
+asan_run() {
+  ASAN_OPTIONS="detect_leaks=0" ./seqlock_asan "$1" "$2" "$3" "$4" >/tmp/asan_run.out 2>&1
+  local rc=$? corrupt reports
+  corrupt=$(grep -oE 'CORRUPT=[0-9]+' /tmp/asan_run.out | cut -d= -f2)
+  reports=$(grep -cE 'runtime error|AddressSanitizer' /tmp/asan_run.out)
+  printf "  %-26s corrupt=%-4s sanitizer reports=%s\n" "$5" "${corrupt:-?}" "$reports"
+  [ "${corrupt:-1}" != "0" ] && { echo "    FAIL: torn or wrong values"; fail=1; }
+  [ "$reports" != "0" ] && { echo "    FAIL: sanitizer reports"; grep -E 'runtime error|ERROR' /tmp/asan_run.out | head -3; fail=1; }
+  [ $rc -gt 1 ] && { echo "    FAIL: exited $rc"; fail=1; }
+  return 0
+}
+asan_run 4 4 4096 16384 "steady state"
+asan_run 6 4 320  4096  "constant wrap-around"
+asan_run 2 4 1024 1024  "high index load factor"
+
+[ $fail -eq 0 ] && echo "  PASS: no torn values, no unexpected race sites, no ASan/UBSan reports"
 exit $fail

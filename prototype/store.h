@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <time.h>
 #include "rapidhash.h"
 
 static const uint32_t TC_MAGIC = 0x54430001;
@@ -76,6 +77,7 @@ struct Header {
   uint64_t dataOff;   uint64_t dataBytes;
   uint64_t ringOff;   uint64_t ringCap;      // power of two
   uint64_t hintsBytes;                       // size of the separate hints segment
+  uint64_t epochMs;                // arena creation time; expiries are ms from here
   std::atomic<uint64_t> tailPub;   // logTail, republished for readers
   std::atomic<uint64_t> ringHead;
   std::atomic<uint64_t> heartbeatNs;
@@ -192,6 +194,8 @@ struct Store {
     }
     h->bumpPtr = 0; h->clockHand = 0; h->logHead = 0; h->logTail = 0;
     h->tailPub.store(0, std::memory_order_relaxed);
+    { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+      h->epochMs = (uint64_t)ts.tv_sec * 1000ull + ts.tv_nsec / 1000000ull; }
     h->maxLive = (uint64_t)(indexSlots * MAX_LOAD);
     if (!openHints(nm, true)) return false;
     bind();

@@ -12,6 +12,7 @@ const { PerformanceObserver } = require('perf_hooks');
 
 const MSG = 'tc';
 let storeReady = false;      // the native store is a per-process singleton
+const instances = new Set();  // live caches in THIS process, for local invalidation
 
 class TurboCache {
     #l1 = new Map();          // key -> { v, bytes, hits }
@@ -26,6 +27,9 @@ class TurboCache {
     #ns = '';
     #nsId = 0;
     #maxValue = 0;
+    #keyMax = 1024;
+    // Native expiry is milliseconds from the arena's creation time.
+    #arenaEpochMs = 0;
     #id;
     #codec;
     #l1Decoded = true;
@@ -53,9 +57,17 @@ class TurboCache {
             // #id is assigned further down, so read the option directly: only the
             // primary may register a namespace; a worker must find it already there.
             this.#nsId = native.nsResolve(nsOpt.name, nsOpt.quotaBytes || 0, (opts.workerId || 0) === 0);
-            if (this.#nsId < 0) throw new Error(`namespace table full (max ${16}) or not registered by the primary`);
+            if (this.#nsId === -2)
+                throw new Error(`namespace name must be under 24 bytes, got ${Buffer.byteLength(nsOpt.name)}`);
+            if (this.#nsId < 0)
+                throw new Error(this.#id === 0
+                    ? 'namespace table full (15 named namespaces max)'
+                    : `namespace '${nsOpt.name}' was not registered by the primary`);
         }
         this.#maxValue = native.maxValueBytes();
+        this.#keyMax = native.keyMaxBytes();
+        this.#arenaEpochMs = native.epochMs();
+        instances.add(this);
         this.#l1Max = opts.l1MaxBytes || 2 * 1024 * 1024;
         this.#outboxMaxBytes = opts.outboxMaxBytes || (1 << 20);
         this.#id = opts.workerId || 0;
@@ -252,7 +264,14 @@ class TurboCache {
         const arenaBytes = opts.arenaBytes || auto.arenaBytes;
         const indexSlots = opts.indexSlots || auto.indexSlots;
         const o = { l1MaxBytes: auto.l1MaxBytes, ...opts };
-        if (cluster.isWorker && process.env.TURBOCACHE_ARENA) {
+        if (cluster.isWorker) {
+            // A worker forked BEFORE the primary called open() has no
+            // TURBOCACHE_ARENA, and used to fall through to createPrimary -
+            // silently creating a second writable arena and shm_unlinking the
+            // primary's. Fail loudly instead.
+            if (!process.env.TURBOCACHE_ARENA)
+                throw new Error('turbocache: no arena to attach to. The primary must call ' +
+                                'Cache.open()/new Cache() BEFORE forking workers.');
             return TurboCache.attachWorker(process.env.TURBOCACHE_ARENA, cluster.worker.id, o);
         }
         // A pid-based name leaks: create() unlinks any prior segment, but a
@@ -274,14 +293,18 @@ class TurboCache {
         return '/tc-' + crypto.createHash('sha1').update(id).digest('hex').slice(0, 16);
     }
 
+    // Attaches exactly once per worker. Calling this between fork() and the
+    // 'online' event previously attached twice, applying every batch twice.
     static install(cluster) {
-        cluster.on('online', w => w.on('message', m => {
-            if (TurboCache.isCacheMessage(m)) TurboCache.applyBatch(m);
-        }));
-        for (const id in cluster.workers) {
-            const w = cluster.workers[id];
+        const wired = new WeakSet();
+        const attach = w => {
+            if (!w || wired.has(w)) return;
+            wired.add(w);
             w.on('message', m => { if (TurboCache.isCacheMessage(m)) TurboCache.applyBatch(m); });
-        }
+        };
+        cluster.on('online', attach);
+        cluster.on('fork', attach);
+        for (const id in cluster.workers) attach(cluster.workers[id]);
     }
 
     static createPrimary(name, arenaBytes, indexSlots, opts = {}) {
@@ -305,7 +328,7 @@ class TurboCache {
             : (key.length + encodedLen + 64) * this.#heapFactor;
         const prev = this.#l1.get(key);
         if (prev) this.#l1Bytes -= prev.bytes;
-        this.#l1.set(key, { v, bytes, hits: 1, exp: expiresAt });
+        this.#l1.set(key, { v, bytes, hits: 1, exp: expiresAt, hash });
         this.#byHash.set(hash, key);
         this.#l1Bytes += bytes;
 
@@ -318,6 +341,7 @@ class TurboCache {
             this.#l1.delete(k);
             if (e.hits > 1) { e.hits = 1; this.#l1.set(k, e); continue; }   // re-queue
             this.#l1Bytes -= e.bytes;
+            if (e.hash !== undefined) this.#byHash.delete(e.hash);          // was leaked
         }
     }
     // Runs right after a GC, so used_heap_size is the LIVE set, not live+garbage.
@@ -331,6 +355,7 @@ class TurboCache {
             if (this.#l1Bytes <= target) break;
             this.#l1Bytes -= e.bytes;
             this.#l1.delete(k);
+            if (e.hash !== undefined) this.#byHash.delete(e.hash);
         }
         this.stats.heapShed = (this.stats.heapShed || 0) + 1;
     }
@@ -340,6 +365,7 @@ class TurboCache {
         if (!e) return;
         this.#l1Bytes -= e.bytes;
         this.#l1.delete(key);
+        if (e.hash !== undefined) this.#byHash.delete(e.hash);   // was leaked
     }
 
     // --- coherence -------------------------------------------------------
@@ -359,7 +385,11 @@ class TurboCache {
             if (r.hashes[i] === 'ffffffffffffffff') {     // clearAll sentinel
                 this.clearLocal(); this.#cursor = r.head; return;
             }
-            if (r.writers[i] === this.#id) continue;      // our own write; L1 already correct
+            // Own records are NOT skipped. The old "our own write, L1 is already
+            // correct" shortcut was false whenever L1 had been refilled from L2
+            // between queuing and apply - a worker that deleted a key then read
+            // it in the same tick kept serving the deleted value forever. The
+            // cost of dropping our own entry is one L2 refetch.
             const k = this.#byHash.get(r.hashes[i]);
             if (k !== undefined) { this.#l1Drop(k); this.#byHash.delete(r.hashes[i]); this.stats.invalidated++; }
         }
@@ -384,13 +414,18 @@ class TurboCache {
         const raw = native.get(key);
         if (raw === undefined) { this.stats.misses++; return undefined; }
         this.stats.l2Hits++;
+        // Carry the arena entry's expiry into L1. Without this the refilled L1
+        // entry had no TTL at all, so any expiring value read once through L2
+        // became immortal in that worker.
+        const expSec = native.lastExpiresAt();
+        const expMs = expSec ? this.#arenaEpochMs + expSec : 0;
         if (this.#codec && !this.#l1Decoded) {          // safe mode: cache the encoded form
-            this.#l1Put(key, raw, native.hashKey(key), raw.length);
+            this.#l1Put(key, raw, native.hashKey(key), raw.length, expMs);
             return this.#codec.decode(raw);
         }
         let v = raw;
         if (this.#codec) { v = this.#codec.decode(raw); if (this.#freeze) TurboCache.deepFreeze(v); }
-        this.#l1Put(key, v, native.hashKey(key), this.#primitives ? 0 : raw.length);
+        this.#l1Put(key, v, native.hashKey(key), this.#primitives ? 0 : raw.length, expMs);
         return v;
     }
 
@@ -400,7 +435,17 @@ class TurboCache {
     set(key, value, opts) {
         this.stats.sets++;
         key = this.#ns + key;
-        const ttlMs = (opts && opts.ttlMs) | 0;
+        // uint32 milliseconds from the arena epoch is ~49 days of range; clamp
+        // rather than overflow (ttlMs near INT32_MAX used to overflow the
+        // seconds conversion and expire immediately).
+        const ttlMs = Math.max(0, Math.min(opts && opts.ttlMs || 0, 0x7fffffff));
+        // Keys used to be silently truncated at 512 bytes, so distinct keys
+        // collided and returned each other's values. Reject instead.
+        if (Buffer.byteLength(key) > this.#keyMax) {
+            this.stats.rejectedKey = (this.stats.rejectedKey || 0) + 1;
+            this.lastError = `key of ${Buffer.byteLength(key)} bytes exceeds the ${this.#keyMax}-byte limit`;
+            return false;
+        }
         if (this.#primitives) {
             const t = typeof value;
             // BigInt is a primitive too, and immutable, so it belongs here.
@@ -445,7 +490,9 @@ class TurboCache {
         // the primary a tick later, so the size must be checked here; otherwise
         // an oversized value would be queued, silently dropped by the primary,
         // and reported as success.
-        const encLen = typeof enc === 'string' ? enc.length : 8;
+        // UTF-8 BYTES, not UTF-16 units: the old check accepted values the
+        // primary then rejected, destroying the previous value silently.
+        const encLen = typeof enc === 'string' ? Buffer.byteLength(enc) : 8;
         if (encLen + key.length + 48 > this.#maxValue) {
             this.stats.rejectedSize++;
             this.lastError = `value ${encLen}B exceeds the ${this.#maxValue}B arena limit`;
@@ -529,6 +576,7 @@ class TurboCache {
 
     close() {
         this.stopGuard();
+        instances.delete(this);
         if (this.#id === 0 && storeReady) { native.destroy(); storeReady = false; }
     }
 
@@ -566,18 +614,25 @@ class TurboCache {
     }
 
     // Primary side: apply a worker's batch to L2.
+    // Applied on the PRIMARY. The primary's #drain is a no-op (it is the sole
+    // writer of its own records), so a worker's write would otherwise never
+    // invalidate the primary's L1 - it kept serving its own stale value even
+    // after a worker overwrote or deleted the key.
     static applyBatch(msg) {
         const b = msg.b;
         for (let i = 0; i < b.length; i += 5) {
-            const op = b[i];
-            if (op === 's') native.set(b[i + 1], b[i + 2], msg.id, b[i + 3], b[i + 4]);
-            else if (op === 'd') native.del(b[i + 1], msg.id);
-            else if (op === 'c') native.clearAll(msg.id);
-            else if (op === 'n') native.clearNamespace(b[i + 4], msg.id);
+            const op = b[i], key = b[i + 1];
+            if (op === 's') { native.set(key, b[i + 2], msg.id, b[i + 3], b[i + 4]); TurboCache.#localDrop(key); }
+            else if (op === 'd') { native.del(key, msg.id); TurboCache.#localDrop(key); }
+            else if (op === 'c') { native.clearAll(msg.id); for (const c of instances) c.clearLocal(); }
+            else if (op === 'n') { native.clearNamespace(b[i + 4], msg.id); for (const c of instances) c.clearLocal(); }
         }
     }
+
+    static #localDrop(fullKey) { for (const c of instances) c._dropExact(fullKey); }
+    _dropExact(fullKey) { this.#l1Drop(fullKey); }
     static isCacheMessage(m) { return m && m.t === MSG; }
     static native() { return native; }
 }
 
-module.exports = { TurboCache, MSG };
+module.exports = { TurboCache, Cache: TurboCache, MSG };
