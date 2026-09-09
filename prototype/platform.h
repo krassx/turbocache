@@ -24,6 +24,8 @@
   #include <sys/stat.h>
   #include <fcntl.h>
   #include <unistd.h>
+  #include <signal.h>
+  #include <errno.h>
   #include <time.h>
 #endif
 
@@ -65,6 +67,17 @@ static inline void *shmCreate(const char *name, uint64_t bytes, ShmHandle *out) 
   int fd = shm_open(name, O_CREAT | O_RDWR | O_EXCL, 0600);
   if (fd < 0) return nullptr;
   if (ftruncate(fd, (off_t)bytes) != 0) { close(fd); shm_unlink(name); return nullptr; }
+  // ftruncate on a tmpfs only sizes the object SPARSELY: it succeeds even when
+  // the filesystem cannot supply the pages, and the process then takes a SIGBUS
+  // the first time it touches one. Docker's /dev/shm defaults to 64MB, so a
+  // 192MB arena "created" fine and killed the process minutes later with no
+  // diagnosable cause. fallocate actually reserves, so shortfall surfaces here
+  // as a clean failure instead.
+#if defined(__linux__)
+  if (posix_fallocate(fd, 0, (off_t)bytes) != 0) {
+    close(fd); shm_unlink(name); return nullptr;
+  }
+#endif
   void *base = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   close(fd);
   if (base == MAP_FAILED) { shm_unlink(name); return nullptr; }
@@ -168,6 +181,33 @@ static inline uint64_t platformGranularity() {
   return (uint64_t)si.dwAllocationGranularity;
 #else
   return (uint64_t)sysconf(_SC_PAGESIZE);
+#endif
+}
+
+// Is that pid still running? Used to reclaim a submission ring whose owner
+// crashed. Signal 0 performs the permission and existence checks without
+// delivering anything; EPERM means the process exists but belongs to another
+// user, which still counts as alive.
+static inline bool platformPidAlive(uint32_t pid) {
+#ifdef _WIN32
+  HANDLE hp = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
+  if (!hp) return false;
+  DWORD w = WaitForSingleObject(hp, 0);
+  CloseHandle(hp);
+  return w == WAIT_TIMEOUT;
+#else
+  if (kill((pid_t)pid, 0) == 0) return true;
+  return errno == EPERM;
+#endif
+}
+
+// Owning pid for a claimed submission ring: lets the primary tell a live worker
+// from a crashed one without any handshake.
+static inline uint32_t platformPid() {
+#ifdef _WIN32
+  return (uint32_t)GetCurrentProcessId();
+#else
+  return (uint32_t)getpid();
 #endif
 }
 

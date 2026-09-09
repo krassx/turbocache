@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include "store_ops.h"
+#include "submit.h"
 #include <vector>
 
 static Store g;
@@ -47,6 +48,32 @@ static bool readKey(napi_env env, napi_value v, char *buf, size_t *outLen) {
   if (need > KEY_MAX) return false;               // caller reports this, never truncates
   size_t got = 0;
   if (napi_get_value_string_utf8(env, v, buf, KEY_MAX + 1, &got) != napi_ok) return false;
+  // V8 replaces every unpaired surrogate with U+FFFD when converting to UTF-8,
+  // so '\uD800', '\uDC00' and '\uFFFD' all encode to the same three bytes and
+  // returned each other's values -- the same aliasing class this function was
+  // already fixed for once (latin1 folding). Only pay for the UTF-16 scan when
+  // the encoded form actually contains U+FFFD, which real keys never do.
+  bool maybeFolded = false;
+  for (size_t i = 0; i + 2 < got; i++)
+    if ((uint8_t)buf[i] == 0xEF && (uint8_t)buf[i + 1] == 0xBF && (uint8_t)buf[i + 2] == 0xBD) {
+      maybeFolded = true; break;
+    }
+  if (maybeFolded) {
+    size_t u16 = 0;
+    if (napi_get_value_string_utf16(env, v, nullptr, 0, &u16) == napi_ok && u16 <= KEY_MAX) {
+      static char16_t k16[KEY_MAX + 2];
+      size_t got16 = 0;
+      if (napi_get_value_string_utf16(env, v, k16, KEY_MAX + 2, &got16) == napi_ok) {
+        for (size_t i = 0; i < got16; i++) {
+          char16_t c = k16[i];
+          if (c >= 0xD800 && c <= 0xDBFF) {
+            if (i + 1 >= got16 || k16[i + 1] < 0xDC00 || k16[i + 1] > 0xDFFF) return false;
+            i++;
+          } else if (c >= 0xDC00 && c <= 0xDFFF) return false;
+        }
+      }
+    }
+  }
   *outLen = got;
   return true;
 }
@@ -104,16 +131,15 @@ static napi_value SetCompressMin(napi_env env, napi_callback_info info) {
   return nullptr;
 }
 
-// set(key, value) - value is a latin1 string in this prototype
-static napi_value Set(napi_env env, napi_callback_info info) {
-  ARG(5)
-  NEED_STORE(nullptr)
-  char key[KEY_MAX + 1]; size_t klen = 0;
-  if (!readKey(env, argv[0], key, &klen)) return nullptr;
+// Encode a JS value into `scratch`, tagging its type. Extracted from Set so the
+// shared-memory submission path encodes identically -- a second copy of this
+// type ladder would drift, and the two paths must agree byte for byte or a
+// value written through one and read through the other changes type.
+static bool encodeValue(napi_env env, napi_value v, size_t *vlenOut, uint8_t *flagsOut) {
   // Encode by type, tagging the entry so the reader rebuilds the right JS
   // value. Doubles are stored as their 8 raw bytes: exact, and no parsing.
   napi_valuetype vt;
-  napi_typeof(env, argv[1], &vt);
+  napi_typeof(env, v, &vt);
   size_t vlen = 0;
   uint8_t flags = 0;
   if (vt == napi_string) {
@@ -121,33 +147,33 @@ static napi_value Set(napi_env env, napi_callback_info info) {
     // string; anything else is stored as UTF-8. Everything used to go through
     // latin1, which silently mangled non-ASCII.
     size_t charLen = 0, utf8Len = 0;
-    if (!strInfo(env, argv[1], &charLen, &utf8Len)) { napi_value r; napi_get_boolean(env, false, &r); return r; }
+    if (!strInfo(env, v, &charLen, &utf8Len)) return false;
     const bool ascii = (utf8Len == charLen);
-    if ((ascii ? charLen : utf8Len) + 1 > SCRATCH) { napi_value r; napi_get_boolean(env, false, &r); return r; }
+    if ((ascii ? charLen : utf8Len) + 1 > SCRATCH) return false;
     size_t got = 0;
-    if (ascii) napi_get_value_string_latin1(env, argv[1], (char *)scratch, SCRATCH, &got);
-    else       napi_get_value_string_utf8(env, argv[1], (char *)scratch, SCRATCH, &got);
+    if (ascii) napi_get_value_string_latin1(env, v, (char *)scratch, SCRATCH, &got);
+    else       napi_get_value_string_utf8(env, v, (char *)scratch, SCRATCH, &got);
     vlen = got;
     flags = FLAG_STRING | (ascii ? FLAG_LATIN1 : 0);
   } else if (vt == napi_number) {
-    double d = 0; napi_get_value_double(env, argv[1], &d);
+    double d = 0; napi_get_value_double(env, v, &d);
     memcpy(scratch, &d, sizeof(d)); vlen = sizeof(d); flags = FLAG_NUMBER;
   } else if (vt == napi_boolean) {
-    bool bv = false; napi_get_value_bool(env, argv[1], &bv);
+    bool bv = false; napi_get_value_bool(env, v, &bv);
     scratch[0] = bv ? 1 : 0; vlen = 1; flags = FLAG_BOOL;
-  } else if (vt == napi_object && isBinaryValue(env, argv[1])) {
+  } else if (vt == napi_object && isBinaryValue(env, v)) {
     // Binary values. Decision 4 lists Buffer/Uint8Array/ArrayBuffer as accepted
     // value types; the native layer only ever handled strings and scalars, so
     // primitives mode rejected them. Stored as raw bytes.
     void *data = nullptr; size_t len = 0;
     bool isBuf = false, isTa = false, isAb = false;
-    napi_is_buffer(env, argv[1], &isBuf);
-    napi_is_typedarray(env, argv[1], &isTa);
-    napi_is_arraybuffer(env, argv[1], &isAb);
-    if (isBuf) { napi_get_buffer_info(env, argv[1], &data, &len); }
+    napi_is_buffer(env, v, &isBuf);
+    napi_is_typedarray(env, v, &isTa);
+    napi_is_arraybuffer(env, v, &isAb);
+    if (isBuf) { napi_get_buffer_info(env, v, &data, &len); }
     else if (isTa) {
       napi_typedarray_type t; size_t n = 0; napi_value ab; size_t off = 0;
-      napi_get_typedarray_info(env, argv[1], &t, &n, &data, &ab, &off);
+      napi_get_typedarray_info(env, v, &t, &n, &data, &ab, &off);
       size_t elem = 1;
       switch (t) {
         case napi_int16_array: case napi_uint16_array: elem = 2; break;
@@ -156,9 +182,9 @@ static napi_value Set(napi_env env, napi_callback_info info) {
         default: elem = 1;
       }
       len = n * elem;
-    } else if (isAb) { napi_get_arraybuffer_info(env, argv[1], &data, &len); }
-    else { napi_get_dataview_info(env, argv[1], &len, &data, nullptr, nullptr); }
-    if (!data || len + 1 > SCRATCH) { napi_value r; napi_get_boolean(env, false, &r); return r; }
+    } else if (isAb) { napi_get_arraybuffer_info(env, v, &data, &len); }
+    else { napi_get_dataview_info(env, v, &len, &data, nullptr, nullptr); }
+    if (!data || len + 1 > SCRATCH) return false;
     memcpy(scratch, data, len);
     vlen = len; flags = FLAG_BINARY;
   } else if (vt == napi_bigint) {
@@ -166,20 +192,263 @@ static napi_value Set(napi_env env, napi_callback_info info) {
     // Querying the word count requires BOTH sign_bit and words to be null;
     // passing a non-null sign_bit takes the other branch and fails CHECK_ARG.
     int sign = 0; size_t words = 0;
-    if (napi_get_value_bigint_words(env, argv[1], nullptr, &words, nullptr) != napi_ok ||
-        1 + words * 8 > SCRATCH) { napi_value r; napi_get_boolean(env, false, &r); return r; }
-    if (words && napi_get_value_bigint_words(env, argv[1], &sign, &words,
+    if (napi_get_value_bigint_words(env, v, nullptr, &words, nullptr) != napi_ok ||
+        1 + words * 8 > SCRATCH) return false;
+    if (words && napi_get_value_bigint_words(env, v, &sign, &words,
                                              (uint64_t *)(scratch + 1)) != napi_ok) {
-      napi_value r; napi_get_boolean(env, false, &r); return r;
+      return false;   // `return r` here converted a non-null napi_value to TRUE,
+                      // reporting success with vlen/flags never assigned
     }
     scratch[0] = (uint8_t)sign;          // written AFTER the call that fills it
     vlen = 1 + words * 8; flags = FLAG_BIGINT;
   } else if (vt == napi_null) {
     vlen = 0; flags = FLAG_NULL;
   } else {
-    napi_value r; napi_get_boolean(env, false, &r); return r;   // unsupported type
+    return false;                      // unsupported type
   }
+  *vlenOut = vlen; *flagsOut = flags;
+  return true;
 
+}
+
+
+// ---- shared-memory write submission -------------------------------------
+//
+// Workers push encoded records into their own SPSC ring; the primary drains and
+// applies them. This replaces process.send on the hot write path, whose real
+// cost was never bandwidth but a synchronous 0.49ms/1.15ms (p50/p99) freeze of
+// the sending worker's event loop while V8 serialized each ~525KB batch -- on
+// the channel the application shares for its own messages.
+static Submit g_submit;
+static int32_t g_ringIdx = -1;
+
+// primary: submitCreate(name, ringCount, ringBytes)
+static napi_value SubmitCreate(napi_env env, napi_callback_info info) {
+  ARG(3)
+  char name[256]; size_t nl = 0;
+  napi_get_value_string_utf8(env, argv[0], name, sizeof name, &nl);
+  int32_t count = 0, bytes = 0;
+  napi_get_value_int32(env, argv[1], &count);
+  napi_get_value_int32(env, argv[2], &bytes);
+  shmUnlink(name);                       // reclaim a crashed run's segment
+  bool ok = g_submit.create(name, (uint32_t)count, (uint32_t)bytes, KEY_MAX, (uint32_t)SCRATCH);
+  napi_value r; napi_get_boolean(env, ok, &r); return r;
+}
+
+// worker: submitOpen(name) then submitClaim() -> ring index, or -1
+static napi_value SubmitOpen(napi_env env, napi_callback_info info) {
+  ARG(1)
+  char name[256]; size_t nl = 0;
+  napi_get_value_string_utf8(env, argv[0], name, sizeof name, &nl);
+  bool ok = g_submit.open(name);
+  napi_value r; napi_get_boolean(env, ok, &r); return r;
+}
+
+// Claim a free ring by CAS on its owner field. The slot is assigned, never
+// passed in by the caller -- which is also what makes a worker-id collision
+// with the primary structurally impossible rather than merely rejected.
+static napi_value SubmitClaim(napi_env env, napi_callback_info info) {
+  napi_value r;
+  if (!g_submit.base) { napi_create_int32(env, -1, &r); return r; }
+  if (g_ringIdx >= 0) { napi_create_int32(env, g_ringIdx, &r); return r; }   // already claimed
+  uint32_t me = platformPid();
+  for (int pass = 0; pass < 2; pass++) {
+    for (uint32_t i = 0; i < g_submit.ringCount; i++) {
+      SubmitRing *ring = g_submit.ring(i);
+      uint32_t expect = ring->owner.load(std::memory_order_acquire);
+      // Pass 0 takes only free slots. Pass 1 reclaims slots whose owner process
+      // no longer exists: without this a crashed worker holds its slot forever,
+      // and after enough churn every new worker silently falls back to IPC.
+      if (expect != 0) {
+        if (pass == 0 || expect == me || platformPidAlive(expect)) continue;
+      }
+      if (ring->owner.compare_exchange_strong(expect, me,
+              std::memory_order_acq_rel, std::memory_order_relaxed)) {
+        if (expect != 0) {          // reclaimed: the dead owner's records are unowned, drop them
+          ring->tail.store(ring->head.load(std::memory_order_acquire), std::memory_order_release);
+        }
+        g_ringIdx = (int32_t)i;
+        napi_create_int32(env, (int32_t)i, &r); return r;
+      }
+    }
+  }
+  napi_create_int32(env, -1, &r); return r;
+}
+
+// worker: submitSet(key, value, ttlMs, ns) -> bool (false = shed, ring full)
+static napi_value SubmitSet(napi_env env, napi_callback_info info) {
+  ARG(4)
+  napi_value r;
+  if (!g_submit.base || g_ringIdx < 0) { napi_get_boolean(env, false, &r); return r; }
+  char key[KEY_MAX + 1]; size_t klen = 0;
+  if (!readKey(env, argv[0], key, &klen)) return nullptr;
+  size_t vlen = 0; uint8_t flags = 0;
+  if (!encodeValue(env, argv[1], &vlen, &flags)) { napi_get_boolean(env, false, &r); return r; }
+  int32_t ttlMs = 0, ns = 0;
+  if (argc > 2) napi_get_value_int32(env, argv[2], &ttlMs);
+  if (argc > 3) napi_get_value_int32(env, argv[3], &ns);
+  bool ok = submitPush(g_submit, (uint32_t)g_ringIdx, SUBMIT_OP_SET, flags,
+                       (uint16_t)ns, (uint32_t)(ttlMs > 0 ? ttlMs : 0),
+                       key, (uint32_t)klen, scratch, (uint32_t)vlen);
+  napi_get_boolean(env, ok, &r); return r;
+}
+
+// worker: submitDel(key, ns) -> bool
+static napi_value SubmitDel(napi_env env, napi_callback_info info) {
+  ARG(2)
+  napi_value r;
+  if (!g_submit.base || g_ringIdx < 0) { napi_get_boolean(env, false, &r); return r; }
+  char key[KEY_MAX + 1]; size_t klen = 0;
+  if (!readKey(env, argv[0], key, &klen)) return nullptr;
+  int32_t ns = 0;
+  if (argc > 1) napi_get_value_int32(env, argv[1], &ns);
+  bool ok = submitPush(g_submit, (uint32_t)g_ringIdx, SUBMIT_OP_DEL, 0,
+                       (uint16_t)ns, 0, key, (uint32_t)klen, nullptr, 0);
+  napi_get_boolean(env, ok, &r); return r;
+}
+
+// primary: submitDrain(maxRecords) -> records applied.
+// Bounded on purpose: draining is synchronous work on the primary's event loop,
+// so an unbounded drain would trade the worker's stall for a primary stall.
+static napi_value SubmitDrain(napi_env env, napi_callback_info info) {
+  ARG(1)
+  napi_value r;
+  if (!g_submit.base || !g.base) { napi_create_int32(env, 0, &r); return r; }
+  int32_t budget = 4096;
+  if (argc > 0) napi_get_value_int32(env, argv[0], &budget);
+  if (budget <= 0) budget = 4096;
+  int32_t applied = 0;
+  const uint32_t cap = g_submit.ringBytes;
+  for (uint32_t i = 0; i < g_submit.ringCount && applied < budget; i++) {
+    SubmitRing *ring = g_submit.ring(i);
+    uint64_t head = ring->head.load(std::memory_order_acquire);
+    uint64_t tail = ring->tail.load(std::memory_order_relaxed);
+    if (tail == head) continue;
+    // A producer can never have more than `cap` bytes live. A larger span means
+    // the worker corrupted its own head, so refuse to walk it: without this a
+    // worker could set head to 2^50 and the loop below would step over that many
+    // bytes synchronously, hanging the primary's event loop.
+    if (head - tail > (uint64_t)cap) {
+      ring->corrupt.fetch_add(1, std::memory_order_relaxed);
+      ring->tail.store(head, std::memory_order_release);   // resynchronise; only this worker loses writes
+      continue;
+    }
+    const int32_t before = applied;
+    uint8_t *base = g_submit.ringData(i);
+    // Bound the WORK, not just the records applied. SKIP records and implicit
+    // gaps advance tail without incrementing `applied`, so a ring full of them
+    // never reaches the budget -- measured 717M iterations against a budget of
+    // 4096. Every step through the ring counts.
+    int32_t steps = 0;
+    const int32_t maxSteps = budget * 4 + 64;
+    while (tail < head && applied < budget && steps < maxSteps) {
+      steps++;
+      uint32_t off = (uint32_t)(tail & (cap - 1));
+      uint32_t gap = submitGapAt(off, cap);
+      if (gap) { tail += gap; continue; }
+      SubmitRec *rec = (SubmitRec *)(base + off);
+      uint64_t avail = head - tail;
+      if (avail > cap - off) avail = cap - off;
+      // Ring contents are written by a worker and are therefore untrusted.
+      // A rejected record stops this ring rather than the drain: the worker
+      // loses its own writes, nothing else is affected.
+      if (!submitValidate(g_submit, rec, avail)) {
+        ring->corrupt.fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+      if (rec->op != SUBMIT_OP_SKIP) {
+        const uint8_t *k = base + off + sizeof(SubmitRec);
+        const uint8_t *v = k + rec->keyLen;
+        if (rec->op == SUBMIT_OP_SET) {
+          uint32_t expiresAt = rec->ttlMs ? nowRelMs(g) + rec->ttlMs : 0;
+          storeSet(g, k, (uint16_t)rec->keyLen, v, rec->valLen, rec->valLen,
+                   rec->flags, expiresAt, (uint16_t)(i + 1), (uint8_t)rec->ns);
+        } else {
+          storeDelete(g, k, (uint16_t)rec->keyLen, (uint16_t)(i + 1));
+        }
+        applied++;
+      }
+      tail += rec->len;
+    }
+    ring->tail.store(tail, std::memory_order_release);
+    ring->applied.fetch_add((uint64_t)(applied - before), std::memory_order_relaxed);
+  }
+  napi_create_int32(env, applied, &r); return r;
+}
+
+// Is there anything to drain? Cheap enough to call every event-loop turn.
+static napi_value SubmitPending(napi_env env, napi_callback_info info) {
+  napi_value r;
+  uint64_t pending = 0;
+  if (g_submit.base)
+    for (uint32_t i = 0; i < g_submit.ringCount; i++)
+      pending += g_submit.ring(i)->head.load(std::memory_order_acquire) -
+                 g_submit.ring(i)->tail.load(std::memory_order_relaxed);
+  napi_create_double(env, (double)pending, &r); return r;
+}
+
+static napi_value SubmitStats(napi_env env, napi_callback_info info) {
+  napi_value o; napi_create_object(env, &o);
+  double pushed = 0, applied = 0, shed = 0, corrupt = 0, claimed = 0;
+  if (g_submit.base) {
+    for (uint32_t i = 0; i < g_submit.ringCount; i++) {
+      SubmitRing *r = g_submit.ring(i);
+      pushed += (double)r->pushed.load(std::memory_order_relaxed);
+      applied += (double)r->applied.load(std::memory_order_relaxed);
+      shed += (double)r->shed.load(std::memory_order_relaxed);
+      corrupt += (double)r->corrupt.load(std::memory_order_relaxed);
+      if (r->owner.load(std::memory_order_relaxed)) claimed++;
+    }
+  }
+  napi_value v;
+#define SETN(name, val) napi_create_double(env, (val), &v); napi_set_named_property(env, o, name, v);
+  SETN("pushed", pushed) SETN("applied", applied) SETN("shed", shed)
+  SETN("corrupt", corrupt) SETN("rings", claimed)
+  SETN("enabled", g_submit.base ? 1 : 0) SETN("ringIndex", (double)g_ringIdx)
+#undef SETN
+  return o;
+}
+
+// Give this process's ring slot back so another worker can take it.
+static napi_value SubmitRelease(napi_env env, napi_callback_info info) {
+  if (g_submit.base && g_ringIdx >= 0) {
+    SubmitRing *ring = g_submit.ring((uint32_t)g_ringIdx);
+    // Drop anything still queued: nothing will ever push it, and leaving it
+    // would make the next owner inherit a stranger's records.
+    ring->tail.store(ring->head.load(std::memory_order_acquire), std::memory_order_release);
+    ring->owner.store(0, std::memory_order_release);
+  }
+  g_ringIdx = -1;
+  return nullptr;
+}
+
+// Largest value a single record can carry. A value can be under the ARENA limit
+// yet too large for a ring, in which case it could never be delivered and set()
+// would keep reporting success -- the caller needs this bound at call time.
+static napi_value SubmitMaxValue(napi_env env, napi_callback_info info) {
+  napi_value r;
+  uint32_t cap = g_submit.base ? g_submit.ringBytes : 0;
+  uint32_t maxRec = cap ? (cap / 2) : 0;
+  uint32_t maxVal = maxRec > (uint32_t)(sizeof(SubmitRec) + KEY_MAX + 8)
+                  ? maxRec - (uint32_t)(sizeof(SubmitRec) + KEY_MAX + 8) : 0;
+  napi_create_int32(env, (int32_t)maxVal, &r); return r;
+}
+
+static napi_value SubmitDestroy(napi_env env, napi_callback_info info) {
+  if (g_submit.base) g_submit.close();
+  g_ringIdx = -1;
+  return nullptr;
+}
+
+// set(key, value) - value is a latin1 string in this prototype
+static napi_value Set(napi_env env, napi_callback_info info) {
+  ARG(5)
+  NEED_STORE(nullptr)
+  char key[KEY_MAX + 1]; size_t klen = 0;
+  if (!readKey(env, argv[0], key, &klen)) return nullptr;
+  size_t vlen = 0;
+  uint8_t flags = 0;
+  if (!encodeValue(env, argv[1], &vlen, &flags)) { napi_value r; napi_get_boolean(env, false, &r); return r; }
   const uint8_t *payload = scratch;
   uint32_t storedLen = (uint32_t)vlen, rawLen = (uint32_t)vlen;
   if ((flags & FLAG_STRING) && vlen >= compressMin) {
@@ -292,7 +561,10 @@ static napi_value Del(napi_env env, napi_callback_info info) {
 static napi_value NsResolve(napi_env env, napi_callback_info info) {
   ARG(3)
   NEED_STORE(nullptr) char nm[64]; size_t n = 0;
-  napi_get_value_string_latin1(env, argv[0], nm, sizeof(nm), &n);
+  // UTF-8, not latin1: latin1 truncates each code unit to its low byte, so
+  // 'a\u0100' folded to "a" and shared an id -- and therefore a quota -- with a
+  // different namespace. Same aliasing class the key path was already fixed for.
+  napi_get_value_string_utf8(env, argv[0], nm, sizeof(nm), &n);
   double quota = 0; napi_get_value_double(env, argv[1], &quota);
   bool create = false; napi_get_value_bool(env, argv[2], &create);
   // Names were compared on NS_NAMELEN-1 chars, so two longer names sharing a
@@ -751,6 +1023,7 @@ static napi_value RingHead(napi_env env, napi_callback_info) {
 
 static napi_value RingRead(napi_env env, napi_callback_info info) {
   ARG(2)
+  NEED_STORE(nullptr)
   double cd; int32_t maxN;
   napi_get_value_double(env, argv[0], &cd);
   napi_get_value_int32(env, argv[1], &maxN);
@@ -782,10 +1055,12 @@ static napi_value RingRead(napi_env env, napi_callback_info info) {
 }
 
 static napi_value ClearHints(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
   for (uint64_t i = 0; i < g.h->indexSlots; i++) g.hints[i].store(0, std::memory_order_relaxed);
   return nullptr;
 }
 static napi_value HintsSet(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
   uint64_t n = 0;
   for (uint64_t i = 0; i < g.h->indexSlots; i++) if (g.hints[i].load(std::memory_order_relaxed)) n++;
   napi_value r; napi_create_double(env, (double)n, &r); return r;
@@ -822,6 +1097,7 @@ static napi_value CompactStats(napi_env env, napi_callback_info) {
 
 // Deliberately writes through the mapping, to prove a read-only worker faults.
 static napi_value Poke(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
   volatile uint8_t *p = (volatile uint8_t *)g.base + g.h->dataOff;
   *p = 0x42;
   napi_value r; napi_get_boolean(env, true, &r); return r;
@@ -881,6 +1157,12 @@ static napi_value Destroy(napi_env env, napi_callback_info) {
                        napi_set_named_property(env, exports, name, f); }
 static napi_value Init(napi_env env, napi_value exports) {
   FN("create", Create) FN("attach", Attach) FN("set", Set) FN("get", Get)
+  FN("submitCreate", SubmitCreate) FN("submitOpen", SubmitOpen)
+  FN("submitClaim", SubmitClaim) FN("submitSet", SubmitSet)
+  FN("submitDel", SubmitDel) FN("submitDrain", SubmitDrain)
+  FN("submitPending", SubmitPending) FN("submitStats", SubmitStats)
+  FN("submitDestroy", SubmitDestroy) FN("submitRelease", SubmitRelease)
+  FN("submitMaxValue", SubmitMaxValue)
   FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("nsResolve", NsResolve) FN("clearNamespace", ClearNamespace) FN("nsStats", NsStats) FN("scanKeys", ScanKeys) FN("sweepExpired", SweepExpired) FN("incr", Incr) FN("cas", Cas) FN("heartbeat", Heartbeat) FN("heartbeatAgeMs", HeartbeatAgeMs) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastExpiresAt", LastExpiresAt) FN("epochMs", EpochMs) FN("keyMaxBytes", KeyMaxBytes)
   FN("destroy", Destroy) FN("poke", Poke)
   FN("suppressRefBit", SetSuppressRefBit) FN("secondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin) FN("hasLz4", HasLz4)

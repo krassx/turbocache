@@ -6,22 +6,59 @@
 //   coherence - workers drain the shared invalidation ring and drop stale L1 entries
 const cluster = require('cluster');
 const native = require('./build/Release/l2.node');
+const fs = require('fs');
 const v8 = require('v8');
 const v8ser = require('v8');
 const { PerformanceObserver } = require('perf_hooks');
 
+// An unpaired surrogate encodes to U+FFFD in UTF-8, so '\uD800', '\uDC00' and
+// '\uFFFD' all became ONE key in the arena and returned each other's values --
+// the same aliasing class as the latin1 folding fixed earlier. Reject such keys
+// at the boundary: the native layer refuses them too, but only this check can
+// report it as `false` rather than as a silent miss or a shed ring write.
+function hasLoneSurrogate(s) {
+    for (let i = 0; i < s.length; i++) {
+        const c = s.charCodeAt(i);
+        if (c < 0xD800 || c > 0xDFFF) continue;
+        if (c > 0xDBFF) return true;                       // lone low surrogate
+        const n = s.charCodeAt(i + 1);
+        if (!(n >= 0xDC00 && n <= 0xDFFF)) return true;    // unpaired high surrogate
+        i++;
+    }
+    return false;
+}
+
 const MSG = 'tc';
-let storeReady = false;      // the native store is a per-process singleton
+const RING_MSG = 'tcr';   // doorbell only: 'your submission rings are non-empty'
+// Max second-chance reprieves per L1 insert. Matches the arena's budget in
+// store_ops.h; see the eviction loop for why an unbounded value is O(n).
+const L1_SECOND_CHANCE_BUDGET = 16;
+let storeReady = false;
+let submitName = null;    // primary: the segment it created, null = IPC transport
+let submitReady = null;   // worker: the segment name it successfully opened
+let isPrimaryProcess = false;   // set by createPrimary; guards the id-0 write path
+const installedWorkers = new WeakSet();   // workers already wired by install()      // the native store is a per-process singleton
 const instances = new Set();  // live caches in THIS process, for local invalidation
 
 class TurboCache {
     #l1 = new Map();          // key -> { v, bytes, hits }
     #byHash = new Map();      // hash hex -> key   (ring records carry hashes)
     #l1Bytes = 0;
+    #l1Iter = null;
+    #ringIdx = -1;            // shared-memory submission ring, -1 = use IPC
+    #ringMaxValue = 0;        // largest value one ring record can carry
+    #pendingDel = new Set();  // keys this worker deleted but the primary has not applied yet
+    #pendingDelHash = new Map();   // hash -> key, so the invalidation record can clear it:
+                                   // #l1Drop already removed the #byHash entry, so without this
+                                   // a deleted key stayed suppressed even after another worker
+                                   // recreated it
+    #doorbellPending = false;           // retained FIFO cursor into #l1; see #oldestEntry
     #l1Max;
     #outbox = [];
     #outboxBytes = 0;
     #outboxMaxBytes = 1 << 20;      // flush eagerly past this, bounding worker memory
+    #inFlightBytes = 0;       // bytes handed to process.send and not yet drained
+    #maxInFlightBytes = 8 << 20;
     #flushScheduled = false;
     #cursor = 0;
     #ns = '';
@@ -73,10 +110,19 @@ class TurboCache {
         this.#keyMax = native.keyMaxBytes();
         this.#arenaEpochMs = native.epochMs();
         instances.add(this);
-        this.#l1Max = opts.l1MaxBytes || 2 * 1024 * 1024;
-        this.#outboxMaxBytes = opts.outboxMaxBytes || (1 << 20);
+        this.#l1Max = opts.l1MaxBytes ?? (2 * 1024 * 1024);
+        this.#outboxMaxBytes = opts.outboxMaxBytes ?? (1 << 20);
+        // `??` not `||`: 0 is a meaningful value (send nothing) and a test that
+        // passed 0 to disable sending silently got the 8MB default instead,
+        // making a control phase identical to the phase it was controlling.
+        this.#maxInFlightBytes = opts.maxInFlightBytes ?? (8 << 20);
         this.#staleMs = opts.primaryStaleMs || 5000;
-        this.#id = opts.workerId || 0;
+        // `|| 0` also mapped an explicit 0 to the primary role. That is only
+        // legitimate in the process that actually created the arena.
+        this.#id = opts.workerId ?? 0;
+        if (this.#id === 0 && opts.attached !== false && !isPrimaryProcess)
+            throw new Error('turbocache: workerId 0 is the primary; a worker must use ' +
+                            'attachWorker() or open() so cluster assigns its id');
         this.#attached = opts.attached !== false;
         // 'primitives' mode: accept only string/number/boolean/null. Buys three
         // things the codec mode cannot: byte accounting that is exact rather
@@ -273,7 +319,21 @@ class TurboCache {
     // want and there was previously no way to express it.
     static open(opts = {}) {
         const cluster = require('cluster');
-        if (storeReady) return new TurboCache({ workerId: cluster.isWorker ? cluster.worker.id : 0, ...opts });
+        if (storeReady) {
+            // The caller's opts used to be spread AFTER the computed id, so
+            // `open({workerId: 0})` in a worker produced a cache that believed it
+            // was the primary and took the primary's WRITE path against a
+            // read-only mapping -- a SIGBUS on the first set(), not a wedge.
+            const id = cluster.isWorker ? cluster.worker.id : 0;
+            if (cluster.isWorker && opts.workerId !== undefined && opts.workerId !== id)
+                throw new Error(`turbocache: workerId is assigned by cluster in a worker (${id}); ` +
+                                `refusing the supplied ${JSON.stringify(opts.workerId)}`);
+            const c = new TurboCache({ ...opts, workerId: id });
+            // A second cache opened in a worker used to skip the ring entirely and
+            // silently run on the slower IPC transport.
+            if (cluster.isWorker && submitReady && opts.transport !== 'ipc') c.useSubmissionRing(submitReady);
+            return c;
+        }
         const auto = TurboCache.autoSize();
         const arenaBytes = opts.arenaBytes || auto.arenaBytes;
         const indexSlots = opts.indexSlots || auto.indexSlots;
@@ -301,6 +361,27 @@ class TurboCache {
     // Wire the primary's side of the worker write path. Without this, worker
     // writes never reach L2.
     // Stable per-application shm name, <= 31 chars for darwin's SHM_NAME_MAX.
+    // A create() failure is nearly always the backing filesystem being too small
+    // rather than anything about the arena itself. On Linux that is /dev/shm,
+    // which containers default to 64MB -- so say so instead of "create failed".
+    static #createError(arenaBytes) {
+        let hint = '';
+        if (process.platform === 'linux') {
+            try {
+                const st = fs.statfsSync('/dev/shm');
+                const total = st.blocks * st.bsize;
+                const free = st.bfree * st.bsize;
+                if (total < arenaBytes || free < arenaBytes) {
+                    const mb = (n) => `${Math.round(n / (1 << 20))}MB`;
+                    hint = ` -- /dev/shm holds ${mb(total)} (${mb(free)} free) but the arena needs ` +
+                           `${mb(arenaBytes)}. In Docker pass --shm-size=${mb(arenaBytes * 2)}, ` +
+                           `or lower the l2Bytes option.`;
+                }
+            } catch { /* statfs is best-effort; fall back to the bare message */ }
+        }
+        return `arena create failed${hint}`;
+    }
+
     static defaultName() {
         const crypto = require('crypto');
         const id = (process.argv[1] || process.cwd()) + '|' + (process.env.TURBOCACHE_ID || '');
@@ -310,19 +391,79 @@ class TurboCache {
     // Attaches exactly once per worker. Calling this between fork() and the
     // 'online' event previously attached twice, applying every batch twice.
     static install(cluster) {
-        const wired = new WeakSet();
+        // Module-level, not per-call: two install() calls each built their own
+        // WeakSet, so both attached a listener to the same worker and every
+        // batch was applied twice (one incr became two).
+        const wired = installedWorkers;
         const attach = w => {
             if (!w || wired.has(w)) return;
             wired.add(w);
-            w.on('message', m => { if (TurboCache.isCacheMessage(m)) TurboCache.applyBatch(m); });
+            w.on('message', m => {
+                if (m && m.t === RING_MSG) { TurboCache.drainSubmissions(); return; }
+                if (TurboCache.isCacheMessage(m)) TurboCache.applyBatch(m);
+            });
         };
         cluster.on('online', attach);
         cluster.on('fork', attach);
         for (const id in cluster.workers) attach(cluster.workers[id]);
     }
 
+    // Drain the submission rings, then keep draining while work remains. Bounded
+    // per turn on purpose: draining is synchronous work on the primary's event
+    // loop, so an unbounded drain would just move the stall from the worker to
+    // the primary -- which is the whole thing this replaces.
+    static drainSubmissions(budget = 4096) {
+        if (!submitName && !storeReady) return 0;
+        let n = 0;
+        try { n = native.submitDrain(budget); } catch { return 0; }
+        // The primary's OWN L1 must follow the writes it just applied, exactly as
+        // applyBatch does for the IPC path. Without this the primary served stale
+        // values indefinitely after any worker write -- and the regression test
+        // that was supposed to catch it drove applyBatch directly, so it passed
+        // while the default path regressed underneath it.
+        if (n > 0) TurboCache.#primaryInvalidate();
+        if (n >= budget && !TurboCache.#drainScheduled) {
+            TurboCache.#drainScheduled = true;
+            setImmediate(() => { TurboCache.#drainScheduled = false; TurboCache.drainSubmissions(budget); });
+        }
+        return n;
+    }
+    static #drainScheduled = false;
+
+    // Drain the arena's invalidation ring on the PRIMARY. Records carry the
+    // writerId that produced them, so entries the primary wrote itself are
+    // skipped: its L1 is already correct for those, and dropping them would make
+    // its own cache useless for every key it writes.
+    static #primaryCursor = 0;
+    static #primaryInvalidate() {
+        for (let round = 0; round < 64; round++) {
+            let r;
+            try { r = native.ringRead(TurboCache.#primaryCursor, 1024); } catch { return; }
+            if (r.wrapped) {                       // fell too far behind: flush wholesale
+                for (const c of instances) c.clearLocal();
+                TurboCache.#primaryCursor = r.head;
+                return;
+            }
+            const n = r.hashes.length;
+            for (let i = 0; i < n; i++) {
+                if (r.hashes[i] === 'ffffffffffffffff') { for (const c of instances) c.clearLocal(); continue; }
+                if (r.writers[i] === 0) continue;  // our own write
+                for (const c of instances) c._dropByHash(r.hashes[i]);
+            }
+            TurboCache.#primaryCursor = r.head;
+            if (n < 1024) return;                  // caught up
+        }
+    }
+
+    _dropByHash(hash) {
+        const k = this.#byHash.get(hash);
+        if (k !== undefined) { this.#l1Drop(k); this.#byHash.delete(hash); this.stats.invalidated++; }
+    }
+
+    static submitStats() { try { return native.submitStats(); } catch { return null; } }
+
     static createPrimary(name, arenaBytes, indexSlots, opts = {}) {
-        if (!native.create(name, arenaBytes, indexSlots, 2)) throw new Error('arena create failed');
+        if (!native.create(name, arenaBytes, indexSlots, 2)) throw new Error(TurboCache.#createError(arenaBytes));
         // Compression is off unless the caller explicitly asks AND the addon was
         // built with LZ4. Measured a bad trade (see DESIGN.md), so it is neither
         // the default nor a build dependency.
@@ -335,14 +476,40 @@ class TurboCache {
             native.setCompressMin(1 << 30, 1);          // effectively never
         }
         storeReady = true;
+        isPrimaryProcess = true;
+        // Submission rings. One per worker slot; a worker claims a slot by CAS on
+        // the ring's owner field, so slots are ASSIGNED rather than passed in --
+        // which makes a worker/primary id collision structurally impossible
+        // instead of merely rejected.
+        if (opts.transport !== 'ipc') {
+            const rings = opts.submitRings || 32;
+            const ringBytes = opts.submitRingBytes || (1 << 20);
+            if (!native.submitCreate(name + '_sub', rings, ringBytes))
+                throw new Error('turbocache: submission ring segment could not be created');
+            submitName = name + '_sub';
+        }
         const c = new TurboCache({ ...opts, workerId: 0 });
         c._startMaintenance(opts);
         return c;
     }
     static attachWorker(name, workerId, opts = {}) {
+        // Worker ids must be >= 1. `#id === 0` is how every method recognises the
+        // primary, so a worker attached as 0 takes the primary's WRITE path and
+        // calls into the native writer against a read-only mapping. That does not
+        // throw and does not crash -- it wedges the process permanently on the
+        // first set(), with the event loop blocked and no diagnostic. Zero-based
+        // worker ids are the natural thing for a caller to write, so this has to
+        // be a loud error rather than a documented footnote.
+        // Coerce numeric strings: ids routinely arrive from environment
+        // variables. Everything else must already be a positive integer.
+        const wid = (typeof workerId === 'string' && /^[0-9]+$/.test(workerId)) ? Number(workerId) : workerId;
+        if (!Number.isInteger(wid) || wid < 1)
+            throw new Error(`workerId must be an integer >= 1 (0 is reserved for the primary), got ${JSON.stringify(workerId)}`);
         if (!native.attach(name)) throw new Error('arena attach failed');
         storeReady = true;
-        return new TurboCache({ ...opts, workerId });
+        const c = new TurboCache({ ...opts, workerId: wid });
+        if (opts.transport !== 'ipc') c.useSubmissionRing(name + '_sub');
+        return c;
     }
 
     // --- L1 --------------------------------------------------------------
@@ -359,17 +526,55 @@ class TurboCache {
         this.#l1Bytes += bytes;
 
         // FIFO with second chance: Map preserves insertion order, so the oldest
-        // entry is first. A entry that has been read again gets one reprieve.
+        // entry is first. An entry that has been read again gets one reprieve.
+        //
+        // The reprieve MUST be budgeted. A re-queue does not free any bytes, so
+        // it does not advance the loop condition: on a workload where most
+        // residents have been re-read, one insert walks the entire map putting
+        // every entry to the back before it can evict anything. Measured O(n) in
+        // L1 entry count -- 3141ns at 2MB, 8257ns at 8MB, 23545ns at 32MB, then
+        // 464ns at 128MB where the set fits and eviction never runs. The native
+        // arena bounds its equivalent loop (store_ops.h g_secondChanceBudget);
+        // this one did not. Past the budget an entry is evicted despite its bit.
+        let reprieves = L1_SECOND_CHANCE_BUDGET;
         while (this.#l1Bytes > this.#l1Max) {
-            const it = this.#l1.entries().next();
-            if (it.done) break;
-            const [k, e] = it.value;
+            const oldest = this.#oldestEntry();
+            if (oldest === undefined) break;
+            const [k, e] = oldest;
             this.#l1.delete(k);
-            if (e.hits > 1) { e.hits = 1; this.#l1.set(k, e); continue; }   // re-queue
+            if (e.hits > 1 && reprieves > 0) {
+                reprieves--; e.hits = 1; this.#l1.set(k, e); continue;      // re-queue
+            }
             this.#l1Bytes -= e.bytes;
             if (e.hash !== undefined) this.#byHash.delete(e.hash);          // was leaked
         }
     }
+    // Oldest live entry, in insertion order.
+    //
+    // This used to be `this.#l1.entries().next()`. V8's OrderedHashMap does not
+    // compact on delete -- it tombstones and only rehashes later -- so a FRESH
+    // iterator must skip the entire accumulated run of holes at the front on
+    // every single call. Using a Map as a FIFO queue that way is O(n) per
+    // eviction. Measured in isolation (no cache involved), popping the oldest
+    // key from a steady-size Map: 1671ns at 8k entries, 6173ns at 32k, 20018ns
+    // at 128k with a fresh iterator, against 89/94/115ns with a retained one --
+    // 174x at 128k. That was the whole reason a cold-read workload got *slower*
+    // as L1 grew (2832ns at 2MB, 23664ns at 32MB) and then snapped back to
+    // 395ns at 128MB, where the set fits and eviction never runs.
+    //
+    // A retained iterator is safe here: Map iterators are live, so entries
+    // appended at the tail after it was created are still visited, and entries
+    // deleted ahead of it are skipped. It only needs recreating once exhausted.
+    #oldestEntry() {
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (this.#l1Iter === null) this.#l1Iter = this.#l1.entries();
+            const r = this.#l1Iter.next();
+            if (!r.done) return r.value;
+            this.#l1Iter = null;          // ran off the end; restart from the front
+        }
+        return undefined;                 // genuinely empty
+    }
+
     // Runs right after a GC, so used_heap_size is the LIVE set, not live+garbage.
     // The byte budget is an estimate; this is not.
     #onGc() {
@@ -413,7 +618,7 @@ class TurboCache {
         if (native.ringHead() === this.#cursor) return;
         const r = native.ringRead(this.#cursor, 512);
         if (r.wrapped) {                       // fell too far behind: flush wholesale
-            this.#l1.clear(); this.#byHash.clear(); this.#l1Bytes = 0;
+            this.#l1.clear(); this.#byHash.clear(); this.#l1Bytes = 0; this.#l1Iter = null; this.#pendingDel.clear(); this.#pendingDelHash.clear();
             this.#cursor = r.head;
             return;
         }
@@ -426,16 +631,43 @@ class TurboCache {
             // between queuing and apply - a worker that deleted a key then read
             // it in the same tick kept serving the deleted value forever. The
             // cost of dropping our own entry is one L2 refetch.
+            const pk = this.#pendingDelHash.get(r.hashes[i]);
+            if (pk !== undefined) {              // the primary applied our delete; L2 is authoritative
+                this.#pendingDel.delete(pk); this.#pendingDelHash.delete(r.hashes[i]);
+            }
             const k = this.#byHash.get(r.hashes[i]);
-            if (k !== undefined) { this.#l1Drop(k); this.#byHash.delete(r.hashes[i]); this.stats.invalidated++; }
+            if (k !== undefined) {
+                this.#l1Drop(k); this.#byHash.delete(r.hashes[i]); this.stats.invalidated++;
+            }
         }
         this.#cursor = r.head;
     }
+
+    // Opt into the shared-memory write path. Falls back silently to IPC when the
+    // segment is absent (a primary from before this existed) or when every ring
+    // is already claimed -- the cache still works, just on the slower transport.
+    useSubmissionRing(segName) {
+        try {
+            if (!native.submitOpen(segName)) return false;
+            const idx = native.submitClaim();
+            if (idx < 0) { this.lastError = 'no free submission ring; falling back to IPC'; return false; }
+            this.#ringIdx = idx;
+            this.#ringMaxValue = native.submitMaxValue();
+            submitReady = segName;
+            return true;
+        } catch { return false; }
+    }
+
+    get transport() { return this.#ringIdx >= 0 ? 'shm' : 'ipc'; }
 
     // --- public API (synchronous) ---------------------------------------
     get(key) {
         this.#drain();
         key = this.#ns + key;
+        // Our own delete has not reached the arena yet; serving L2 here would
+        // hand back the value this process just deleted.
+        if (hasLoneSurrogate(key)) return undefined;   // cannot have been stored
+        if (this.#pendingDel.size && this.#pendingDel.has(key)) return undefined;
         const e = this.#l1.get(key);
         // TTL must be enforced in L1 too. The arena expires lazily on read, but
         // an L1 hit never reaches the arena, so without this an expired value
@@ -488,6 +720,20 @@ class TurboCache {
             this.lastError = `key of ${Buffer.byteLength(key)} bytes exceeds the ${this.#keyMax}-byte limit`;
             return false;
         }
+        // An empty key is rejected by the submission ring's validator, and a
+        // rejected record stops that ring permanently -- so a single set('') from
+        // a worker silently killed all of its later writes. Reject it up front,
+        // in every process, so the two paths agree on what a legal key is.
+        if (key.length === 0) {
+            this.stats.rejectedKey = (this.stats.rejectedKey || 0) + 1;
+            this.lastError = 'key must not be empty';
+            return false;
+        }
+        if (hasLoneSurrogate(key)) {
+            this.stats.rejectedKey = (this.stats.rejectedKey || 0) + 1;
+            this.lastError = 'key contains an unpaired surrogate';
+            return false;
+        }
         if (this.#noCodec) {
             const t = typeof value;
             // Binary values are accepted alongside the primitives: decision 4
@@ -538,6 +784,8 @@ class TurboCache {
         // Freeze only ever applies to an object the cache owns. Freezing the
         // caller's object would be a side effect on something they still hold.
         if (this.#codec && this.#freeze) TurboCache.deepFreeze(l1Value);
+        const keyHash = native.hashKey(key);
+        this.#pendingDel.delete(key); this.#pendingDelHash.delete(keyHash);   // a write supersedes our pending delete
         // set() reports whether the pipeline ACCEPTED, serialised and queued the
         // value - not that it is durably in L2. A worker's write is applied by
         // the primary a tick later, so the size must be checked here; otherwise
@@ -552,16 +800,55 @@ class TurboCache {
             this.lastError = `value ${encLen}B exceeds the ${this.#maxValue}B arena limit`;
             return false;
         }
-        this.#l1Put(key, l1Value, native.hashKey(key), this.#noCodec ? 0 : enc.length,
+        // A value can fit the arena and still be too large for a submission ring
+        // record. That is a PERMANENT condition, not the transient "ring full"
+        // backpressure, so it must be reported as a rejection here rather than as
+        // an endless stream of successful-looking writes that never reach L2.
+        if (this.#ringIdx >= 0 && this.#ringMaxValue > 0 && encLen > this.#ringMaxValue) {
+            this.stats.rejectedSize++;
+            this.lastError = `value ${encLen}B exceeds the ${this.#ringMaxValue}B submission-ring limit ` +
+                             `(raise submitRingBytes on the primary)`;
+            return false;
+        }
+        this.#l1Put(key, l1Value, keyHash, this.#noCodec ? 0 : enc.length,
                     ttlMs > 0 ? Date.now() + ttlMs : 0);
         if (this.#id === 0) {
-            const ok = native.set(key, enc, 0, ttlMs, this.#nsId);
+            const ok = native.set(key, enc, 0, ttlMs, this.#nsId) === true;
             if (!ok) { this.stats.rejectedSize++; this.lastError = 'value does not fit the arena'; this.#l1Drop(key); }
             return ok;
+        }
+        // Shared-memory submission: a memcpy into this worker's own ring, which
+        // the primary already has mapped. The IPC path is kept as a fallback for
+        // when the ring segment is unavailable (older primary, claim failed).
+        if (this.#ringIdx >= 0) {
+            if (native.submitSet(key, enc, ttlMs, this.#nsId)) { this.stats.sent++; this.#ringDoorbell(); return true; }
+            // Ring full. Same contract as a shed IPC write: the value is in this
+            // worker's L1, it just has not reached L2, so other workers see a
+            // miss rather than a wrong value. Counted, never silent.
+            this.stats.writesShed = (this.stats.writesShed || 0) + 1;
+            this.lastError = 'submission ring full; L2 write shed';
+            return true;
         }
         this.#outbox.push('s', key, enc, ttlMs, this.#nsId);
         this.#schedule(encLen + key.length + 48);
         return true;                      // queued; capacity is decided by the primary
+    }
+
+    // Edge-triggered doorbell. The primary only needs waking when its rings go
+    // from empty to non-empty: while it is already draining, every extra
+    // notification is pure waste, and under load the ring is almost never empty
+    // so this fires rarely. A timer instead would either burn wakeups finding
+    // nothing or add latency waiting for the next tick.
+    #ringDoorbell() {
+        if (this.#doorbellPending) return;
+        this.#doorbellPending = true;
+        // A one-field message, not a batch: this is a notification, not a
+        // transport. The payload that used to freeze the event loop for
+        // 0.49-1.15ms per send now travels through shared memory instead.
+        setImmediate(() => {
+            this.#doorbellPending = false;
+            if (process.connected) { try { process.send({ t: RING_MSG, id: this.#id }); } catch { /* shutting down */ } }
+        });
     }
 
     // Batching normally waits for the next tick, but a worker doing a long
@@ -582,6 +869,8 @@ class TurboCache {
     has(key) {
         this.#drain();
         key = this.#ns + key;
+        if (hasLoneSurrogate(key)) return false;
+        if (this.#pendingDel.size && this.#pendingDel.has(key)) return false;
         const e = this.#l1.get(key);
         if (e !== undefined) {
             if (!e.exp || e.exp > Date.now()) return true;
@@ -599,6 +888,20 @@ class TurboCache {
         // worker and the primary disagreed about the same absent key.
         const had = this.#l1.has(key) || native.has(key);
         this.#l1Drop(key);
+        // A worker's delete is applied by the primary a tick later, so a get()
+        // in between refilled L1 straight from L2 and served the value this
+        // worker just deleted. Remember the key until the invalidation for it
+        // comes back around. Bounded: if the primary is not applying our
+        // deletes, dropping the record only costs us a stale read, whereas
+        // growing without bound costs the process.
+        if (this.#pendingDel.size >= 4096) { this.#pendingDel.clear(); this.#pendingDelHash.clear(); }
+        this.#pendingDel.add(key);
+        this.#pendingDelHash.set(native.hashKey(key), key);
+        if (this.#ringIdx >= 0) {
+            if (native.submitDel(key, this.#nsId)) this.#ringDoorbell();
+            else this.stats.writesShed = (this.stats.writesShed || 0) + 1;
+            return had;
+        }
         this.#outbox.push('d', key, null, 0, this.#nsId);
         this.#schedule(key.length + 48);
         return had;
@@ -607,7 +910,7 @@ class TurboCache {
     // Drops only this process's L1. The shared arena is untouched, so the next
     // read simply repopulates it.
     clearLocal() {
-        this.#l1.clear(); this.#byHash.clear(); this.#l1Bytes = 0;
+        this.#l1.clear(); this.#byHash.clear(); this.#l1Bytes = 0; this.#l1Iter = null; this.#pendingDel.clear(); this.#pendingDelHash.clear();
     }
 
     // Wipes the shared arena AND every worker's L1, via a flush record on the
@@ -738,7 +1041,15 @@ class TurboCache {
         this.stopGuard();
         if (this.#timer) { clearInterval(this.#timer); this.#timer = null; }
         instances.delete(this);
-        if (this.#id === 0 && storeReady) { native.destroy(); storeReady = false; }
+        // Release this process's ring slot, or it stays owned by a dead pid
+        // forever: after enough worker churn every slot is taken, submitClaim
+        // returns -1, and every new worker silently falls back to IPC.
+        try { native.submitRelease(); } catch { /* transport not in use */ }
+        if (this.#id === 0 && storeReady) {
+            try { native.submitDestroy(); } catch { /* not created */ }
+            submitName = null; isPrimaryProcess = false;
+            native.destroy(); storeReady = false;
+        }
     }
 
     get l1Size() { return this.#l1.size; }
@@ -748,7 +1059,32 @@ class TurboCache {
     flush() {
         this.#flushScheduled = false;
         if (!this.#outbox.length) return;
+        // Do not push into a congested channel. process.send() queues into
+        // libuv, which is UNBOUNDED: under sustained write load the worker's
+        // RSS grew past 485MB while its JS heap stayed flat, because the
+        // backlog lives outside the heap. Wait for the drain callback instead.
+        // The bound must be on BYTES IN FLIGHT, not on "is one message
+        // outstanding". `false` from process.send only means libuv's buffer is
+        // above its high-water mark right now -- it does not mean the channel is
+        // saturated. Treating it as a stop-everything flag allowed exactly one
+        // message in flight and discarded everything produced while it was
+        // pending, which capped delivery at ~60k writes/s. Measured with no cache
+        // in the way, the same channel carries 439 MB/s under JSON and 1738 MB/s
+        // under 'advanced' -- equivalent to 1.8M and 7.3M writes/s. The ceiling
+        // was this policy, not the transport.
+        if (this.#inFlightBytes >= this.#maxInFlightBytes) {
+            if (this.#outboxBytes < this.#outboxMaxBytes) return;   // keep batching
+            // Window full AND our own buffer is full: shed rather than grow
+            // without bound. The value stays in this worker's L1, it just does
+            // not reach L2, so other workers see a miss, never a wrong value.
+            this.stats.writesShed = (this.stats.writesShed || 0) + this.#outbox.length / 5;
+            this.#outbox = [];
+            this.#outboxBytes = 0;
+            this.lastError = 'IPC send window full; L2 writes shed';
+            return;
+        }
         const batch = this.#outbox;
+        const batchBytes = this.#outboxBytes;
         this.#outbox = [];
         this.#outboxBytes = 0;
         this.stats.flushes++;
@@ -760,15 +1096,36 @@ class TurboCache {
         if (!process.connected) { this.stats.flushDropped = (this.stats.flushDropped || 0) + 1; return; }
         // The write fails ASYNCHRONOUSLY, so try/catch cannot see it; without a
         // callback Node emits an unhandled 'error' event that kills the process.
-        // Passing a callback routes the failure here instead.
+        // Passing a callback routes the failure here instead - and tells us when
+        // the message actually reached the channel, which is our drain signal.
         const self = this;
         try {
-            process.send({ t: MSG, id: this.#id, b: batch }, err => {
+            // Reserve AFTER the call cannot throw synchronously. process.send
+            // throws for a value the serializer cannot represent (a BigInt under
+            // JSON serialization), and reserving first meant the catch below
+            // never returned those bytes -- eight such batches wedged the worker
+            // for its lifetime while every set() still reported success.
+            this.#inFlightBytes += batchBytes;
+            let sendThrew = true;
+            const accepted = process.send({ t: MSG, id: this.#id, b: batch }, err => {
+                self.#inFlightBytes -= batchBytes;
+                if (self.#inFlightBytes < 0) self.#inFlightBytes = 0;
                 if (!err) return;
                 self.stats.flushDropped = (self.stats.flushDropped || 0) + 1;
                 self.lastError = `flush failed: ${err.code || err.message}`;
             });
+            // false means the backlog is above libuv's high-water mark.
+            // Informational only now: a `false` return is normal backpressure and
+            // the window, not this flag, decides whether we keep sending.
+            sendThrew = false;
+            if (accepted === false) this.stats.congested = (this.stats.congested || 0) + 1;
         } catch (e) {
+            // Synchronous throw: the callback will never run, so return the bytes
+            // here or the window shrinks permanently and the worker stops writing.
+            if (sendThrew) {
+                this.#inFlightBytes -= batchBytes;
+                if (this.#inFlightBytes < 0) this.#inFlightBytes = 0;
+            }
             this.stats.flushDropped = (this.stats.flushDropped || 0) + 1;
             this.lastError = `flush failed: ${e.code || e.message}`;
         }
@@ -780,6 +1137,13 @@ class TurboCache {
     // invalidate the primary's L1 - it kept serving its own stale value even
     // after a worker overwrote or deleted the key.
     static applyBatch(msg) {
+        // set/delete travel through the shared-memory ring while incr/clearAll/
+        // clearNamespace still travel over IPC. A worker pushes to its ring
+        // synchronously and sends the IPC message afterwards, so draining the
+        // rings to empty here is what keeps one worker's operations in order --
+        // without it a clearAll() was observed leaving 3808 keys that had been
+        // written before it.
+        if (submitName) { let guard = 0; while (TurboCache.drainSubmissions(8192) > 0 && ++guard < 512); }
         const b = msg.b;
         for (let i = 0; i < b.length; i += 5) {
             const op = b[i], key = b[i + 1];

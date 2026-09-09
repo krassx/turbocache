@@ -378,6 +378,14 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
                             const uint8_t *val, uint32_t storedLen, uint32_t rawLen,
                             uint8_t flags, uint32_t expiresAt, uint16_t writerId,
                             uint8_t ns = 0) {
+  // NS_MAX is 16 and `ns` is a uint8_t, so an out-of-range id indexes past
+  // nsBytes[] into nsQuota / nsProtected / nsDropped and, past ~77, into the
+  // INDEX itself -- `nsBytes[ns] += blockSize` then corrupts a live index slot
+  // permanently (the slot no longer matches any entry, so eviction can never
+  // reclaim it and `live` leaks toward the ceiling). nsResolve can return -1
+  // (table full) and -2 (name too long), so this is reachable from the public
+  // API the moment a caller registers a 17th namespace.
+  if (ns >= NS_MAX) return false;
   Header *h = s.h;
   uint64_t hash = rapidhash_withSeed(key, keyLen, 0);
   if (hash <= HASH_TOMB) hash += 2;   // reserve 0/1 as sentinels
@@ -465,6 +473,7 @@ static inline bool storeDelete(Store &s, const uint8_t *key, uint16_t keyLen, ui
 // reader trust a stale position pointing at reused bytes.
 // Drop every entry of one namespace. O(index slots); clearing is rare.
 static inline uint64_t storeClearNamespace(Store &s, uint8_t ns, uint16_t writerId) {
+  if (ns >= NS_MAX) return 0;
   Header *h = s.h;
   uint64_t removed = 0;
   for (uint64_t i = 0; i < h->indexSlots; i++) {
@@ -529,7 +538,12 @@ static inline bool storeGet(Store &s, const uint8_t *key, uint16_t keyLen,
     uint64_t pos = s.idx[i].off.load(std::memory_order_acquire);
     Entry *e = s.entryAt(pos);
 
-    for (int retry = 0; retry < 8; retry++) {
+    // A tight 8-spin is shorter than a single incr, so a concurrent update storm
+  // made 0.04% of reads of a permanently-present key report as missing -- which
+  // silently resets a get-or-compute caller's counter. Retry far longer and
+  // yield, since the writer always finishes.
+  for (int retry = 0; retry < 4096; retry++) {
+    if (retry > 64) platformSleepUs(1);
       uint32_t s1 = e->seq.load(std::memory_order_acquire);
       if (s1 & 1) continue;                                  // writer mid-update
       uint16_t kl = e->keyLen; uint32_t sl = e->storedLen, rl = e->rawLen;
@@ -583,6 +597,7 @@ static inline bool storeGet(Store &s, const uint8_t *key, uint16_t keyLen,
 static inline bool storeIncr(Store &s, const uint8_t *key, uint16_t keyLen,
                              double by, uint32_t expiresAt, uint16_t writerId,
                              uint8_t ns, double *out) {
+  if (ns >= NS_MAX) return false;
   Header *h = s.h;
   uint64_t hash = rapidhash_withSeed(key, keyLen, 0);
   if (hash <= HASH_TOMB) hash += 2;

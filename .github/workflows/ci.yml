@@ -30,10 +30,18 @@ jobs:
           fail=0
           for t in test.js api_test.js codec_test.js prim_test.js json_fastpath_test.js \
                    v8codec_test.js storage_modes_test.js namespace_test.js \
-                   review_regression_test.js gaps_test.js typeflow_test.js; do
+                   review_regression_test.js gaps_test.js typeflow_test.js \
+                   perf_regression_test.js; do
             echo "--- $t"
             node "$t" || { echo "FAILED: $t"; fail=1; }
           done
+          for t in shm ipc; do
+            echo "--- transport_regression_test.js ($t)"
+            TC_T=$t node transport_regression_test.js || { echo "FAILED: transport ($t)"; fail=1; }
+          done
+          echo "--- submit_test.cc (submission ring, standalone)"
+          c++ -std=c++17 -O2 -o /tmp/submit_test submit_test.cc -lpthread \
+            && /tmp/submit_test || { echo "FAILED: submit_test"; fail=1; }
           exit $fail
 
       - name: Cross-process behaviour

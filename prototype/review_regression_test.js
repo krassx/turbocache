@@ -83,5 +83,43 @@ ok(typeof Cache === 'function', 'Cache alias is exported as the docs describe');
     ok(c.delete('never-existed') === false, 'delete of an absent key reports false');
     TurboCache.native().destroy();
 }
+// worker id 0 must be rejected, not silently wedge the process.
+// `#id === 0` is how every method recognises the primary, so a worker attached
+// as 0 takes the primary's write path against a read-only mapping and blocks
+// the event loop forever on its first set() -- no throw, no crash, no log.
+{
+    let threw = 0;
+    for (const bad of [0, -1, 1.5, null, undefined, 'x']) {
+        try { TurboCache.attachWorker('/tcnope' + process.pid, bad); } catch { threw++; }
+    }
+    ok(threw === 6, 'attachWorker rejects every non-positive-integer workerId');
+    let coerced = false;
+    try { TurboCache.attachWorker('/tcnope' + process.pid, '3'); } catch (e) { coerced = !/workerId must be/.test(e.message); }
+    ok(coerced, "numeric string workerId '3' is coerced, not rejected");
+}
+
+// Native-layer defects found by the second adversarial review.
+{
+    const c = mk({});
+    // Namespace ids index nsBytes[16] with no check: ns>=16 walked into
+    // nsQuota/nsProtected/nsDropped and past ~77 into the INDEX itself, silently
+    // corrupting a live slot that eviction could then never reclaim.
+    ok(native.set('nsbad', 'v', 0, 0, 77) === false, 'namespace id 77 is rejected, not written past nsBytes');
+    ok(native.set('nsbad', 'v', 0, 0, 255) === false, 'namespace id 255 is rejected');
+    ok(native.set('nsok', 'v', 0, 0, 3) === true, 'a valid namespace id is still accepted');
+
+    // Unpaired surrogates all encode to U+FFFD, so distinct keys aliased and
+    // returned each other's values.
+    c.set('\uFFFD', 'real-replacement-char');
+    ok(c.set('\uD800', 'x') === false, 'lone high surrogate key is rejected');
+    ok(c.set('\uDC00', 'x') === false, 'lone low surrogate key is rejected');
+    ok(c.get('\uD800') === undefined, 'lone surrogate key does not alias U+FFFD');
+    ok(c.get('\uFFFD') === 'real-replacement-char', 'a genuine U+FFFD key still works');
+
+    // These dereferenced the store before an arena existed.
+    ok(typeof native.ringRead === 'function', 'ringRead is exported');
+    c.close();
+}
+
 console.log(fail ? `  ${fail} FAILURES` : '  all passed');
 process.exit(fail ? 1 : 0);
