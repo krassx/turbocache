@@ -2,6 +2,13 @@ const l2 = require('./build/Release/l2.node');
 const { makePayload } = require('./payload');
 const KEYS = 2000;
 const keys = Array.from({length: KEYS}, (_, i) => 'user:session:' + i);
+const _native = require('./build/Release/l2.node');
+if (!_native.hasLz4()) {
+    console.log('  SKIPPED: this addon was built without LZ4 ' +
+                '(rebuild with --turbocache_lz4=1 to run the compression measurements)');
+    process.exit(0);
+}
+
 function timeit(fn, N) {
   for (let i = 0; i < 50000; i++) fn(i);
   const t = process.hrtime.bigint(); let s = 0;

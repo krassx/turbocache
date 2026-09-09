@@ -323,7 +323,17 @@ class TurboCache {
 
     static createPrimary(name, arenaBytes, indexSlots, opts = {}) {
         if (!native.create(name, arenaBytes, indexSlots, 2)) throw new Error('arena create failed');
-        native.setCompressMin(1 << 30);                 // compression off, per DESIGN.md
+        // Compression is off unless the caller explicitly asks AND the addon was
+        // built with LZ4. Measured a bad trade (see DESIGN.md), so it is neither
+        // the default nor a build dependency.
+        if (opts.compress === true) {
+            if (!native.hasLz4())
+                throw new Error('turbocache: compress:true requires an addon built with ' +
+                                'LZ4 (node-gyp configure build --turbocache_lz4=1)');
+            native.setCompressMin(opts.compressMinBytes || 1024, opts.compressAccel || 1);
+        } else {
+            native.setCompressMin(1 << 30, 1);          // effectively never
+        }
         storeReady = true;
         const c = new TurboCache({ ...opts, workerId: 0 });
         c._startMaintenance(opts);
@@ -661,6 +671,10 @@ class TurboCache {
     }
 
     static namespaceStats() { return native.nsStats(); }
+
+    // Whether this addon build can compress. Compression is optional at build
+    // time so the default build has no external dependencies.
+    static hasCompression() { return native.hasLz4(); }
 
     // Live entries in this cache's namespace. Arena-wide counters are in
     // TurboCache.arenaStats().

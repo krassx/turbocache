@@ -4,6 +4,13 @@ const { makePayload } = require('./payload');
 
 const NKEYS = 40000, OPS = 300000;
 const ARENA = (Number(process.env.ARENA_MB) || 24) << 20;
+const _native = require('./build/Release/l2.node');
+if (!_native.hasLz4()) {
+    console.log('  SKIPPED: this addon was built without LZ4 ' +
+                '(rebuild with --turbocache_lz4=1 to run the compression measurements)');
+    process.exit(0);
+}
+
 function mkRng(seed) { let s = seed >>> 0; return () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296; }
 function mkZipf(N, rnd) {
   const cdf = new Float64Array(N); let sum = 0;

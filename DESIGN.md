@@ -491,9 +491,26 @@ pure cost. LZ4 acceleration does not rescue the write path — at accel=16 nothi
 clears the "12.5% smaller" bar at all, so it degenerates to compression being
 off. There is no setting that makes compression cheap.
 
-**Verdict: off by default, off in v1.** Retained as a per-cache opt-in
-(`compress: true`, floor 1KB) for deployments under a hard memory cap that
-cannot simply enlarge the arena.
+**Verdict: off by default, off in v1 — and now off at build time too.** Since
+nothing uses it, linking LZ4 unconditionally only made the addon unbuildable
+anywhere without a system LZ4 at a hardcoded path. It is now an optional build
+feature:
+
+```
+node-gyp configure build                      # default: no LZ4, no dependency
+node-gyp configure build --turbocache_lz4=1   # link system LZ4
+```
+
+The default build has **no external dependencies at all**. `find_lz4.js` locates
+LZ4 for the opt-in build via `pkg-config`, then the usual prefixes, honouring
+`LZ4_PREFIX`. `Cache.hasCompression()` reports the capability, and asking for
+`compress: true` on a build without it throws rather than silently storing
+uncompressed.
+
+Mixing builds is guarded rather than left to chance: the header records a
+`FEATURE_LZ4` bit the first time a compressed entry is written, and a build
+without LZ4 **refuses to attach** to such an arena with a message naming the fix,
+instead of attaching and reporting silent misses for every compressed key.
 
 ### Background compaction — prototyped, and rejected
 

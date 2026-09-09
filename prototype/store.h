@@ -20,6 +20,7 @@
 
 static const uint32_t TC_MAGIC = 0x54430001;
 static const uint32_t TC_LAYOUT = 1;
+static const uint32_t FEATURE_LZ4 = 1;
 static const uint64_t HASH_EMPTY = 0;
 static const uint64_t HASH_TOMB  = 1;
 // Ring sentinel: 'drop your entire L1', used by clearAll.
@@ -108,6 +109,11 @@ struct Header {
   uint64_t nsQuota[NS_MAX];          // 0 = no quota, competes freely
   uint64_t nsProtected[NS_MAX], nsDropped[NS_MAX];
   uint64_t reappends, reappendSkippedNoRoom, dropped, tailAdvances, tailLive;
+  // Set the first time a compressed entry is written. An attaching process
+  // built without LZ4 cannot read those entries, so it refuses the arena
+  // rather than silently reporting misses.
+  uint32_t features;
+  uint64_t readsSkippedNoLz4;
 };
 
 struct Store {
@@ -128,6 +134,7 @@ struct Store {
   size_t   hintsMapBytes = 0;
   char     name[64] = {0};
   char     hintsName[80] = {0};
+  int      attachError = 0;   // 1 = arena needs LZ4 and this build lacks it
 
   inline Entry *entryAt(uint64_t pos) const { return (Entry *)(data + (pos & (h->dataBytes - 1))); }
   inline uint8_t *keyOf(Entry *e) const { return (uint8_t *)e + sizeof(Entry); }
@@ -214,6 +221,11 @@ struct Store {
     mapBytes = st.st_size; writable = false;
     h = (Header *)base;
     if (h->magic != TC_MAGIC || h->layout != TC_LAYOUT) { close(fd); return false; }
+    // Refuse an arena holding compressed entries this build cannot decompress,
+    // rather than attaching and reporting silent misses for them.
+#ifndef TURBOCACHE_LZ4
+    if (h->features & FEATURE_LZ4) { close(fd); attachError = 1; return false; }
+#endif
     close(fd);
     // Hints live in their OWN segment, opened read-write. The arena fd above is
     // O_RDONLY, so a worker cannot map the arena writable even deliberately -

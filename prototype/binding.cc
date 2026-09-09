@@ -1,6 +1,10 @@
 #define NAPI_VERSION 10
 #include <node_api.h>
+// Compression is an optional build feature; see binding.gyp. Without it the
+// addon has no external dependencies.
+#ifdef TURBOCACHE_LZ4
 #include <lz4.h>
+#endif
 #include <stdlib.h>
 #include <time.h>
 #include "store_ops.h"
@@ -63,7 +67,24 @@ static napi_value Attach(napi_env env, napi_callback_info info) {
   napi_get_value_string_latin1(env, argv[0], nm, sizeof(nm), &l);
   if (!scratch) { scratch = (uint8_t *)malloc(SCRATCH); cbuf = (uint8_t *)malloc(SCRATCH); }
   bool ok = g.attachReadOnly(nm);
+  if (!ok && g.attachError == 1) {
+    napi_throw_error(env, nullptr,
+      "turbocache: this arena contains LZ4-compressed entries but the addon was "
+      "built without LZ4. Rebuild with --turbocache_lz4=1, or recreate the arena "
+      "with compression disabled.");
+    return nullptr;
+  }
   napi_value r; napi_get_boolean(env, ok, &r); return r;
+}
+
+static napi_value HasLz4(napi_env env, napi_callback_info) {
+  napi_value r;
+#ifdef TURBOCACHE_LZ4
+  napi_get_boolean(env, true, &r);
+#else
+  napi_get_boolean(env, false, &r);
+#endif
+  return r;
 }
 
 static napi_value SetCompressMin(napi_env env, napi_callback_info info) {
@@ -157,10 +178,13 @@ static napi_value Set(napi_env env, napi_callback_info info) {
   const uint8_t *payload = scratch;
   uint32_t storedLen = (uint32_t)vlen, rawLen = (uint32_t)vlen;
   if ((flags & FLAG_STRING) && vlen >= compressMin) {
+#ifdef TURBOCACHE_LZ4
     int c = LZ4_compress_fast((const char *)scratch, (char *)cbuf, (int)vlen, (int)SCRATCH, compressAccel);
     if (c > 0 && (uint32_t)c < rawLen - (rawLen >> 3)) {   // keep only if >12.5% smaller
       payload = cbuf; storedLen = (uint32_t)c; flags |= FLAG_COMPRESSED;
+      g.h->features |= FEATURE_LZ4;      // record that compressed entries exist
     }
+#endif
   }
   int32_t writerId = 0, ttlMs = 0, ns = 0;
   if (argc > 2) napi_get_value_int32(env, argv[2], &writerId);
@@ -184,9 +208,17 @@ static napi_value Get(napi_env env, napi_callback_info info) {
   g_lastExpiresAt = rr.expiresAt;
   const char *src = (const char *)rr.buf;
   if (rr.flags & FLAG_COMPRESSED) {
+#ifdef TURBOCACHE_LZ4
     int d = LZ4_decompress_safe((const char *)rr.buf, (char *)cbuf, (int)rr.storedLen, (int)SCRATCH);
     if (d < 0) return nullptr;
     src = (const char *)cbuf;
+#else
+    // A compressed entry in a build without LZ4: report a miss rather than
+    // hand back compressed bytes. attach() refuses such an arena up front, so
+    // this is a belt-and-braces path.
+    g.h->readsSkippedNoLz4++;
+    return nullptr;
+#endif
   }
   napi_value out;
   if (rr.flags & FLAG_NUMBER) {
@@ -221,8 +253,12 @@ static napi_value GetLen(napi_env env, napi_callback_info info) {
   ReadResult rr;
   int32_t n = -1;
   if (storeGet(g, (const uint8_t *)key, (uint16_t)klen, scratch, SCRATCH, &rr, nowRelMs(g))) {
+#ifdef TURBOCACHE_LZ4
     if (rr.flags & FLAG_COMPRESSED)
       LZ4_decompress_safe((const char *)rr.buf, (char *)cbuf, (int)rr.storedLen, (int)SCRATCH);
+#else
+    if (rr.flags & FLAG_COMPRESSED) { napi_value r; napi_create_int32(env, -1, &r); return r; }
+#endif
     n = (int32_t)rr.rawLen;
   }
   napi_value out; napi_create_int32(env, n, &out); return out;
@@ -452,9 +488,13 @@ static void CompactExecute(napi_env, void *data) {
   Job *j = (Job *)data;
   if (j->delayUs) usleep(j->delayUs);   // test hook: widen the capture->apply window
   for (auto &it : j->items) {
+#ifdef TURBOCACHE_LZ4
     int c = LZ4_compress_default((const char *)it.raw, (char *)it.comp,
                                  (int)it.rawLen, (int)LZ4_compressBound(it.rawLen));
     it.compLen = c > 0 ? (uint32_t)c : 0;
+#else
+    it.compLen = 0;                       // no compression available; nothing to apply
+#endif
   }
 }
 
@@ -531,7 +571,11 @@ static napi_value CompactAsync(napi_env env, napi_callback_info info) {
     it.rawLen = e->rawLen; it.oldBlockSize = bsz; it.keyLen = e->keyLen;
     memcpy(it.key, g.keyOf(e), e->keyLen);
     it.raw = (uint8_t *)malloc(it.rawLen);
+#ifdef TURBOCACHE_LZ4
     it.comp = (uint8_t *)malloc(LZ4_compressBound(it.rawLen));
+#else
+    it.comp = (uint8_t *)malloc(it.rawLen + 64);
+#endif
     memcpy(it.raw, g.valOf(e), it.rawLen);     // storedLen == rawLen: uncompressed
     j->items.push_back(it);
   }
@@ -837,7 +881,7 @@ static napi_value Init(napi_env env, napi_value exports) {
   FN("create", Create) FN("attach", Attach) FN("set", Set) FN("get", Get)
   FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("nsResolve", NsResolve) FN("clearNamespace", ClearNamespace) FN("nsStats", NsStats) FN("scanKeys", ScanKeys) FN("sweepExpired", SweepExpired) FN("incr", Incr) FN("cas", Cas) FN("heartbeat", Heartbeat) FN("heartbeatAgeMs", HeartbeatAgeMs) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastExpiresAt", LastExpiresAt) FN("epochMs", EpochMs) FN("keyMaxBytes", KeyMaxBytes)
   FN("destroy", Destroy) FN("poke", Poke)
-  FN("suppressRefBit", SetSuppressRefBit) FN("secondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin)
+  FN("suppressRefBit", SetSuppressRefBit) FN("secondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin) FN("hasLz4", HasLz4)
   return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)
