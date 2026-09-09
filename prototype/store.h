@@ -10,12 +10,8 @@
 #include <atomic>
 #include <stdint.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <stdio.h>
-#include <time.h>
+#include "platform.h"
 #include "vendor/rapidhash.h"
 
 static const uint32_t TC_MAGIC = 0x54430001;
@@ -135,6 +131,7 @@ struct Store {
   char     name[64] = {0};
   char     hintsName[80] = {0};
   int      attachError = 0;   // 1 = arena needs LZ4 and this build lacks it
+  ShmHandle baseHandle, hintsHandle;
 
   inline Entry *entryAt(uint64_t pos) const { return (Entry *)(data + (pos & (h->dataBytes - 1))); }
   inline uint8_t *keyOf(Entry *e) const { return (uint8_t *)e + sizeof(Entry); }
@@ -144,13 +141,8 @@ struct Store {
   bool create(const char *nm, uint64_t totalBytes, uint64_t indexSlots, uint8_t mode) {
     if (indexSlots < 16 || (indexSlots & (indexSlots - 1))) return false;   // power of two
     snprintf(name, sizeof(name), "%s", nm);
-    shm_unlink(nm);
-    int fd = shm_open(nm, O_CREAT | O_RDWR | O_EXCL, 0600);
-    if (fd < 0) return false;
-    if (ftruncate(fd, (off_t)totalBytes) != 0) { close(fd); return false; }
-    base = (uint8_t *)mmap(nullptr, totalBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
-    if (base == MAP_FAILED) { base = nullptr; return false; }
+    base = (uint8_t *)shmCreate(nm, totalBytes, &baseHandle);
+    if (!base) return false;
     mapBytes = totalBytes; writable = true;
     memset(base, 0, sizeof(Header));
 
@@ -175,7 +167,7 @@ struct Store {
         h->ringCap = p;
     }
     uint64_t ringBytes = h->ringCap * sizeof(RingRec);
-    uint64_t pg = (uint64_t)sysconf(_SC_PAGESIZE);
+    uint64_t pg = platformGranularity();
     h->hintsBytes = (indexSlots + pg - 1) & ~(pg - 1);      // one byte per index slot
     h->dataOff = (h->ringOff + ringBytes + 63) & ~63ull;
 
@@ -183,7 +175,7 @@ struct Store {
     // too-small segment underflows `totalBytes - dataOff` into a huge unsigned
     // value and create() hangs or scribbles past the mapping.
     if (h->dataOff + MIN_DATA_BYTES > totalBytes) {
-      munmap(base, totalBytes); base = nullptr; shm_unlink(nm); return false;
+      shmClose(base, totalBytes, &baseHandle); base = nullptr; shmUnlink(nm); return false;
     }
     // MODE_LOG masks with (dataBytes-1), so the data region must be a power of two.
     // Both modes are rounded identically so the two allocators compete at equal capacity.
@@ -202,8 +194,7 @@ struct Store {
     }
     h->bumpPtr = 0; h->clockHand = 0; h->logHead = 0; h->logTail = 0;
     h->tailPub.store(0, std::memory_order_relaxed);
-    { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-      h->epochMs = (uint64_t)ts.tv_sec * 1000ull + ts.tv_nsec / 1000000ull; }
+    h->epochMs = nowMs();
     h->maxLive = (uint64_t)(indexSlots * MAX_LOAD);
     if (!openHints(nm, true)) return false;
     bind();
@@ -213,20 +204,21 @@ struct Store {
   }
 
   bool attachReadOnly(const char *nm) {
-    int fd = shm_open(nm, O_RDONLY, 0600);
-    if (fd < 0) return false;
-    struct stat st; fstat(fd, &st);
-    base = (uint8_t *)mmap(nullptr, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (base == MAP_FAILED) { base = nullptr; close(fd); return false; }
-    mapBytes = st.st_size; writable = false;
+    uint64_t sz = 0;
+    base = (uint8_t *)shmOpenRead(nm, &baseHandle, &sz);
+    if (!base) return false;
+    mapBytes = (size_t)sz; writable = false;
     h = (Header *)base;
-    if (h->magic != TC_MAGIC || h->layout != TC_LAYOUT) { close(fd); return false; }
+    if (h->magic != TC_MAGIC || h->layout != TC_LAYOUT) {
+      shmClose(base, mapBytes, &baseHandle); base = nullptr; return false;
+    }
     // Refuse an arena holding compressed entries this build cannot decompress,
     // rather than attaching and reporting silent misses for them.
 #ifndef TURBOCACHE_LZ4
-    if (h->features & FEATURE_LZ4) { close(fd); attachError = 1; return false; }
+    if (h->features & FEATURE_LZ4) {
+      shmClose(base, mapBytes, &baseHandle); base = nullptr; attachError = 1; return false;
+    }
 #endif
-    close(fd);
     // Hints live in their OWN segment, opened read-write. The arena fd above is
     // O_RDONLY, so a worker cannot map the arena writable even deliberately -
     // the isolation is a property of the descriptor, not just of the mapping.
@@ -247,29 +239,18 @@ struct Store {
   bool openHints(const char *nm, bool create) {
     char hn[80];
     snprintf(hn, sizeof(hn), "%.60s.h", nm);
-    int fd;
-    if (create) {
-      shm_unlink(hn);
-      fd = shm_open(hn, O_CREAT | O_RDWR | O_EXCL, 0600);
-      if (fd < 0) return false;
-      if (ftruncate(fd, (off_t)h->hintsBytes) != 0) { close(fd); return false; }
-      snprintf(hintsName, sizeof(hintsName), "%s", hn);
-    } else {
-      fd = shm_open(hn, O_RDWR, 0600);
-      if (fd < 0) return false;
-    }
+    if (create) snprintf(hintsName, sizeof(hintsName), "%s", hn);
     hintsMapBytes = h->hintsBytes;
-    hintsMap = (std::atomic<uint8_t> *)mmap(nullptr, hintsMapBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
-    if (hintsMap == (void *)MAP_FAILED) { hintsMap = nullptr; return false; }
+    hintsMap = (std::atomic<uint8_t> *)shmOpenRW(hn, hintsMapBytes, create, &hintsHandle);
+    if (!hintsMap) return false;
     return true;
   }
 
   void destroy() {
-    if (hintsMap) { munmap(hintsMap, hintsMapBytes); hintsMap = nullptr; }
-    if (base) munmap(base, mapBytes);
-    if (writable && name[0]) shm_unlink(name);
-    if (writable && hintsName[0]) shm_unlink(hintsName);
+    if (hintsMap) { shmClose(hintsMap, hintsMapBytes, &hintsHandle); hintsMap = nullptr; }
+    if (base) shmClose(base, mapBytes, &baseHandle);
+    if (writable && name[0]) shmUnlink(name);
+    if (writable && hintsName[0]) shmUnlink(hintsName);
     base = nullptr;
   }
 

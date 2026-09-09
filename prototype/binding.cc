@@ -9,7 +9,6 @@
 #include <time.h>
 #include "store_ops.h"
 #include <vector>
-#include <unistd.h>
 
 static Store g;
 static uint8_t *scratch = nullptr;
@@ -386,9 +385,7 @@ static napi_value SweepExpired(napi_env env, napi_callback_info info) {
 // and stop trusting the arena. The field existed but nothing ever wrote it.
 static napi_value Heartbeat(napi_env env, napi_callback_info) {
   NEED_STORE(nullptr)
-  struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-  g.h->heartbeatNs.store((uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec,
-                         std::memory_order_release);
+  g.h->heartbeatNs.store(nowNs(), std::memory_order_release);
   return nullptr;
 }
 static napi_value HeartbeatAgeMs(napi_env env, napi_callback_info) {
@@ -396,8 +393,7 @@ static napi_value HeartbeatAgeMs(napi_env env, napi_callback_info) {
   uint64_t hb = g.h->heartbeatNs.load(std::memory_order_acquire);
   napi_value r;
   if (!hb) { napi_create_double(env, -1, &r); return r; }   // never stamped
-  struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-  uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+  uint64_t now = nowNs();
   napi_create_double(env, now > hb ? (double)((now - hb) / 1000000ull) : 0, &r);
   return r;
 }
@@ -492,7 +488,7 @@ struct Job {
 // off the writer thread, and it cannot observe or mutate shared state.
 static void CompactExecute(napi_env, void *data) {
   Job *j = (Job *)data;
-  if (j->delayUs) usleep(j->delayUs);   // test hook: widen the capture->apply window
+  if (j->delayUs) platformSleepUs(j->delayUs);   // test hook: widen the capture->apply window
   for (auto &it : j->items) {
 #ifdef TURBOCACHE_LZ4
     int c = LZ4_compress_default((const char *)it.raw, (char *)it.comp,

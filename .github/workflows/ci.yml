@@ -1,0 +1,88 @@
+name: build and test
+
+on:
+  push: { branches: [main] }
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false          # a Windows failure must not hide a Linux pass
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}' }
+
+      - name: Build the addon (no external dependencies)
+        working-directory: prototype
+        run: npx --yes node-gyp configure build
+
+      - name: Core suite
+        working-directory: prototype
+        shell: bash
+        run: |
+          fail=0
+          for t in test.js api_test.js codec_test.js prim_test.js json_fastpath_test.js \
+                   v8codec_test.js storage_modes_test.js namespace_test.js \
+                   review_regression_test.js gaps_test.js typeflow_test.js; do
+            echo "--- $t"
+            node "$t" || { echo "FAILED: $t"; fail=1; }
+          done
+          exit $fail
+
+      - name: Cross-process behaviour
+        working-directory: prototype
+        shell: bash
+        run: |
+          node cluster_api_test.js
+          node protect.js
+          node hints.js
+
+      - name: Concurrency stress (cross-process, zero torn reads expected)
+        working-directory: prototype
+        shell: bash
+        run: |
+          ARENA=4194304 NKEYS=2000 WORKERS=4 SECONDS=6 node multiproc.js | tee /tmp/mp.txt
+          grep -q "CORRUPT/TORN READS: 0" /tmp/mp.txt
+
+  sanitizers:
+    name: TSan + ASan + UBSan (POSIX only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+      # TSAN does not exist for MSVC, so the gate over the lock-free read path
+      # can only run on POSIX. That is why Linux/macOS are the platforms of
+      # record for concurrency verification.
+      - name: Sanitizer gate
+        working-directory: prototype/tsan
+        run: ./run_sanitizers.sh
+
+  lz4-optional:
+    name: opt-in LZ4 build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+      - run: sudo apt-get update && sudo apt-get install -y liblz4-dev
+      - name: Build with --turbocache_lz4=1 and verify compression works
+        working-directory: prototype
+        run: |
+          npx --yes node-gyp configure build --turbocache_lz4=1
+          node -e "
+            const n=require('./build/Release/l2.node');
+            if (!n.hasLz4()) { console.error('hasLz4() false in an LZ4 build'); process.exit(1); }
+            n.create('/tcci'+process.pid, 16<<20, 1<<16, 2); n.setCompressMin(256,1);
+            const v='{'+Array.from({length:200},(_,i)=>'\"k'+i+'\":'+i).join(',')+'}';
+            n.set('c', v, 0,0,0);
+            if (n.get('c') !== v) { console.error('compressed round-trip failed'); process.exit(1); }
+            console.log('compressed round-trip ok');
+          "

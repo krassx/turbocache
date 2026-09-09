@@ -13,8 +13,15 @@ l2.create(NAME, 4 << 20, 1 << 12, 2);
 l2.set('hello', 'world');
 const r = spawnSync(process.execPath, [__filename, 'child', NAME], { stdio: 'inherit' });
 console.log(`\n  child exit: status=${r.status} signal=${r.signal}`);
-console.log(r.signal === 'SIGBUS' || r.signal === 'SIGSEGV'
+// POSIX raises SIGBUS/SIGSEGV on a write to a read-only mapping. Windows has no
+// signals: the write raises EXCEPTION_ACCESS_VIOLATION and the process exits
+// with 0xC0000005 (surfaced by Node as 3221225477, or as a negative status).
+const faulted = process.platform === 'win32'
+    ? (r.status === 3221225477 || r.status === -1073741819 || r.status === null)
+    : (r.signal === 'SIGBUS' || r.signal === 'SIGSEGV');
+console.log(faulted
   ? '  PASS: worker write faulted - the arena is protected by the MMU, not by convention'
-  : `  FAIL: expected SIGBUS/SIGSEGV, got status=${r.status} signal=${r.signal}`);
+  : `  FAIL: expected a memory fault, got status=${r.status} signal=${r.signal}`);
+if (!faulted) process.exitCode = 1;
 console.log('  primary still reads:', l2.get('hello'));
 l2.destroy();

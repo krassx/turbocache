@@ -9,9 +9,7 @@ static inline uint64_t align8(uint64_t v) { return (v + 7) & ~7ull; }
 
 // Milliseconds since this arena was created. uint32 gives ~49 days of TTL range.
 static inline uint32_t nowRelMs(const Store &s) {
-  struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-  uint64_t nowMs = (uint64_t)ts.tv_sec * 1000ull + ts.tv_nsec / 1000000ull;
-  return (uint32_t)(nowMs - s.h->epochMs);
+  return (uint32_t)(nowMs() - s.h->epochMs);
 }
 
 struct ReadResult {
