@@ -651,11 +651,12 @@ verbatim and bugsee's JSON-only API must still encode.
 
 **Cluster, 1 primary + 4 workers** — this is where the architectures separate.
 
-| workers | turbocache | hit rate | bugsee | hit rate |
+| workers | turbocache (`bytes`) | hit rate | bugsee | hit rate |
 |---|---|---|---|---|
-| 1 | 212k ops/s | 82.2% | 62k ops/s | 82.2% |
-| 2 | 381k ops/s | 87.3% | 87k ops/s | 69.1% |
-| 4 | **674k ops/s** | **91.8%** | 79k ops/s | 30.6% |
+| 1 | 213k ops/s | 80.4% | 57k ops/s | 80.4% |
+| 2 | 374k ops/s | 85.7% | 89k ops/s | 68.4% |
+| 4 | 666k ops/s | 90.5% | 80k ops/s | 30.2% |
+| 8 | **1,040k ops/s** | **94.1%** | **42k ops/s** | **12.8%** |
 
 turbocache scales close to linearly because reads never touch the primary.
 bugsee plateaus near 80k regardless of worker count: every L1 miss is an IPC
