@@ -27,6 +27,11 @@ class TurboCache {
     #ns = '';
     #nsId = 0;
     #maxValue = 0;
+    #timer = null;
+    #sweepCursor = 0;
+    #drainTicks = 0;
+    #staleMs = 5000;
+    #primaryDead = false;
     #keyMax = 1024;
     // Native expiry is milliseconds from the arena's creation time.
     #arenaEpochMs = 0;
@@ -70,6 +75,7 @@ class TurboCache {
         instances.add(this);
         this.#l1Max = opts.l1MaxBytes || 2 * 1024 * 1024;
         this.#outboxMaxBytes = opts.outboxMaxBytes || (1 << 20);
+        this.#staleMs = opts.primaryStaleMs || 5000;
         this.#id = opts.workerId || 0;
         this.#attached = opts.attached !== false;
         // 'primitives' mode: accept only string/number/boolean/null. Buys three
@@ -311,7 +317,9 @@ class TurboCache {
         if (!native.create(name, arenaBytes, indexSlots, 2)) throw new Error('arena create failed');
         native.setCompressMin(1 << 30);                 // compression off, per DESIGN.md
         storeReady = true;
-        return new TurboCache({ ...opts, workerId: 0 });
+        const c = new TurboCache({ ...opts, workerId: 0 });
+        c._startMaintenance(opts);
+        return c;
     }
     static attachWorker(name, workerId, opts = {}) {
         if (!native.attach(name)) throw new Error('arena attach failed');
@@ -374,6 +382,16 @@ class TurboCache {
     // unchanged, before paying for a real drain.
     #drain() {
         if (this.#id === 0) return;
+        // A dead primary cannot invalidate anything, so the arena is frozen and
+        // increasingly stale. Degrade to L1-only rather than serve it silently.
+        if (!this.#primaryDead && ++this.#drainTicks >= 256) {
+            this.#drainTicks = 0;
+            const age = native.heartbeatAgeMs();
+            if (age > this.#staleMs) {
+                this.#primaryDead = true;
+                this.lastError = `primary heartbeat is ${age}ms old; serving L1 only`;
+            }
+        }
         if (native.ringHead() === this.#cursor) return;
         const r = native.ringRead(this.#cursor, 512);
         if (r.wrapped) {                       // fell too far behind: flush wholesale
@@ -407,10 +425,14 @@ class TurboCache {
         if (e !== undefined && e.exp && e.exp <= Date.now()) { this.#l1Drop(key); }
         else if (e !== undefined) {
             e.hits++; this.stats.l1Hits++;
+            // Binary is copied on every read (decision 7): it is mutable, and
+            // L1 hands out the same entry to every caller in this process.
+            if (Buffer.isBuffer(e.v)) return Buffer.from(e.v);
             // l1Decoded: hand back the cached object (free, but shared/frozen).
             // Otherwise decode per read, giving each caller a fresh mutable one.
             return this.#l1Decoded ? e.v : this.#codec.decode(e.v);
         }
+        if (this.#primaryDead) { this.stats.misses++; return undefined; }
         const raw = native.get(key);
         if (raw === undefined) { this.stats.misses++; return undefined; }
         this.stats.l2Hits++;
@@ -426,7 +448,9 @@ class TurboCache {
         let v = raw;
         if (this.#codec) { v = this.#codec.decode(raw); if (this.#freeze) TurboCache.deepFreeze(v); }
         this.#l1Put(key, v, native.hashKey(key), this.#primitives ? 0 : raw.length, expMs);
-        return v;
+        // The L2 path used to return the very object it just placed in L1, so a
+        // caller mutating a binary result corrupted the cached copy.
+        return Buffer.isBuffer(v) ? Buffer.from(v) : v;
     }
 
     // Always returns a boolean and never throws, so a caller may ignore the
@@ -448,8 +472,12 @@ class TurboCache {
         }
         if (this.#primitives) {
             const t = typeof value;
+            // Binary values are accepted alongside the primitives: decision 4
+            // lists Buffer/Uint8Array/ArrayBuffer, and they are byte-shaped
+            // rather than object-shaped, so they need no codec.
+            const isBinary = ArrayBuffer.isView(value) || value instanceof ArrayBuffer;
             // BigInt is a primitive too, and immutable, so it belongs here.
-            if (t !== 'string' && t !== 'number' && t !== 'boolean' && t !== 'bigint' && value !== null) {
+            if (!isBinary && t !== 'string' && t !== 'number' && t !== 'boolean' && t !== 'bigint' && value !== null) {
                 this.stats.rejectedType++;
                 this.lastError = `primitives mode accepts string/number/boolean/bigint/null, got ${t}`;
                 return false;
@@ -459,6 +487,12 @@ class TurboCache {
                 // substring of an 8MB document retains all 8MB (measured).
                 // Flattening costs ~42ns and makes the accounting honest.
                 value = native.flatten(value);
+            } else if (isBinary) {
+                // Decision 7: binary values are mutable, so the cache keeps its
+                // own copy rather than sharing the caller's.
+                value = Buffer.from(ArrayBuffer.isView(value)
+                    ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+                    : new Uint8Array(value));
             }
         }
         // Encode once: L2 needs bytes regardless, so this is not extra work.
@@ -492,7 +526,8 @@ class TurboCache {
         // and reported as success.
         // UTF-8 BYTES, not UTF-16 units: the old check accepted values the
         // primary then rejected, destroying the previous value silently.
-        const encLen = typeof enc === 'string' ? Buffer.byteLength(enc) : 8;
+        const encLen = typeof enc === 'string' ? Buffer.byteLength(enc)
+            : (Buffer.isBuffer(enc) ? enc.length : 8);
         if (encLen + key.length + 48 > this.#maxValue) {
             this.stats.rejectedSize++;
             this.lastError = `value ${encLen}B exceeds the ${this.#maxValue}B arena limit`;
@@ -566,6 +601,46 @@ class TurboCache {
         this.#schedule(48);
     }
 
+    // Atomic increment. The primary is the sole writer, so on the primary this
+    // is genuinely atomic and returns the NEW value. In a worker the write is
+    // applied a tick later, so the result cannot be known synchronously without
+    // a round trip that does not exist yet: the delta is queued and undefined
+    // is returned. Read it back with get() once applied.
+    //
+    // A missing key counts as zero. Returns false if the key holds a non-numeric
+    // value, matching set()'s "accepted" contract.
+    incr(key, by = 1, opts) {
+        const full = this.#ns + key;
+        const ttlMs = Math.max(0, Math.min(opts && opts.ttlMs || 0, 0x7fffffff));
+        if (Buffer.byteLength(full) > this.#keyMax) {
+            this.stats.rejectedKey = (this.stats.rejectedKey || 0) + 1;
+            this.lastError = 'key too long';
+            return false;
+        }
+        this.#l1Drop(full);                     // the arena becomes authoritative
+        if (this.#id === 0) {
+            const v = native.incr(full, by, 0, ttlMs, this.#nsId);
+            if (v === undefined) { this.lastError = 'incr on a non-numeric value'; return false; }
+            return v;
+        }
+        this.#outbox.push('i', full, by, ttlMs, this.#nsId);
+        this.#schedule(full.length + 48);
+        this.stats.incrQueued = (this.stats.incrQueued || 0) + 1;
+        return undefined;                       // queued; read it back with get()
+    }
+
+    // Compare-and-set on a numeric value. Primary-only: a queued CAS whose
+    // outcome the caller never learns is not a CAS, so a worker gets an error
+    // rather than a misleading `true`.
+    cas(key, expected, next) {
+        if (this.#id !== 0)
+            throw new Error('cas() is primary-only: a worker cannot learn the outcome ' +
+                            'of a write applied a tick later');
+        const full = this.#ns + key;
+        this.#l1Drop(full);
+        return native.cas(full, expected, next, 0) === true;
+    }
+
     // Drops every entry of THIS cache's namespace, leaving other namespaces
     // untouched. The blunt clearAll() wipes the whole arena.
     clearNamespace() {
@@ -607,8 +682,38 @@ class TurboCache {
         }
     }
 
+    // The primary stamps a heartbeat and reclaims expired entries on a timer.
+    // Expiry was lazy only, so an expired entry held its index slot and arena
+    // bytes until the tail reached it; and heartbeatNs was never written, so a
+    // worker could not tell a live arena from one whose primary had died.
+    _startMaintenance(opts = {}) {
+        if (this.#id !== 0 || opts.maintenance === false) return;
+        const everyMs = opts.maintenanceMs || 500;
+        // Size the slice so a full pass over the index completes in a bounded
+        // time regardless of index size. A fixed slice covered only ~3% of a
+        // 1M-slot index per second, so expired entries lingered for minutes.
+        const fullPassMs = opts.sweepFullPassMs || 30000;
+        const slots = (native.stats() || {}).indexSlots || 65536;
+        const slice = opts.sweepSlots ||
+            Math.max(1024, Math.ceil(slots / Math.max(1, fullPassMs / everyMs)));
+        native.heartbeat();
+        this.#timer = setInterval(() => {
+            native.heartbeat();
+            const r = native.sweepExpired(this.#sweepCursor, slice);
+            if (!r) return;
+            this.#sweepCursor = r.cursor;
+            this.stats.expired = (this.stats.expired || 0) + r.removed;
+        }, everyMs);
+        if (this.#timer.unref) this.#timer.unref();   // never holds the process open
+    }
+
+    // Milliseconds since the primary last stamped the arena, or -1 if it never
+    // has. A worker seeing a large value stops trusting L2.
+    static primaryAgeMs() { return native.heartbeatAgeMs(); }
+
     close() {
         this.stopGuard();
+        if (this.#timer) { clearInterval(this.#timer); this.#timer = null; }
         instances.delete(this);
         if (this.#id === 0 && storeReady) { native.destroy(); storeReady = false; }
     }
@@ -659,6 +764,7 @@ class TurboCache {
             else if (op === 'd') { native.del(key, msg.id); TurboCache.#localDrop(key); }
             else if (op === 'c') { native.clearAll(msg.id); for (const c of instances) c.clearLocal(); }
             else if (op === 'n') { native.clearNamespace(b[i + 4], msg.id); for (const c of instances) c.clearLocal(); }
+            else if (op === 'i') { native.incr(key, b[i + 2], msg.id, b[i + 3], b[i + 4]); TurboCache.#localDrop(key); }
         }
     }
 

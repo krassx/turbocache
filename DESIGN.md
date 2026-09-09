@@ -59,6 +59,9 @@ class Cache {
   clearNamespace(): void;      // just this cache's namespace
   close(): void;
 
+  incr(key: string, by?: number, opts?: { ttlMs?: number }): number | undefined | false;
+  cas(key: string, expected: number, next: number): boolean;   // primary only
+
   keys(opts?: { limit?, batch? }): Iterable<string>;   // this namespace
   readonly size: number;                               // live entries here
 
@@ -70,6 +73,7 @@ class Cache {
   static install(cluster): void;
   static namespaceStats(): Array<{name, id, bytes, quota, protected, dropped}>;
   static arenaStats(): { live, evictions, liveBytes, dataBytes, ... };
+  static primaryAgeMs(): number;   // ms since the primary last stamped the arena
 }
 ```
 
@@ -115,6 +119,26 @@ a worker and the primary disagreed about the same absent key.
 key text. Decision 3 named this as a benefit of verifying keys with `memcmp`,
 but nothing ever exposed it, so there was no way to see what a cache held. It is
 O(index slots) and meant for operations, not the hot path.
+
+**Values may be binary.** `Buffer`, any `TypedArray`, `ArrayBuffer` and
+`DataView` are accepted by `primitives` mode and stored as raw bytes. They come
+back as a `Buffer` (a `Uint8Array` subclass, so `instanceof` still holds) and are
+**copied on every read** — decision 7's rule for mutable values, applied on both
+the L1 and the L2 refill path.
+
+**`incr` and `cas` are atomic, because there is only one writer.** On the primary
+`incr` returns the new value and `cas` returns whether it replaced. In a worker
+the write is applied a tick later, so:
+
+- `incr` **queues the delta** and returns `undefined`; read the value back with
+  `get()`. Queuing a *delta* rather than a value is what makes it lossless —
+  measured: 4 workers x 500 concurrent increments produce exactly 2000.
+- `cas` **throws** in a worker. A queued compare-and-set whose outcome the caller
+  never learns is not a compare-and-set, so it is primary-only rather than
+  quietly returning a misleading `true`.
+
+A missing key counts as zero. `incr` returns `false` if the key holds a
+non-numeric value, matching `set`'s "accepted" contract.
 
 **TTL is enforced in both tiers.** The arena expires lazily on read, but an L1
 hit never reaches the arena, so L1 entries carry their own expiry. Without that,
@@ -1372,10 +1396,11 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 
 ### Decisions that need a call
 
-1. **Atomic read-modify-write** (`incr`, `cas`). Out of scope so far. With a
-   single writer these are genuinely easy — the primary can serialise them — but
-   the API shape (return the new value? a `Promise` for a worker, since the write
-   is batched?) has not been decided.
+1. ~~**Atomic read-modify-write.**~~ **Done** — see §2. The shape settled as:
+   `incr` returns the new value on the primary and queues a delta (returning
+   `undefined`) in a worker; `cas` is primary-only and throws in a worker rather
+   than returning an outcome it cannot know. Remaining wart: `incr`'s return type
+   differs by process role, which only an async request/response path would fix.
 2. ~~**Namespaces share one eviction budget.**~~ **Solved** — soft per-namespace
    quotas enforced through the eviction path, plus `clearNamespace()`. See §9.
    Remaining: the namespace table is a fixed 16 entries, and quotas are not
@@ -1402,16 +1427,21 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 
 ### Unbuilt
 
-8. **`Buffer` / `Uint8Array` / `ArrayBuffer` as first-class values.** Decision 4
-   lists them; the native layer handles only strings and scalars, so
-   `primitives` mode rejects them today.
+8. ~~**Binary values.**~~ **Done** — `Buffer`, `TypedArray`, `ArrayBuffer` and
+   `DataView` are stored as raw bytes under `FLAG_BINARY` and returned as a
+   copied `Buffer`.
 9. **The L3 (Valkey) seam.** Nothing exists. It is the reason the async method
-   variants were reserved.
-10. **TTL sweeping.** Expiry is lazy on read in both tiers, so an expired entry
-    occupies arena space until the tail reaches it and `live` drifts high. No
-    background sweep.
-11. **Primary-crash detection.** The `heartbeatNs` header field exists and is
-    never written or read, so a worker cannot tell a stale arena from a live one.
+   variants were reserved — and the reason a worker's `incr` cannot return a
+   value, since there is no request/response path over IPC.
+10. ~~**TTL sweeping.**~~ **Done** — the primary sweeps a slice of the index on a
+    timer, sized so a full pass completes in a bounded time (a fixed slice
+    covered only ~3% of a 1M-slot index per second). Reclaimed entries append to
+    the invalidation ring so workers drop their L1 copies.
+11. ~~**Primary-crash detection.**~~ **Done** — the primary stamps `heartbeatNs`
+    on each maintenance tick; a worker whose drain sees a stale heartbeat sets
+    `#primaryDead`, stops consulting L2 and serves L1 only. Still open: nothing
+    *recovers* when a new primary appears; the worker stays degraded until
+    restarted.
 12. **Windows.** Needs `CreateFileMapping` — a second shared-memory
     implementation.
 

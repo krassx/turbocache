@@ -103,6 +103,38 @@ static napi_value Set(napi_env env, napi_callback_info info) {
   } else if (vt == napi_boolean) {
     bool bv = false; napi_get_value_bool(env, argv[1], &bv);
     scratch[0] = bv ? 1 : 0; vlen = 1; flags = FLAG_BOOL;
+  } else if (vt == napi_object &&
+             ({ bool isBuf = false, isTa = false, isAb = false, isDv = false;
+                napi_is_buffer(env, argv[1], &isBuf);
+                napi_is_typedarray(env, argv[1], &isTa);
+                napi_is_arraybuffer(env, argv[1], &isAb);
+                napi_is_dataview(env, argv[1], &isDv);
+                isBuf || isTa || isAb || isDv; })) {
+    // Binary values. Decision 4 lists Buffer/Uint8Array/ArrayBuffer as accepted
+    // value types; the native layer only ever handled strings and scalars, so
+    // primitives mode rejected them. Stored as raw bytes.
+    void *data = nullptr; size_t len = 0;
+    bool isBuf = false, isTa = false, isAb = false;
+    napi_is_buffer(env, argv[1], &isBuf);
+    napi_is_typedarray(env, argv[1], &isTa);
+    napi_is_arraybuffer(env, argv[1], &isAb);
+    if (isBuf) { napi_get_buffer_info(env, argv[1], &data, &len); }
+    else if (isTa) {
+      napi_typedarray_type t; size_t n = 0; napi_value ab; size_t off = 0;
+      napi_get_typedarray_info(env, argv[1], &t, &n, &data, &ab, &off);
+      size_t elem = 1;
+      switch (t) {
+        case napi_int16_array: case napi_uint16_array: elem = 2; break;
+        case napi_int32_array: case napi_uint32_array: case napi_float32_array: elem = 4; break;
+        case napi_float64_array: case napi_bigint64_array: case napi_biguint64_array: elem = 8; break;
+        default: elem = 1;
+      }
+      len = n * elem;
+    } else if (isAb) { napi_get_arraybuffer_info(env, argv[1], &data, &len); }
+    else { napi_get_dataview_info(env, argv[1], &len, &data, nullptr, nullptr); }
+    if (!data || len + 1 > SCRATCH) { napi_value r; napi_get_boolean(env, false, &r); return r; }
+    memcpy(scratch, data, len);
+    vlen = len; flags = FLAG_BINARY;
   } else if (vt == napi_bigint) {
     // Arbitrary precision: sign byte followed by 64-bit words, little-endian.
     // Querying the word count requires BOTH sign_bit and words to be null;
@@ -161,6 +193,12 @@ static napi_value Get(napi_env env, napi_callback_info info) {
     double d = 0; memcpy(&d, src, sizeof(d)); napi_create_double(env, d, &out);
   } else if (rr.flags & FLAG_BOOL) {
     napi_get_boolean(env, src[0] != 0, &out);
+  } else if (rr.flags & FLAG_BINARY) {
+    // Always handed back as a fresh Buffer. Decision 7 copies binary values on
+    // every read because they are mutable and L1 shares its entry; a Buffer is
+    // a Uint8Array subclass, so instanceof checks still hold.
+    void *dst = nullptr;
+    if (napi_create_buffer_copy(env, rr.rawLen, src, &dst, &out) != napi_ok) return nullptr;
   } else if (rr.flags & FLAG_BIGINT) {
     if (napi_create_bigint_words(env, (int)src[0], (rr.rawLen - 1) / 8,
                                  (const uint64_t *)(src + 1), &out) != napi_ok) return nullptr;
@@ -236,6 +274,92 @@ static napi_value ClearNamespace(napi_env env, napi_callback_info info) {
 // Enumeration is possible because entries store the key text - decision 3 named
 // this as a benefit of verifying keys, but nothing ever exposed it, so there
 // was no way to see what a cache actually held.
+// sweepExpired(cursorSlot, maxSlots) -> { removed, cursor, done }
+// Expiry was lazy only, so an expired entry held its index slot and arena bytes
+// until the tail happened to reach it, and `live` drifted high. The primary is
+// the sole writer, so it can reclaim them directly.
+static napi_value Incr(napi_env env, napi_callback_info info) {
+  ARG(5)
+  NEED_STORE(nullptr)
+  char key[KEY_MAX + 1]; size_t klen = 0;
+  if (!readKey(env, argv[0], key, &klen)) return nullptr;
+  double by = 1; napi_get_value_double(env, argv[1], &by);
+  int32_t writerId = 0, ttlMs = 0, ns = 0;
+  napi_get_value_int32(env, argv[2], &writerId);
+  napi_get_value_int32(env, argv[3], &ttlMs);
+  napi_get_value_int32(env, argv[4], &ns);
+  uint32_t expiresAt = ttlMs > 0 ? nowRelMs(g) + (uint32_t)ttlMs : 0;
+  double out = 0;
+  if (!storeIncr(g, (const uint8_t *)key, (uint16_t)klen, by, expiresAt,
+                 (uint16_t)writerId, (uint8_t)ns, &out)) return nullptr;
+  napi_value r; napi_create_double(env, out, &r); return r;
+}
+
+static napi_value Cas(napi_env env, napi_callback_info info) {
+  ARG(4)
+  NEED_STORE(nullptr)
+  char key[KEY_MAX + 1]; size_t klen = 0;
+  if (!readKey(env, argv[0], key, &klen)) return nullptr;
+  double expected = 0, next = 0; int32_t writerId = 0;
+  napi_get_value_double(env, argv[1], &expected);
+  napi_get_value_double(env, argv[2], &next);
+  napi_get_value_int32(env, argv[3], &writerId);
+  napi_value r;
+  napi_get_boolean(env, storeCas(g, (const uint8_t *)key, (uint16_t)klen,
+                                 expected, next, (uint16_t)writerId), &r);
+  return r;
+}
+
+static napi_value SweepExpired(napi_env env, napi_callback_info info) {
+  ARG(2)
+  NEED_STORE(nullptr)
+  double cur = 0; int32_t maxSlots = 0;
+  napi_get_value_double(env, argv[0], &cur);
+  napi_get_value_int32(env, argv[1], &maxSlots);
+  Header *h = g.h;
+  uint32_t now = nowRelMs(g);
+  uint64_t i = (uint64_t)cur, scanned = 0, removed = 0;
+  for (; i < h->indexSlots && (int32_t)scanned < maxSlots; i++, scanned++) {
+    uint64_t hv = g.idx[i].hash.load(std::memory_order_relaxed);
+    if (hv == HASH_EMPTY || hv == HASH_TOMB) continue;
+    uint64_t pos = g.idx[i].off.load(std::memory_order_relaxed);
+    Entry *e = g.entryAt(pos);
+    if (!e->expiresAt || e->expiresAt > now) continue;
+    uint32_t bsz = e->blockSize; uint8_t ns = e->ns; uint64_t eh = e->hash;
+    indexRemove(g, i);
+    h->live--; h->liveBytes -= bsz; h->nsBytes[ns] -= bsz; h->evictions++;
+    ringAppend(g, eh, ++h->inserts, 0);      // workers must drop their L1 copy
+    removed++;
+    i--;                                     // backward shift may refill this slot
+  }
+  napi_value o; napi_create_object(env, &o);
+  put(env, o, "removed", (double)removed);
+  put(env, o, "cursor", (double)(i >= h->indexSlots ? 0 : i));
+  napi_value done; napi_get_boolean(env, i >= h->indexSlots, &done);
+  napi_set_named_property(env, o, "done", done);
+  return o;
+}
+
+// The primary stamps its liveness here; workers use it to notice a dead primary
+// and stop trusting the arena. The field existed but nothing ever wrote it.
+static napi_value Heartbeat(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
+  struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+  g.h->heartbeatNs.store((uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec,
+                         std::memory_order_release);
+  return nullptr;
+}
+static napi_value HeartbeatAgeMs(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
+  uint64_t hb = g.h->heartbeatNs.load(std::memory_order_acquire);
+  napi_value r;
+  if (!hb) { napi_create_double(env, -1, &r); return r; }   // never stamped
+  struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+  uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+  napi_create_double(env, now > hb ? (double)((now - hb) / 1000000ull) : 0, &r);
+  return r;
+}
+
 static napi_value ScanKeys(napi_env env, napi_callback_info info) {
   ARG(3)
   NEED_STORE(nullptr)
@@ -538,6 +662,19 @@ static napi_value PrimBytes(napi_env env, napi_callback_info info) {
     double d; napi_get_value_double(env, argv[0], &d);
     bool smi = d == (double)(int32_t)d && d >= -1073741824.0 && d <= 1073741823.0;
     bytes = smi ? 0 : 16;
+  } else if (t == napi_object) {
+    bool isBuf = false, isTa = false, isAb = false;
+    napi_is_buffer(env, argv[0], &isBuf);
+    napi_is_typedarray(env, argv[0], &isTa);
+    napi_is_arraybuffer(env, argv[0], &isAb);
+    if (isBuf || isTa || isAb) {
+      size_t len = 0; void *d = nullptr;
+      if (isBuf) napi_get_buffer_info(env, argv[0], &d, &len);
+      else if (isAb) napi_get_arraybuffer_info(env, argv[0], &d, &len);
+      else { napi_typedarray_type tt; size_t n = 0; napi_value ab; size_t off = 0;
+             napi_get_typedarray_info(env, argv[0], &tt, &n, &d, &ab, &off); len = n; }
+      bytes = (double)(len + 96);      // ArrayBuffer + view headers
+    }
   } else if (t == napi_bigint) {
     size_t words = 0;
     napi_get_value_bigint_words(env, argv[0], nullptr, &words, nullptr);
@@ -698,7 +835,7 @@ static napi_value Destroy(napi_env env, napi_callback_info) {
                        napi_set_named_property(env, exports, name, f); }
 static napi_value Init(napi_env env, napi_value exports) {
   FN("create", Create) FN("attach", Attach) FN("set", Set) FN("get", Get)
-  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("nsResolve", NsResolve) FN("clearNamespace", ClearNamespace) FN("nsStats", NsStats) FN("scanKeys", ScanKeys) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastExpiresAt", LastExpiresAt) FN("epochMs", EpochMs) FN("keyMaxBytes", KeyMaxBytes)
+  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("nsResolve", NsResolve) FN("clearNamespace", ClearNamespace) FN("nsStats", NsStats) FN("scanKeys", ScanKeys) FN("sweepExpired", SweepExpired) FN("incr", Incr) FN("cas", Cas) FN("heartbeat", Heartbeat) FN("heartbeatAgeMs", HeartbeatAgeMs) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastExpiresAt", LastExpiresAt) FN("epochMs", EpochMs) FN("keyMaxBytes", KeyMaxBytes)
   FN("destroy", Destroy) FN("poke", Poke)
   FN("suppressRefBit", SetSuppressRefBit) FN("secondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin)
   return exports;
