@@ -98,7 +98,7 @@ if (cluster.isPrimary) {
             // cost. Use the real presets.
             c = TurboCache.attachWorker(process.env.TC_ARENA, id, MODE === 'codec'
                 ? { l1MaxBytes: L1, codec: JSONC }
-                : { l1MaxBytes: L1, storage: 'primitives' });
+                : { l1MaxBytes: L1, storage: 'bytes' });
         } else {
             c = new (require(BUGSEE).Cache)({ l1MaxBytes: L1 });
         }

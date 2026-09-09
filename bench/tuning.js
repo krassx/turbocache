@@ -6,7 +6,7 @@ const { buildPlan, run } = require('./workload');
 
 let seq = 0;
 const mk = o => TurboCache.createPrimary('/tctune' + process.pid + '_' + (seq++), 64 << 20, 1 << 18,
-    { storage: 'primitives', l1MaxBytes: 256 * 1024, ...o });
+    { storage: 'bytes', l1MaxBytes: 256 * 1024, ...o });
 
 (async () => {
     console.log('=== second-chance budget: what does capping re-appends cost or buy? ===');

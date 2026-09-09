@@ -1,7 +1,7 @@
 const { TurboCache } = require('./turbocache');
 const native = require('./build/Release/l2.node');
 const c = TurboCache.createPrimary('/tctf' + process.pid, 32 << 20, 1 << 16,
-                                   { values: 'primitives', l1MaxBytes: 32 * 1024 });
+                                   { values: 'bytes', l1MaxBytes: 32 * 1024 });
 const cases = [['string', 'hello'], ['number', 42], ['float', 1.5], ['boolean', true], ['null', null]];
 console.log('  value    typeof in   L1 hit gives      reaches L2?   after L1 eviction');
 for (const [label, v] of cases) {

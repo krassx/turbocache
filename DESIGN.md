@@ -40,7 +40,7 @@ const other = Cache.open({ namespace: { name: 'sessions', quotaBytes: 32 << 20 }
 ```ts
 class Cache {
   constructor(opts?: {
-    storage?: 'primitives' | 'direct' | 'safe';   // default 'primitives'
+    storage?: 'bytes' | 'direct' | 'safe';        // default 'bytes'
     namespace?: string;        // prefixed into the key
     l1MaxBytes?: number;       // default: heapLimit x 0.5%, clamped 512KB..2MB
     arenaBytes?: number;       // default: totalRAM x 1%, clamped 16MB..128MB
@@ -121,7 +121,7 @@ but nothing ever exposed it, so there was no way to see what a cache held. It is
 O(index slots) and meant for operations, not the hot path.
 
 **Values may be binary.** `Buffer`, any `TypedArray`, `ArrayBuffer` and
-`DataView` are accepted by `primitives` mode and stored as raw bytes. They come
+`DataView` are accepted by `bytes` mode and stored as raw bytes. They come
 back as a `Buffer` (a `Uint8Array` subclass, so `instanceof` still holds) and are
 **copied on every read** — decision 7's rule for mutable values, applied on both
 the L1 and the L2 refill path.
@@ -844,7 +844,7 @@ L1 hit — 291k versus 1,583k measured.
 
 | mode | L1 holds | accounting | aliasing | L1 hit cost |
 |---|---|---|---|---|
-| **primitives** | the primitive | **exact** | **none** | free |
+| **bytes** | the value's bytes | **exact** | **none** | free |
 | JSON-always (the bugsee design) | JSON string | exact | none | parse per hit |
 | codec, decoded L1 | decoded object | `heapFactor` estimate | **yes** | free |
 
@@ -1042,7 +1042,7 @@ were invisible to other workers — while `get` looked correct until then), and
 
 Measured end to end — set, forced L1 eviction, read back through the arena.
 
-| input | `primitives` | codec: JSON | codec: `v8.serialize` |
+| input | `bytes` | codec: JSON | codec: `v8.serialize` |
 |---|---|---|---|
 | string / number / boolean / null | exact | exact | exact |
 | `BigInt` | exact | rejected | exact |
@@ -1072,11 +1072,35 @@ kept in L1 beside the object. Freezing is three orders of magnitude cheaper than
 either. V8 structured serialization still earns a place — not as a per-read
 clone, but as a **codec**, where it encodes to bytes for L2 exactly as JSON does.
 
+### Why the codec-free mode is called `bytes`, not `primitives`
+
+It was called `primitives` and then accepted `Buffer` and `TypedArray`, which are
+not primitives. That was incoherent, and the cause was ordering: decision 4 fixed
+the accepted value types before the three storage modes existed, so when binary
+support finally landed it was attached to the only codec-free mode without
+revisiting the name.
+
+Removing binary from it would have been worse. Bytes are the most directly
+storable thing there is, and the alternative is routing them through a
+serializer:
+
+| 4KB `Buffer` | set | get |
+|---|---|---|
+| codec-free path | **861ns** | **906ns** |
+| via `direct` (v8 codec) | 4598ns | 3531ns |
+
+5.3x on writes and 3.9x on reads to serialise something that is already bytes.
+
+So the behaviour was right and the name was wrong. The mode means **no codec:
+the native layer encodes the value itself** — scalars become their byte
+representation, binary is stored verbatim, and anything that would need a codec
+is rejected loudly. `'primitives'` is still accepted as a legacy alias.
+
 ### Storage modes
 
-`storage: 'primitives' | 'direct' | 'safe'`.
+`storage: 'bytes' | 'direct' | 'safe'`.
 
-| | `primitives` (default) | `direct` | `safe` |
+| | `bytes` (default) | `direct` | `safe` |
 |---|---|---|---|
 | accepts | scalars only, rejects rest | any structured-cloneable value | any JSON value |
 | encoding | none — the app owns it | `v8.serialize` | `JSON.stringify` |
@@ -1105,13 +1129,13 @@ From `bench/modes_report.js`, which is repeatable.
 
 | | exact | silently converted | rejected | lost |
 |---|---|---|---|---|
-| `primitives` | 11/18 | **0** | 7 | 0 |
+| `bytes` | 11/18 | **0** | 7 | 0 |
 | `direct` | **18/18** | **0** | 0 | 0 |
 | `safe` | 9/18 | **8** | 1 | 0 |
 
 **Safety** — can a caller corrupt the cache?
 
-| vector | `primitives` | `direct` | `safe` |
+| vector | `bytes` | `direct` | `safe` |
 |---|---|---|---|
 | mutate the object passed to `set` | n/a | safe | safe |
 | mutate the `get()` result | n/a | throws | safe |
@@ -1125,7 +1149,7 @@ in every mode; a read-only worker reads 200/200 correctly in every mode.
 
 **Performance** — 200k ops, throughput / p50:
 
-| workload | `primitives` | `direct` | `safe` |
+| workload | `bytes` | `direct` | `safe` |
 |---|---|---|---|
 | reads dominate, fits L1 | 431k / 1209ns | **1196k / 42ns** | 430k / 1208ns |
 | mixed 90/10, exceeds L1 | **351k** / 1875ns | 174k / 2917ns | 318k / 2000ns |
@@ -1374,14 +1398,14 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 | 15 | Current LTS, darwin + linux, x64 + arm64 | Windows in v1 | Windows needs `CreateFileMapping` — a second shared-memory implementation |
 | 17 | **No background compaction** | async compress-on-the-threadpool with version-validated apply | Built and proven race-safe (18k stale captures correctly discarded, 0 wrong values), but worth only +1.9 points of hit rate at 3x read latency, while doubling the arena buys +6.9 points at no cost. Restricting to cold entries removes the latency penalty *and* the entire benefit. |
 | 31 | **Modes are chosen by read/write ratio and type needs, not by a global default** | pick one mode for everyone | Measured across four dimensions: `direct` is lossless (18/18 types exact) and 2.8x faster than `primitives` when reads dominate, but 3.8x slower when writes do; `safe` silently converts 8 of 18 types but gives fresh mutable results and cheap writes; `primitives` never converts, refusing instead. All three are consistent L1-to-L2 and cross-process. |
-| 30 | **Three named storage modes: `primitives`, `direct`, `safe`** | one mode with codec/freeze/isolate knobs | The knobs are still there, but the presets name the tradeoff being accepted. Measured, the ranking inverts by workload: `direct` 585k vs `safe` 433k when L1 hits dominate, and 175k vs 307k when writes and misses do, so neither is a default for everyone. `direct` carries one hole JS cannot close: typed-array contents cannot be frozen. |
+| 30 | **Three named storage modes: `bytes`, `direct`, `safe`** | one mode with codec/freeze/isolate knobs | The knobs are still there, but the presets name the tradeoff being accepted. Measured, the ranking inverts by workload: `direct` 585k vs `safe` 433k when L1 hits dominate, and 175k vs 307k when writes and misses do, so neither is a default for everyone. `direct` carries one hole JS cannot close: typed-array contents cannot be frozen. |
 | 29 | **BigInt accepted in primitives mode; rich types require the `v8.serialize` codec** | BigInt via text; JSON codec for everything | BigInt is a primitive and immutable, so excluding it was inconsistent; stored as sign byte plus 64-bit words for arbitrary precision. Date/Map/Set/TypedArray are rejected loudly by primitives mode and corrupted *silently* by JSON (Date to string, Map/Set to `{}`), so fidelity workloads must use the v8 codec. |
 | 28 | **Value type is tagged in the entry, not inferred** | strings only; encode everything to text | L2 is read by other processes, so the type must travel with the bytes. Before this, numbers and booleans never reached the arena - they lived in L1 only, vanished on eviction and were invisible to other workers, while `get` looked correct until then. `null` threw outright. Doubles are stored as raw bytes: exact for `-0`, `NaN`, `Infinity` and subnormals, and no parsing. |
 | 27 | **`structuredClone` rejected for per-read isolation; V8 serialization offered as a fidelity codec** | clone per read; JSON everywhere | Cloning per read is 2.0-2.4x slower than parsing the equivalent string and 1000x more than freezing, and Node 26 widens the gap. But JSON silently degrades eight common types (Date to string, Map/Set/RegExp to `{}`, NaN/Infinity to null, undefined dropped) and throws on cycles and BigInt, so a `v8.serialize` codec is offered for callers who need fidelity, at roughly 2-3x JSON's cost. |
 | 26 | **Codec mode isolates on set and freezes by default** | adopt the caller's object; document a do-not-mutate contract; deep-copy on every get | `set` adopting the caller's object let a caller corrupt L1 without calling `get`, and the value then silently reverted when L1 evicted. Isolation costs one decode per set; freezing costs ~24% and turns a silent corruption into a `TypeError`. Freezing delivers the same guarantee as parse-per-read at roughly twice the throughput (813k vs 413k), differing in ergonomics: shared-immutable rather than fresh-mutable. |
 | 25 | **A JSON replacer/space/reviver is never permitted; enforced, not documented** | rely on code review; document the rule only | A replacer costs 3.51x on Node 26 and indentation 2.11x, and an identity replacer produces byte-identical output so no output check can catch it. Enforced by a repo-wide balanced-paren lint plus a construction-time check on the caller-supplied codec, with `allowSlowCodec: true` as the deliberate escape hatch. |
 | 24 | **ASCII values stored and returned as one-byte strings; non-ASCII as UTF-8** | latin1 for everything (previous behaviour) | Fixes silent mangling of non-ASCII, and keeps ASCII on the representation Node 26's 34%-faster stringify fast path favours. Node 26 penalises all-non-ASCII payloads 2.03x, worse in absolute terms than Node 24. |
-| 23 | **`values: 'primitives'` is the default mode; codec is opt-in** | codec everywhere; JSON-always like bugsee; accept objects natively | Primitives make accounting exact (verified within 1% against measured heap), remove the aliasing hazard entirely, and need no codec. Costs ~20% for flattening plus exact sizing, and pushes object workloads onto a decode-per-hit path. Requires flattening on insert: a cached 1MB substring otherwise retains an 8MB parent. |
+| 23 | **`values: 'bytes'` is the default mode; codec is opt-in** | codec everywhere; JSON-always like bugsee; accept objects natively | Primitives make accounting exact (verified within 1% against measured heap), remove the aliasing hazard entirely, and need no codec. Costs ~20% for flattening plus exact sizing, and pushes object workloads onto a decode-per-hit path. Requires flattening on insert: a cached 1MB substring otherwise retains an 8MB parent. |
 | 22 | **No per-object size measurement; a post-GC heap guard instead** | native structural size walk; `v8.serialize().length`; sampling `used_heap_size` directly | V8 exposes no per-object size outside a heap snapshot. A native walk was built and is -14% to -26% accurate against +/-7% for `encodedBytes x 3`, at 5825ns versus free. Bounding live heap after a GC bounds the thing that actually matters: retained heap 445MB to 121MB where the byte budget bound nothing. |
 | 21 | **Optional caller-supplied codec; L1 caches decoded values, L2 stores bytes** | app owns the codec (L1 caches encoded strings); built-in JSON mode; accept the limitation | Resolves the decision 4/5 conflict by applying each at its own boundary. 3.6x on L1-resident object workloads, p50 1334ns to 42ns. Costs a documented aliasing contract (or 25-30% for `freeze: true`) and turns the L1 byte cap into a `heapFactor`-scaled estimate, measured at 2.79-3.21x for JSON-shaped objects. |
 | 20 | **Arena sizing and `indexSlots` validated at create time** | trust the caller | A too-small segment underflowed into a hang; a non-power-of-two slot count breaks the probe mask |
@@ -1455,7 +1479,7 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
     estimator that lost to `encodedBytes x 3` are all still compiled in, along
     with test-only hooks (`poke`, `suppressRefBit`, `backwardShift`,
     `clearHints`, `probe`) that sit on the same surface as `get` and `set`.
-18. **`primitives` mode copies every string value on `set`.** `flatten` is
+18. **`bytes` mode copies every string value on `set`.** `flatten` is
     unconditional because Node-API cannot tell a flat string from a slice, and a
     slice of any size can retain an arbitrarily large parent. That is the right
     default for correctness, but it is an allocation per write.

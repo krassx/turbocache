@@ -34,5 +34,5 @@ function scenario(title, opts, prim) {
 scenario('codec, isolate:false  (adopts the caller object)', { codec: JSONC, isolate: false });
 scenario('codec, isolate:true   (default now)', { codec: JSONC });
 scenario('codec, isolate + freeze', { codec: JSONC, freeze: true });
-scenario('primitives  (default mode; app parses, like the bugsee design)', { values: 'primitives' }, true);
+scenario('bytes  (default mode; app parses, like the bugsee design)', { values: 'bytes' }, true);
 console.log('\n  "viewer" everywhere = the cache was never corrupted.');

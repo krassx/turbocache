@@ -9,7 +9,7 @@ console.log('  values  keyspace   order        L2 hit (getLen, no JS string)   f
 for (const bytes of [64, 1024]) {
     for (const [nkeys, arena] of [[2000, 64 << 20], [200000, 512 << 20]]) {
         const c = TurboCache.createPrimary('/tcl2' + process.pid + '_' + (seq++), arena, 1 << 20,
-            { storage: 'primitives', l1MaxBytes: 4096 });     // L1 tiny: measure L2
+            { storage: 'bytes', l1MaxBytes: 4096 });     // L1 tiny: measure L2
         const val = 'x'.repeat(bytes);
         const keys = Array.from({ length: nkeys }, (_, i) => 'key:' + i);
         for (const k of keys) c.set(k, val);

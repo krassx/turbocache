@@ -48,7 +48,7 @@ function probe(cache, make) {
     return describe(got);
 }
 
-const modes = [['primitives', { values: 'primitives' }], ['codec: JSON', { codec: JSONC }], ['codec: v8', { codec: V8C }]];
+const modes = [['bytes', { values: 'bytes' }], ['codec: JSON', { codec: JSONC }], ['codec: v8', { codec: V8C }]];
 console.log('  input        ' + modes.map(m => m[0].padEnd(24)).join(''));
 for (const [label, make] of Object.entries(values)) {
     const row = modes.map(([, opts]) => { const c = mk(opts); const r = probe(c, make); TurboCache.native().destroy(); return r.padEnd(24); });

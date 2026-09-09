@@ -78,7 +78,7 @@ const fresh = (opts) => TurboCache.createPrimary('/tc-sng-' + process.pid + '-' 
     let tcC = fresh();
     report('turbocache (raw bytes)', await run(tcStr(tcC), planC, 256, NOYIELD));
     TurboCache.native().destroy();
-    tcC = fresh({ values: 'primitives', l1MaxBytes: L1 });
+    tcC = fresh({ values: 'bytes', l1MaxBytes: L1 });
     report('turbocache (primitives)', await run(tcStr(tcC), planC, 256, NOYIELD),
            'exact accounting + flatten');
     TurboCache.native().destroy();

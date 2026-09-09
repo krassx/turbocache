@@ -23,4 +23,4 @@ function run(label, opts, ops) {
 
 run('codec mode, working set fits in L1', { codec: COUNTING, l1MaxBytes: 4 << 20 }, 5000);
 run('codec mode, tiny L1 (forces L2 reads)', { codec: COUNTING, l1MaxBytes: 24 * 1024 }, 5000);
-run('primitives mode (cache never sees JSON)', { values: 'primitives', l1MaxBytes: 4 << 20 }, 5000);
+run('bytes mode (cache never sees JSON)', { values: 'bytes', l1MaxBytes: 4 << 20 }, 5000);

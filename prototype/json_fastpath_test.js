@@ -79,7 +79,7 @@ try { TurboCache.assertFastCodec({ encode: JSON.stringify, decode: JSON.parse })
 ok(fine, 'plain JSON codec accepted');
 
 // 5. A cached substring must be flattened, or it retains its parent.
-const cache = TurboCache.createPrimary('/tcfp2' + process.pid, 16 << 20, 1 << 16, { values: 'primitives' });
+const cache = TurboCache.createPrimary('/tcfp2' + process.pid, 16 << 20, 1 << 16, { values: 'bytes' });
 const parent = new Array(50000).fill('abcdefgh').join('');
 cache.set('slice', parent.substring(0, 500));
 ok(cache.get('slice').length === 500, 'substring cached correctly');

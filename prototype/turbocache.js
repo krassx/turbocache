@@ -39,7 +39,7 @@ class TurboCache {
     #codec;
     #l1Decoded = true;
     #isolate = true;
-    #primitives = false;
+    #noCodec = false;
     #freeze;
     #heapFactor;
     #guardMax = 0; #guardShed = 0.25; #gcObserver = null; liveHeapFraction = 0;
@@ -85,8 +85,15 @@ class TurboCache {
         // every L1 hit if its values are really objects.
         // Storage modes. Each names the tradeoff it accepts:
         //
-        //   primitives - scalars only, rejects anything else LOUDLY.
-        //                Exact byte accounting, no aliasing, no codec.
+        //   bytes      - NO CODEC. The native layer encodes the value directly:
+        //                 scalars become their byte representation, binary is
+        //                 stored verbatim. Anything needing a codec is rejected
+        //                 LOUDLY. Exact byte accounting, no aliasing.
+        //                 ('primitives' is accepted as a legacy alias, but the
+        //                 mode never accepted only primitives once decision 4's
+        //                 Buffer/TypedArray values were honoured - bytes are the
+        //                 most directly storable thing there is, and routing
+        //                 them through a codec costs 5.3x on write, 3.9x on read.)
         //   direct     - value stored as-is with full JS type fidelity
         //                (v8 structured serialization). One serialize +
         //                deserialize per write; reads are free because L1 hands
@@ -101,15 +108,16 @@ class TurboCache {
                      codec: opts.codec || TurboCache.V8_CODEC };
         } else if (preset === 'safe') {
             opts = { ...opts, codec: opts.codec || TurboCache.JSON_CODEC, l1Decoded: false };
-        } else if (preset === 'primitives') {
-            opts = { ...opts, values: 'primitives' };
+        } else if (preset === 'bytes' || preset === 'primitives') {
+            opts = { ...opts, values: 'bytes' };
         }
-        this.storage = preset || (opts.codec ? 'codec' : 'primitives');
+        this.storage = preset === 'primitives' ? 'bytes'
+            : (preset || (opts.codec ? 'codec' : 'bytes'));
         // safe mode keeps the ENCODED form in L1 and decodes on every read, so
         // each caller gets its own object. direct keeps the decoded object.
         this.#l1Decoded = opts.l1Decoded !== false;
-        this.#primitives = opts.values === 'primitives';
-        this.#codec = this.#primitives ? null : (opts.codec || null);
+        this.#noCodec = opts.values === 'bytes' || opts.values === 'primitives';
+        this.#codec = this.#noCodec ? null : (opts.codec || null);
         if (this.#codec && opts.allowSlowCodec !== true) TurboCache.assertFastCodec(this.#codec);
         // Safe by default, fast by choice. Without freeze, mutating what get()
         // returned silently corrupts L1 for this worker until eviction, at
@@ -127,7 +135,7 @@ class TurboCache {
         // A decoded object costs several times its encoded size on the V8 heap,
         // and JS cannot measure that. The budget is in encoded bytes scaled by
         // this factor; it is an estimate, not a guarantee.
-        this.#heapFactor = (this.#primitives || !this.#l1Decoded) ? 1
+        this.#heapFactor = (this.#noCodec || !this.#l1Decoded) ? 1
             : (opts.heapFactor || (this.#codec ? 3 : 1));
         // Per-object size cannot be measured: V8 exposes no such API, and a
         // structural estimate is both less accurate than encodedBytes*3 and far
@@ -331,7 +339,7 @@ class TurboCache {
     #l1Put(key, v, hash, encodedLen, expiresAt = 0) {
         // In primitives mode the cost is known exactly; otherwise it is the
         // encoded length scaled by heapFactor, which is only an estimate.
-        const bytes = this.#primitives
+        const bytes = this.#noCodec
             ? native.primBytes(v) + native.primBytes(key) + 64
             : (key.length + encodedLen + 64) * this.#heapFactor;
         const prev = this.#l1.get(key);
@@ -447,7 +455,7 @@ class TurboCache {
         }
         let v = raw;
         if (this.#codec) { v = this.#codec.decode(raw); if (this.#freeze) TurboCache.deepFreeze(v); }
-        this.#l1Put(key, v, native.hashKey(key), this.#primitives ? 0 : raw.length, expMs);
+        this.#l1Put(key, v, native.hashKey(key), this.#noCodec ? 0 : raw.length, expMs);
         // The L2 path used to return the very object it just placed in L1, so a
         // caller mutating a binary result corrupted the cached copy.
         return Buffer.isBuffer(v) ? Buffer.from(v) : v;
@@ -470,7 +478,7 @@ class TurboCache {
             this.lastError = `key of ${Buffer.byteLength(key)} bytes exceeds the ${this.#keyMax}-byte limit`;
             return false;
         }
-        if (this.#primitives) {
+        if (this.#noCodec) {
             const t = typeof value;
             // Binary values are accepted alongside the primitives: decision 4
             // lists Buffer/Uint8Array/ArrayBuffer, and they are byte-shaped
@@ -479,7 +487,8 @@ class TurboCache {
             // BigInt is a primitive too, and immutable, so it belongs here.
             if (!isBinary && t !== 'string' && t !== 'number' && t !== 'boolean' && t !== 'bigint' && value !== null) {
                 this.stats.rejectedType++;
-                this.lastError = `primitives mode accepts string/number/boolean/bigint/null, got ${t}`;
+                this.lastError = `bytes mode accepts string/number/boolean/bigint/null ` +
+                    `or binary (Buffer/TypedArray/ArrayBuffer/DataView), got ${t}`;
                 return false;
             }
             if (t === 'string') {
@@ -533,7 +542,7 @@ class TurboCache {
             this.lastError = `value ${encLen}B exceeds the ${this.#maxValue}B arena limit`;
             return false;
         }
-        this.#l1Put(key, l1Value, native.hashKey(key), this.#primitives ? 0 : enc.length,
+        this.#l1Put(key, l1Value, native.hashKey(key), this.#noCodec ? 0 : enc.length,
                     ttlMs > 0 ? Date.now() + ttlMs : 0);
         if (this.#id === 0) {
             const ok = native.set(key, enc, 0, ttlMs, this.#nsId);

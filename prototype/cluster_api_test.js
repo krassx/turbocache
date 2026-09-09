@@ -3,7 +3,7 @@ const cluster = require('cluster');
 const { TurboCache } = require('./turbocache');
 
 if (cluster.isPrimary) {
-    const cache = TurboCache.open({ storage: 'primitives' });
+    const cache = TurboCache.open({ storage: 'bytes' });
     TurboCache.install(cluster);                       // the entire primary-side setup
     cache.set('from-primary', 'hello');
 
@@ -25,7 +25,7 @@ if (cluster.isPrimary) {
         });
     }
 } else {
-    const cache = TurboCache.open({ storage: 'primitives' });   // auto-attaches
+    const cache = TurboCache.open({ storage: 'bytes' });   // auto-attaches
     const id = cluster.worker.id;
     const checks = [];
     checks.push([cache.get('from-primary') === 'hello', 'worker reads what the primary wrote']);

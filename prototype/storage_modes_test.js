@@ -51,12 +51,14 @@ for (const storage of ['direct', 'safe']) {
     TurboCache.native().destroy();
 }
 
-// --- primitives still rejects non-primitives loudly
+// --- bytes mode rejects anything needing a codec; 'primitives' is a legacy alias
 {
     const c = mk('primitives');
-    ok(c.set('o', { a: 1 }) === false, 'primitives: rejects objects (returns false)');
+    ok(c.storage === 'bytes', "'primitives' is accepted as an alias of 'bytes'");
+    ok(c.set('o', { a: 1 }) === false, 'bytes: rejects objects (returns false)');
+    ok(c.set('bin', Buffer.from([1,2])) === true, 'bytes: accepts binary, which needs no codec');
     c.set('b', 2n ** 70n);
-    ok(c.get('b') === 2n ** 70n, 'primitives: BigInt round-trips');
+    ok(c.get('b') === 2n ** 70n, 'bytes: BigInt round-trips');
     TurboCache.native().destroy();
 }
 console.log(fail ? `  ${fail} FAILURES` : '  all passed');

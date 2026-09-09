@@ -2,7 +2,7 @@
 // json-fastpath-lint: allow
 // Scorecard for the three storage modes: validity, safety, consistency, performance.
 const { TurboCache } = require('../prototype/turbocache');
-const MODES = ['primitives', 'direct', 'safe'];
+const MODES = ['bytes', 'direct', 'safe'];
 let seq = 0;
 const mk = (storage, opts = {}) => TurboCache.createPrimary(
     '/tcrep' + process.pid + '_' + (seq++), 64 << 20, 1 << 17,
@@ -49,7 +49,7 @@ function validity() {
         res[mode] = {};
         for (const [name, val] of Object.entries(TYPES)) {
             const c = mk(mode);
-            const prim = mode === 'primitives';
+            const prim = mode === 'bytes';
             let verdict;
             try {
                 if (c.set('t', val) === false) { TurboCache.native().destroy(); res[mode][name] = 'rejected'; continue; }
@@ -119,7 +119,7 @@ function safety() {
     console.log('  vector                                ' + MODES.map(m => m.padEnd(18)).join(''));
     for (const [name, fn] of Object.entries(vectors)) {
         const row = MODES.map(m => { const c = mk(m); let r;
-            try { r = fn(c, m === 'primitives'); } catch (e) { r = 'ERR ' + e.constructor.name; }
+            try { r = fn(c, m === 'bytes'); } catch (e) { r = 'ERR ' + e.constructor.name; }
             TurboCache.native().destroy(); return r.padEnd(18); });
         console.log('  ' + name.padEnd(38) + row.join(''));
     }
@@ -134,7 +134,7 @@ function consistency() {
     for (const mode of MODES) {
         // reseed per mode so every mode sees the IDENTICAL operation stream
         let s = 12345; const rnd = () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
-        const prim = mode === 'primitives';
+        const prim = mode === 'bytes';
         const c = mk(mode, { l1MaxBytes: 128 * 1024 });
         const expect = new Map();
         const val = i => prim ? 'v' + i + ':' + 'x'.repeat(60) : { i, tag: 'v' + i, pad: 'x'.repeat(60) };
@@ -178,7 +178,7 @@ function crossProcess() {
 if (process.argv[2] === 'child') {
     // parent half: create the arena, write, then fork a reader
     const [, , , arena, mode] = process.argv;
-    const prim = mode === 'primitives';
+    const prim = mode === 'bytes';
     if (!process.env.TC_CHILD) {
         const c = TurboCache.createPrimary(arena, 32 << 20, 1 << 16, { storage: mode, l1MaxBytes: 64 * 1024 });
         const N = 200;
@@ -216,7 +216,7 @@ async function performance() {
         const plan = buildPlan({ ops: 200000, nkeys, seed: 3, writeRatio });
         const cells = [];
         for (const mode of MODES) {
-            const prim = mode === 'primitives';
+            const prim = mode === 'bytes';
             const c = TurboCache.createPrimary('/tcperf' + process.pid + '_' + (seq++), 256 << 20, 1 << 20,
                                                { storage: mode, l1MaxBytes: 2 << 20 });
             // primitives cannot take objects, so the app encodes - counted against it

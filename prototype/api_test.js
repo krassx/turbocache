@@ -1,7 +1,7 @@
 const { TurboCache } = require('./turbocache');
 let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
 
-const c = TurboCache.open({ storage: 'primitives', namespace: 'app' });
+const c = TurboCache.open({ storage: 'bytes', namespace: 'app' });
 
 // get / set
 ok(c.set('k', 'v') === true, 'set returns true on success');

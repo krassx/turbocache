@@ -4,7 +4,7 @@ const native = require('./build/Release/l2.node');
 let fail = 0, n = 0;
 const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
 const mk = o => TurboCache.createPrimary('/tcrr' + process.pid + '_' + (n++), 8 << 20, 1 << 16,
-    { storage: 'primitives', l1MaxBytes: 32 * 1024, ...o });
+    { storage: 'bytes', l1MaxBytes: 32 * 1024, ...o });
 
 // 1. long / non-latin1 keys must never collide or truncate
 {

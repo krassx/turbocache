@@ -7,11 +7,11 @@ function scenario(label, quotas) {
     // 'cold' writes a small working set once; 'hot' then hammers the arena.
     const name = '/tcnsq' + process.pid + '_' + (seq++);
     const cold = TurboCache.createPrimary(name, 8 << 20, 1 << 16,
-        { storage: 'primitives', l1MaxBytes: 16 * 1024,
+        { storage: 'bytes', l1MaxBytes: 16 * 1024,
           namespace: { name: 'cold', quotaBytes: quotas.cold } });
     // second namespace in the SAME process, bound to the arena already created
     const hot = TurboCache.open(
-        { storage: 'primitives', l1MaxBytes: 16 * 1024,
+        { storage: 'bytes', l1MaxBytes: 16 * 1024,
           namespace: { name: 'hot', quotaBytes: quotas.hot } });
 
     const val = 'x'.repeat(500);
