@@ -539,11 +539,15 @@ class TurboCache {
     delete(key) {
         key = this.#ns + key;
         this.stats.deletes++;
+        if (this.#id === 0) { const had = native.del(key, 0); this.#l1Drop(key); return had; }
+        // A worker's delete is applied a tick later, so report whether the key
+        // was present at call time. Returning an unconditional true meant a
+        // worker and the primary disagreed about the same absent key.
+        const had = this.#l1.has(key) || native.has(key);
         this.#l1Drop(key);
-        if (this.#id === 0) return native.del(key, 0);
         this.#outbox.push('d', key, null, 0, this.#nsId);
         this.#schedule(key.length + 48);
-        return true;
+        return had;
     }
 
     // Drops only this process's L1. The shared arena is untouched, so the next
@@ -573,6 +577,35 @@ class TurboCache {
     }
 
     static namespaceStats() { return native.nsStats(); }
+
+    // Live entries in this cache's namespace. Arena-wide counters are in
+    // TurboCache.arenaStats().
+    get size() {
+        const st = native.nsStats();
+        if (!st) return 0;
+        if (this.#nsId === 0 && st.length <= 1) return (native.stats() || {}).live || 0;
+        let n = 0;
+        for (const k of this.keys({ limit: Infinity })) n++;
+        return n;
+    }
+
+    static arenaStats() { return native.stats(); }
+
+    // Enumerate the keys this cache's namespace holds, newest-slot order.
+    // O(index slots); intended for operations and debugging, not the hot path.
+    *keys({ limit = 1000, batch = 512 } = {}) {
+        let cursor = 0, yielded = 0;
+        for (;;) {
+            const r = native.scanKeys(this.#nsId, cursor, batch);
+            if (!r) return;
+            for (const k of r.keys) {
+                if (yielded++ >= limit) return;
+                yield this.#ns ? k.slice(this.#ns.length) : k;
+            }
+            if (r.done) return;
+            cursor = r.cursor;
+        }
+    }
 
     close() {
         this.stopGuard();

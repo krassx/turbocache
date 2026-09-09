@@ -53,6 +53,14 @@ ok(c.set('x', { a: 1 }) === false, 'unsupported value returns false');
 ok(typeof c.lastError === 'string', 'lastError explains the rejection');
 ok(c.stats.rejectedType > 0, 'rejection counted in stats');
 
+// enumeration — decision 3 named this as a benefit of storing key text
+c.clearAll();
+for (let i = 0; i < 5; i++) c.set('e' + i, 'v');
+ok([...c.keys()].sort().join(',') === 'e0,e1,e2,e3,e4', 'keys() enumerates this namespace');
+ok(c.size === 5, 'size reports live entries');
+ok(typeof TurboCache.arenaStats().live === 'number', 'arenaStats() exposes arena counters');
+ok([...c.keys({ limit: 2 })].length === 2, 'keys() honours limit');
+
 // lifecycle
 ok(typeof c.close === 'function', 'close() exists');
 c.close();

@@ -77,5 +77,11 @@ const mk = o => TurboCache.createPrimary('/tcrr' + process.pid + '_' + (n++), 8 
     TurboCache.native().destroy();
 }
 ok(typeof Cache === 'function', 'Cache alias is exported as the docs describe');
+// worker and primary must agree on delete() of an absent key
+{
+    const c = mk({});
+    ok(c.delete('never-existed') === false, 'delete of an absent key reports false');
+    TurboCache.native().destroy();
+}
 console.log(fail ? `  ${fail} FAILURES` : '  all passed');
 process.exit(fail ? 1 : 0);

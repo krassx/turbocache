@@ -59,6 +59,9 @@ class Cache {
   clearNamespace(): void;      // just this cache's namespace
   close(): void;
 
+  keys(opts?: { limit?, batch? }): Iterable<string>;   // this namespace
+  readonly size: number;                               // live entries here
+
   readonly stats: { l1Hits, l2Hits, misses, sets, deletes, invalidated,
                     rejectedType, rejectedSize, flushes, sent };
   readonly lastError: string | null;
@@ -66,6 +69,7 @@ class Cache {
   static open(opts?): Cache;   // create (primary) or attach (worker)
   static install(cluster): void;
   static namespaceStats(): Array<{name, id, bytes, quota, protected, dropped}>;
+  static arenaStats(): { live, evictions, liveBytes, dataBytes, ... };
 }
 ```
 
@@ -101,6 +105,16 @@ and it does not set the CLOCK reference bit — so an existence check cannot
 distort hit-rate statistics or eviction order. It matters more than it sounds:
 because `null` is a storable value, `get(k) === undefined` is not an existence
 check, and `has` is the only way to ask the question.
+
+**`delete` reports presence at call time.** A worker's delete is applied a tick
+later, so it answers "was this key here when you asked" — matching what the
+primary returns. It previously returned an unconditional `true` in a worker, so
+a worker and the primary disagreed about the same absent key.
+
+**Enumeration exists.** `keys()` and `size` scan the index and read the stored
+key text. Decision 3 named this as a benefit of verifying keys with `memcmp`,
+but nothing ever exposed it, so there was no way to see what a cache held. It is
+O(index slots) and meant for operations, not the hot path.
 
 **TTL is enforced in both tiers.** The arena expires lazily on read, but an L1
 hit never reaches the arena, so L1 entries carry their own expiry. Without that,

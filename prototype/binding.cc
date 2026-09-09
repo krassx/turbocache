@@ -232,6 +232,42 @@ static napi_value ClearNamespace(napi_env env, napi_callback_info info) {
   return r;
 }
 
+// scanKeys(nsId, cursorSlot, max) -> { keys: [...], cursor }
+// Enumeration is possible because entries store the key text - decision 3 named
+// this as a benefit of verifying keys, but nothing ever exposed it, so there
+// was no way to see what a cache actually held.
+static napi_value ScanKeys(napi_env env, napi_callback_info info) {
+  ARG(3)
+  NEED_STORE(nullptr)
+  int32_t ns = 0, max = 0; double cur = 0;
+  napi_get_value_int32(env, argv[0], &ns);
+  napi_get_value_double(env, argv[1], &cur);
+  napi_get_value_int32(env, argv[2], &max);
+  Header *h = g.h;
+  napi_value arr; napi_create_array(env, &arr);
+  uint32_t n = 0;
+  uint64_t i = (uint64_t)cur;
+  for (; i < h->indexSlots && (int32_t)n < max; i++) {
+    uint64_t hv = g.idx[i].hash.load(std::memory_order_acquire);
+    if (hv == HASH_EMPTY || hv == HASH_TOMB) continue;
+    uint64_t pos = g.idx[i].off.load(std::memory_order_acquire);
+    Entry *e = g.entryAt(pos);
+    if (h->mode != MODE_SLAB && h->tailPub.load(std::memory_order_acquire) > pos) continue;
+    if (ns >= 0 && e->ns != (uint8_t)ns) continue;
+    uint16_t kl = e->keyLen;
+    if (kl == 0 || kl > KEY_MAX) continue;
+    napi_value k;
+    if (napi_create_string_utf8(env, (const char *)g.keyOf(e), kl, &k) != napi_ok) continue;
+    napi_set_element(env, arr, n++, k);
+  }
+  napi_value o; napi_create_object(env, &o);
+  napi_set_named_property(env, o, "keys", arr);
+  put(env, o, "cursor", (double)i);
+  napi_value done; napi_get_boolean(env, i >= h->indexSlots, &done);
+  napi_set_named_property(env, o, "done", done);
+  return o;
+}
+
 static napi_value NsStats(napi_env env, napi_callback_info) {
   NEED_STORE(nullptr)
   napi_value arr; napi_create_array(env, &arr);
@@ -662,7 +698,7 @@ static napi_value Destroy(napi_env env, napi_callback_info) {
                        napi_set_named_property(env, exports, name, f); }
 static napi_value Init(napi_env env, napi_value exports) {
   FN("create", Create) FN("attach", Attach) FN("set", Set) FN("get", Get)
-  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("nsResolve", NsResolve) FN("clearNamespace", ClearNamespace) FN("nsStats", NsStats) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastExpiresAt", LastExpiresAt) FN("epochMs", EpochMs) FN("keyMaxBytes", KeyMaxBytes)
+  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("nsResolve", NsResolve) FN("clearNamespace", ClearNamespace) FN("nsStats", NsStats) FN("scanKeys", ScanKeys) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastExpiresAt", LastExpiresAt) FN("epochMs", EpochMs) FN("keyMaxBytes", KeyMaxBytes)
   FN("destroy", Destroy) FN("poke", Poke)
   FN("suppressRefBit", SetSuppressRefBit) FN("secondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin)
   return exports;
