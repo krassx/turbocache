@@ -58,6 +58,11 @@ function verify(key, val) {
             Array.isArray(val.tags) && val.tags[1] === val.v) ? null : 'payload-mismatch';
 }
 
+const mergeLat = (rows) => {
+    const all = [];
+    for (const r of rows) if (r.lat) for (const v of r.lat) all.push(v);
+    return all.sort((a, b) => a - b);
+};
 const pct = (sorted, p) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p / 100))] : 0;
 
 if (cluster.isPrimary) {
@@ -89,7 +94,12 @@ if (cluster.isPrimary) {
             const rows = all.map(r => r[phase]);
             console.log(`  --- ${phase === 'baseline' ? 'BASELINE (no-op cache, same harness)' : `CACHED (storage=${MODE})`} ---`);
             console.log(`  requests/s             ${(agg(rows,'reqs','sum')/secs/1000).toFixed(0)}k    cache ops/s ${(agg(rows,'ops','sum')/secs/1000).toFixed(0)}k`);
-            console.log(`  event loop delay       mean ${agg(rows,'loopMean','avg').toFixed(2)}ms  p99 ${agg(rows,'loopP99','avg').toFixed(2)}ms  max ${agg(rows,'loopMax','max').toFixed(2)}ms`);
+            // A per-process histogram cannot be merged across processes, so the p99
+            // is the WORST worker's, not an average of theirs -- averaging would
+            // hide the one worker that is actually stalling.
+            console.log(`  event loop delay       mean ${agg(rows,'loopMean','avg').toFixed(2)}ms` +
+                        `  p99 ${agg(rows,'loopP99','max').toFixed(2)}ms (worst worker)` +
+                        `  max ${agg(rows,'loopMax','max').toFixed(2)}ms`);
             // Per-request, not absolute: the baseline runs several times faster
             // than the cached phase, so it produces proportionally more harness
             // garbage. Comparing raw GC totals across phases compares throughput,
@@ -97,21 +107,24 @@ if (cluster.isPrimary) {
             const reqs = agg(rows,'reqs','sum');
             console.log(`  gc                     ${agg(rows,'gcN','sum').toFixed(0)} cycles, ${agg(rows,'gcMs','sum').toFixed(0)}ms total, longest pause ${agg(rows,'gcMax','max').toFixed(2)}ms, major ${agg(rows,'gcMajor','sum').toFixed(0)}`);
             console.log(`  gc per 1M requests     ${(1e6*agg(rows,'gcMs','sum')/reqs).toFixed(1)}ms  (${(1e6*agg(rows,'gcN','sum')/reqs).toFixed(0)} cycles)`);
-            console.log(`  sampled get latency    p50 ${agg(rows,'p50','avg').toFixed(0)}ns  p99 ${agg(rows,'p99','avg').toFixed(0)}ns  p99.9 ${agg(rows,'p999','avg').toFixed(0)}ns  max ${(agg(rows,'gmax','max')/1000).toFixed(1)}us`);
+            const m = mergeLat(rows);
+            console.log(`  sampled get latency    p50 ${pct(m,50).toFixed(0)}ns  p99 ${pct(m,99).toFixed(0)}ns` +
+                        `  p99.9 ${pct(m,99.9).toFixed(0)}ns  max ${((m[m.length-1]||0)/1000).toFixed(1)}us` +
+                        `  (${m.length.toLocaleString()} samples merged)`);
             console.log(`  wrong values           ${agg(rows,'wrong','sum')}`);
         }
         const b = all.map(r => r.baseline), c = all.map(r => r.cached);
-        const dLoop = agg(c,'loopP99','avg') - agg(b,'loopP99','avg');
+        const dLoop = agg(c,'loopP99','max') - agg(b,'loopP99','max');
         const gcPer = (rows) => 1e6 * agg(rows,'gcMs','sum') / agg(rows,'reqs','sum');
         const dGc   = gcPer(c) - gcPer(b);
         console.log(`\n  --- attribution (cached minus baseline) ---`);
         console.log(`  event loop p99 delta   ${dLoop >= 0 ? '+' : ''}${dLoop.toFixed(2)}ms  <- blocking the cache adds to the loop`);
         console.log(`  gc per 1M req delta    ${dGc >= 0 ? '+' : ''}${dGc.toFixed(1)}ms  ` +
                     `(${gcPer(b).toFixed(1)}ms baseline -> ${gcPer(c).toFixed(1)}ms cached)`);
-        console.log(`  longest single stall   ${(agg(c,'gmax','max')/1000).toFixed(1)}us worst get,` +
+        console.log(`  longest single stall   ${((mergeLat(c).pop()||0)/1000).toFixed(1)}us worst get,` +
                     ` ${agg(c,'loopMax','max').toFixed(1)}ms worst loop delay`);
         const wrong = agg(c,'wrong','sum') + agg(b,'wrong','sum');
-        const pass = wrong === 0 && agg(c,'loopP99','avg') < 50;
+        const pass = wrong === 0 && agg(c,'loopP99','max') < 50;
         console.log(`\n  ${pass ? 'PASS' : 'FAIL'}${wrong ? ` (${wrong} wrong values)` : ''}`);
         for (const id in cluster.workers) cluster.workers[id].kill();
         cache.close();
@@ -187,7 +200,12 @@ if (cluster.isPrimary) {
             reqs, ops, wrong: wrong + (sink < 0 ? 1 : 0),
             loopMean: h.mean / 1e6, loopP99: h.percentile(99) / 1e6, loopMax: h.max / 1e6,
             gcMs, gcN, gcMax, gcMajor,
-            p50: pct(lat, 50), p99: pct(lat, 99), p999: pct(lat, 99.9), gmax: lat.length ? lat[lat.length - 1] : 0,
+            // Ship the SAMPLES, not this worker's percentiles. A mean of four
+            // workers' p99s is not a p99: with one worker carrying a heavier
+            // tail, avg-of-p99 read 8,836ns where the true merged p99 was
+            // 15,337ns -- 42% low, and low in exactly the case you are looking
+            // for. Sent once, after the measured window, so the cost is nil.
+            lat,
         };
         gcMs = 0; gcN = 0; gcMax = 0; gcMajor = 0;
         return out;

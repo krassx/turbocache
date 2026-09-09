@@ -15,7 +15,7 @@
 #include "vendor/rapidhash.h"
 
 static const uint32_t TC_MAGIC = 0x54430001;
-static const uint32_t TC_LAYOUT = 1;
+static const uint32_t TC_LAYOUT = 2;   // 2: BigInt words moved to offset 8 for alignment
 static const uint32_t FEATURE_LZ4 = 1;
 static const uint64_t HASH_EMPTY = 0;
 static const uint64_t HASH_TOMB  = 1;
@@ -67,7 +67,16 @@ static const uint64_t MIN_DATA_BYTES = 1u << 16;
 #define NS_NAMELEN 24
 
 struct Header {
-  uint32_t magic, layout;
+  // magic is ATOMIC and published LAST. create() used to write it first and the
+  // geometry after, so a reader attaching in that window saw a header that
+  // validated while indexSlots and dataBytes were still zero -- bind() then
+  // computed pointers from them and probing used a mask of 2^64-1. Nothing
+  // caught it; the attach happened to be refused only because the hints segment
+  // did not exist yet, which is an accident, not a check. The recovery poll
+  // (a worker re-attaching by name every second) would hit that window
+  // repeatedly and deliberately.
+  std::atomic<uint32_t> magic;
+  uint32_t layout;
   uint8_t  mode;
   uint8_t  _pad[7];
   uint64_t totalBytes;
@@ -147,7 +156,8 @@ struct Store {
     memset(base, 0, sizeof(Header));
 
     h = (Header *)base;
-    h->magic = TC_MAGIC; h->layout = TC_LAYOUT; h->mode = mode;
+    h->magic.store(0, std::memory_order_relaxed);   // published at the very end
+    h->layout = TC_LAYOUT; h->mode = mode;
     h->totalBytes = totalBytes;
     h->indexOff = (sizeof(Header) + 63) & ~63ull;
     h->indexSlots = indexSlots;
@@ -211,6 +221,9 @@ struct Store {
     bind();
     memset(idx, 0, indexBytes);
     memset(hints, 0, h->hintsBytes);
+    // Everything above must be visible before any reader can validate this
+    // header, so this store is the publication point.
+    h->magic.store(TC_MAGIC, std::memory_order_release);
     return true;
   }
 
@@ -220,8 +233,9 @@ struct Store {
     if (!base) return false;
     mapBytes = (size_t)sz; writable = false;
     h = (Header *)base;
-    if (h->magic != TC_MAGIC || h->layout != TC_LAYOUT) {
-      shmClose(base, mapBytes, &baseHandle); base = nullptr; return false;
+    if (h->magic.load(std::memory_order_acquire) != TC_MAGIC || h->layout != TC_LAYOUT ||
+        !geometryOk(h, mapBytes)) {
+      shmClose(base, mapBytes, &baseHandle); base = nullptr; h = nullptr; return false;
     }
     // Refuse an arena holding compressed entries this build cannot decompress,
     // rather than attaching and reporting silent misses for them.
@@ -239,6 +253,30 @@ struct Store {
       return false;
     }
     bind();
+    return true;
+  }
+
+  // The arena is written only by the primary and the fd is read-only to
+  // everyone else, so this is NOT the hostile-input case the submission ring
+  // faces: it guards a half-written header, a layout the build does not match,
+  // and a truncated segment. Every field bind() turns into a pointer or a mask
+  // is checked against the mapping we actually got.
+  static bool geometryOk(const Header *hh, uint64_t mapBytes) {
+    auto pow2 = [](uint64_t v) { return v && !(v & (v - 1)); };
+    const uint64_t T = hh->totalBytes;
+    if (hh->mode > MODE_LOG2) return false;
+    // <= not ==: Windows rounds a mapped view up to the allocation granularity.
+    if (T < sizeof(Header) || T > mapBytes) return false;
+    if (!pow2(hh->indexSlots) || hh->indexSlots < 16 || hh->indexSlots > (1ull << 32)) return false;
+    if (!pow2(hh->ringCap) || hh->ringCap == 0 || hh->ringCap > (1ull << 24)) return false;
+    if (!pow2(hh->dataBytes) || hh->dataBytes < 4096) return false;
+    const uint64_t ib = hh->indexSlots * sizeof(IndexSlot);   // both bounded above, cannot overflow
+    const uint64_t rb = hh->ringCap * sizeof(RingRec);
+    if ((hh->indexOff & 63) || hh->indexOff < sizeof(Header) || hh->indexOff > T || ib > T - hh->indexOff) return false;
+    if (hh->ringOff < hh->indexOff + ib || hh->ringOff > T || rb > T - hh->ringOff) return false;
+    if ((hh->dataOff & 63) || hh->dataOff < hh->ringOff + rb || hh->dataOff > T ||
+        hh->dataBytes > T - hh->dataOff) return false;
+    if (hh->hintsBytes < hh->indexSlots) return false;
     return true;
   }
 

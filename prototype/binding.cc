@@ -214,14 +214,15 @@ static bool encodeValue(napi_env env, napi_value v, size_t *vlenOut, uint8_t *fl
     // passing a non-null sign_bit takes the other branch and fails CHECK_ARG.
     int sign = 0; size_t words = 0;
     if (napi_get_value_bigint_words(env, v, nullptr, &words, nullptr) != napi_ok ||
-        1 + words * 8 > SCRATCH) return false;
+        8 + words * 8 > SCRATCH) return false;
     if (words && napi_get_value_bigint_words(env, v, &sign, &words,
-                                             (uint64_t *)(scratch + 1)) != napi_ok) {
+                                             (uint64_t *)(scratch + 8)) != napi_ok) {
       return false;   // `return r` here converted a non-null napi_value to TRUE,
                       // reporting success with vlen/flags never assigned
     }
+    memset(scratch, 0, 8);
     scratch[0] = (uint8_t)sign;          // written AFTER the call that fills it
-    vlen = 1 + words * 8; flags = FLAG_BIGINT;
+    vlen = 8 + words * 8; flags = FLAG_BIGINT;
   } else if (vt == napi_null) {
     vlen = 0; flags = FLAG_NULL;
   } else {
@@ -517,11 +518,14 @@ static napi_value Get(napi_env env, napi_callback_info info) {
     return nullptr;
 #endif
   }
-  napi_value out;
+  // Every constructor's status is checked. These were ignored, so a failure left
+  // `out` uninitialised and returned it.
+  napi_value out = nullptr;
   if (rr.flags & FLAG_NUMBER) {
-    double d = 0; memcpy(&d, src, sizeof(d)); napi_create_double(env, d, &out);
+    double d = 0; memcpy(&d, src, sizeof(d));
+    if (napi_create_double(env, d, &out) != napi_ok) return nullptr;
   } else if (rr.flags & FLAG_BOOL) {
-    napi_get_boolean(env, src[0] != 0, &out);
+    if (napi_get_boolean(env, src[0] != 0, &out) != napi_ok) return nullptr;
   } else if (rr.flags & FLAG_BINARY) {
     // Always handed back as a fresh Buffer. Decision 7 copies binary values on
     // every read because they are mutable and L1 shares its entry; a Buffer is
@@ -529,14 +533,20 @@ static napi_value Get(napi_env env, napi_callback_info info) {
     void *dst = nullptr;
     if (napi_create_buffer_copy(env, rr.rawLen, src, &dst, &out) != napi_ok) return nullptr;
   } else if (rr.flags & FLAG_BIGINT) {
-    if (napi_create_bigint_words(env, (int)src[0], (rr.rawLen - 1) / 8,
-                                 (const uint64_t *)(src + 1), &out) != napi_ok) return nullptr;
+    // rawLen 0 would ask for (0-1)/8 = 536,870,911 words. Unreachable from the
+    // encoder, but this is the read path and the rest of it verifies rather than
+    // trusts. The words start at offset 8 so the cast is aligned: they used to
+    // sit at +1, which is UB on the misaligned load even though x64 and arm64
+    // tolerate it, and the UBSan gate has no reason to keep tolerating it.
+    if (rr.rawLen < 8 || (rr.rawLen & 7)) return nullptr;
+    if (napi_create_bigint_words(env, src[0] & 1, (rr.rawLen - 8) / 8,
+                                 (const uint64_t *)(src + 8), &out) != napi_ok) return nullptr;
   } else if (rr.flags & FLAG_NULL) {
-    napi_get_null(env, &out);
+    if (napi_get_null(env, &out) != napi_ok) return nullptr;
   } else if (rr.flags & FLAG_LATIN1) {
-    napi_create_string_latin1(env, src, rr.rawLen, &out);
+    if (napi_create_string_latin1(env, src, rr.rawLen, &out) != napi_ok) return nullptr;
   } else {
-    napi_create_string_utf8(env, src, rr.rawLen, &out);
+    if (napi_create_string_utf8(env, src, rr.rawLen, &out) != napi_ok) return nullptr;
   }
   return out;
 }

@@ -84,6 +84,47 @@ int main() {
        "the arena still serves reads after all those wraps");
   }
 
+  // Header geometry validation. attachReadOnly used to check only magic and
+  // layout, then bind() computed pointers and masks straight from fields it had
+  // never validated -- indexSlots 0 gives a probe mask of 2^64-1. The window
+  // where that mattered was masked by an accident (create() published magic
+  // first, but the hints segment did not exist yet, so the attach was refused
+  // for an unrelated reason). magic is now published LAST with a release store,
+  // and the geometry is checked against the mapping we actually got. Testing the
+  // predicate directly, because going through attachReadOnly conflates this with
+  // whether the hints segment happens to exist.
+  {
+    alignas(64) unsigned char raw[sizeof(Header)];
+    memcpy(raw, s.base, sizeof(Header));            // a known-good header
+    Header *g0 = (Header *)raw;
+    const uint64_t mapBytes = s.mapBytes;
+    ok(Store::geometryOk(g0, mapBytes), "a real header passes validation");
+
+    struct C { const char *name; void (*bend)(Header *); };
+    C cases[] = {
+      {"indexSlots = 0",          [](Header *h){ h->indexSlots = 0; }},
+      {"indexSlots not pow2",     [](Header *h){ h->indexSlots = 4095; }},
+      {"dataBytes not pow2",      [](Header *h){ h->dataBytes = 12345; }},
+      {"dataOff + dataBytes > T", [](Header *h){ h->dataBytes = h->totalBytes; }},
+      {"indexOff inside header",  [](Header *h){ h->indexOff = 8; }},
+      {"ringOff overlaps index",  [](Header *h){ h->ringOff = h->indexOff; }},
+      {"hintsBytes < indexSlots", [](Header *h){ h->hintsBytes = 8; }},
+      {"totalBytes > mapping",    [](Header *h){ h->totalBytes = h->totalBytes * 4; }},
+      {"mode out of range",       [](Header *h){ h->mode = 9; }},
+      {"all-zero geometry",       [](Header *h){ h->indexSlots = 0; h->dataBytes = 0; h->ringCap = 0;
+                                                 h->indexOff = 0; h->dataOff = 0; h->ringOff = 0; }},
+    };
+    int refused = 0;
+    for (auto &c : cases) {
+      alignas(64) unsigned char bent[sizeof(Header)];
+      memcpy(bent, raw, sizeof(Header));
+      c.bend((Header *)bent);
+      if (!Store::geometryOk((Header *)bent, mapBytes)) refused++;
+      else printf("      accepted: %s\n", c.name);
+    }
+    ok(refused == (int)(sizeof(cases) / sizeof(cases[0])), "every corrupted geometry is refused");
+  }
+
   s.destroy(); shmUnlink(NM);
   printf(fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
   return fails ? 1 : 0;
