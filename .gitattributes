@@ -1,0 +1,4 @@
+# Vendored third-party sources are stored byte-for-byte as published, so that
+# re-fetching upstream and diffing shows only real changes. Without this git
+# normalises CRLF to LF on checkout and the file silently stops matching.
+prototype/vendor/** -text -diff linguist-vendored
