@@ -1353,6 +1353,67 @@ of `run_sanitizers.sh`. The TSAN gate was also flaky — its allowlist named onl
 writer-side frames, but TSAN attributes the deliberate race to whichever thread
 detects it, so reader frames appear intermittently; both sides are now allowed.
 
+### Full performance matrix, re-measured
+
+Everything below was re-measured after the review fixes (UTF-8 keys, own-write
+invalidation no longer skipped, TTL sweeping, the zero-copy second chance,
+atomic reference bits). `bench/single_matrix.js` and `bench/cluster_matrix.js`,
+sharing `bench/adapters.js` so both drive each implementation identically.
+
+The workload is objects. Who encodes them differs by mode, and that cost is
+charged where it falls: `bytes` has no codec, so the application stringifies and
+parses, and those calls are inside the measurement.
+
+**Cluster, 1 primary + 4 workers, 60k shared keys.**
+
+| | 90/10 read/write | | | 50/50 write-heavy | |
+|---|---|---|---|---|---|
+| | ops/s | hit | p50 | ops/s | hit |
+| `turbo/bytes` | 650k | 90.5% | 4.1µs | 551k | 89.4% |
+| `turbo/direct` | 447k | 90.5% | 5.1µs | 315k | 89.6% |
+| **`turbo/safe`** | **694k** | 90.5% | **3.9µs** | **638k** | 89.4% |
+| bugsee | 82k | 30.4% | 54.8µs | 85k | 23.3% |
+
+`safe` wins in the cluster, which inverts the single-process ranking. Its writes
+are cheap (`JSON.stringify` on a hot path Node 26 made 34% faster) and it skips
+the string flatten that `bytes` pays on every write. `direct` is last because
+`v8.serialize` on every write is 2–3x JSON, and a cluster workload writes on both
+explicit sets and miss-fills.
+
+**Scaling is the headline.**
+
+| workers | `turbo/bytes` | hit | bugsee | hit |
+|---|---|---|---|---|
+| 1 | 213k | 80.4% | 57k | 80.4% |
+| 2 | 374k | 85.7% | 89k | 68.4% |
+| 4 | 666k | 90.5% | 80k | 30.2% |
+| 8 | **1,040k** | **94.1%** | **42k** | **12.8%** |
+
+turbocache scales 4.9x across an 8x worker increase, and its hit rate *improves*
+(80.4% → 94.1%) because more workers fill the shared arena faster. bugsee peaks
+at two workers and then **goes backwards** — 89k to 42k — while its hit rate
+collapses to 12.8%. At 8 workers the gap is **24.8x**.
+
+That collapse is not a defect in bugsee so much as the architecture reaching its
+limit: every L1 miss is an IPC round trip through one event loop, and past
+saturation its client times out at 100ms or hits its 256-request pending cap and
+resolves `undefined`, which the application sees as a miss. Its L2 holds the
+data; it simply cannot be reached in time. Degrading rather than queueing without
+bound is a deliberate and defensible choice.
+
+**Tail latency** at 4 workers, 90/10: p99 18.5µs vs 121µs, p99.9 297µs vs 3.7ms.
+At 8 workers bugsee's p50 alone reaches 181µs.
+
+**What the modes are actually for**, given both tables:
+
+- **`bytes`** — the default. Best when values are already scalars or bytes, and
+  competitive everywhere. The app owns any codec, so it can skip encoding
+  entirely for opaque payloads.
+- **`direct`** — only when reads dominate *and* values carry real JS types. It is
+  2.7x the field on an L1-resident read workload and last everywhere else.
+- **`safe`** — best in the cluster, and the friendliest contract (a fresh mutable
+  object per read). Pay for it in silent type conversion.
+
 ## 10. Why not V8 fast calls
 
 The original premise. It does not survive contact:
