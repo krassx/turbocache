@@ -7,10 +7,27 @@ static bool g_suppressRefBit = false;
 
 static inline uint64_t align8(uint64_t v) { return (v + 7) & ~7ull; }
 
-// Milliseconds since this arena was created. uint32 gives ~49 days of TTL range.
+// Milliseconds since this arena was created, as a uint32.
 static inline uint32_t nowRelMs(const Store &s) {
   return (uint32_t)(nowMs() - s.h->epochMs);
 }
+
+// Has `exp` passed, given the current relative time? 0 means "no expiry".
+//
+// A plain `exp <= now` is wrong across the uint32 wrap at 49.7 days of primary
+// uptime: an entry whose expiry crosses 2^32 gets a SMALL exp while `now` is
+// still large, so it reads as already expired and is dead on arrival for the
+// whole length of its TTL. Measured at an uptime of 2^32-1000ms: a 5s TTL
+// produced expiresAt=4000 and has() returned false immediately.
+//
+// Comparing the DIFFERENCE as a signed value is wrap-correct as long as no TTL
+// exceeds 2^31 ms (~24.8 days), which storeSet's callers clamp to.
+static inline bool tcExpired(uint32_t exp, uint32_t now) {
+  return exp != 0 && (int32_t)(now - exp) >= 0;
+}
+
+// Largest TTL the wrap-aware comparison above can represent unambiguously.
+static const uint32_t TC_TTL_MAX_MS = 0x7FFFFFFFu;
 
 struct ReadResult {
   bool     hit = false;
@@ -164,11 +181,31 @@ static const uint32_t SLOT_PAD = 0xFFFFFFFFu;
 // bit) is re-appended at the head
 // instead of dropped (its bit is cleared), giving the log CLOCK-style second
 // chance. `budget` caps re-appends so a hot arena still makes progress.
+// Bytes the log must step over without a record header, because a header does
+// not fit in what is left before the wrap. Records are 8-aligned and the header
+// is 40 bytes, so a remainder of 8, 16, 24 or 32 is reachable -- writing a pad
+// header there wrote up to 32 bytes PAST the data region, and the tail walk then
+// read blockSize from outside it. Today that lands in mapping slack (dataOff is
+// never page-aligned), so it neither crashes nor corrupts; it becomes a SIGBUS
+// the day the header grows or the layout is page-aligned. The gap is left
+// IMPLICIT and both the allocator and the tail walk derive it from the same
+// rule, exactly as the submission ring does.
+static inline uint32_t logGapAt(uint64_t phys, uint64_t dataBytes) {
+  uint64_t remain = dataBytes - phys;
+  return remain < sizeof(Entry) ? (uint32_t)remain : 0;
+}
+
 static inline void logDropTail(Store &s, int *budget) {
   Header *h = s.h;
   h->tailAdvances++;
   uint64_t tailPos = h->logTail;
   uint64_t phys = tailPos & (h->dataBytes - 1);
+  uint32_t gap = logGapAt(phys, h->dataBytes);
+  if (gap) {                                  // implicit wrap gap: no header here
+    h->logTail += gap;
+    h->tailPub.store(h->logTail, std::memory_order_release);
+    return;
+  }
   Entry *e = s.entryAt(tailPos);
   uint32_t bsz = e->blockSize;
   if (bsz == 0 || bsz > h->dataBytes) { h->logTail = h->logHead;
@@ -260,6 +297,12 @@ static inline int64_t logAlloc(Store &s, uint32_t need) {
     uint64_t phys = h->logHead & mask;
     uint64_t freeBytes = h->dataBytes - (h->logHead - h->logTail);
 
+    uint32_t gap = logGapAt(phys, h->dataBytes);
+    if (gap) {                                 // too little room even for a header
+      if (freeBytes < gap) { logDropTail(s, &budget); continue; }
+      h->logHead += gap;                       // implicit; nothing is written
+      continue;
+    }
     if (phys + need > h->dataBytes) {          // would straddle the wrap: pad to the end
       uint32_t pad = (uint32_t)(h->dataBytes - phys);
       if (freeBytes < pad) { logDropTail(s, &budget); continue; }
@@ -517,7 +560,7 @@ static inline bool storeHas(Store &s, const uint8_t *key, uint16_t keyLen, uint3
   Entry *e = s.entryAt(pos);
   uint32_t exp = e->expiresAt;
   if (h->mode != MODE_SLAB && h->tailPub.load(std::memory_order_seq_cst) > pos) return false;
-  return !(exp && exp <= nowMs);
+  return !tcExpired(exp, nowMs);
 }
 
 // Reader path. Safe against a concurrent writer reusing the block underneath us:
@@ -571,7 +614,7 @@ static inline bool storeGet(Store &s, const uint8_t *key, uint16_t keyLen,
       // proves the record was live for the whole copy (tail only increases).
       // seq_cst so the copy cannot be reordered after this load.
       if (h->mode != MODE_SLAB && h->tailPub.load(std::memory_order_seq_cst) > pos) return false;
-      if (exp && exp <= nowMs) return false;                 // lazily expired
+      if (tcExpired(exp, nowMs)) return false;               // lazily expired
       // Reference bit lives in the hints region, which workers map READ-WRITE
       // even though the rest of the segment is read-only to them. Load first:
       // a hot entry is already marked, so the store (and the cache-line
@@ -613,7 +656,7 @@ static inline bool storeIncr(Store &s, const uint8_t *key, uint16_t keyLen,
   Entry *e = s.entryAt(pos);
   if (!(e->flags & FLAG_NUMBER) || e->storedLen != sizeof(double)) return false;
   uint32_t now = nowRelMs(s);
-  if (e->expiresAt && e->expiresAt <= now) {       // expired: restart from zero
+  if (tcExpired(e->expiresAt, now)) {              // expired: restart from zero
     double v = by;
     unlinkSlot(s, (uint64_t)slot);
     if (!storeSet(s, key, keyLen, (const uint8_t *)&v, sizeof(v), sizeof(v),
@@ -648,7 +691,7 @@ static inline bool storeCas(Store &s, const uint8_t *key, uint16_t keyLen,
   Entry *e = s.entryAt(pos);
   if (!(e->flags & FLAG_NUMBER) || e->storedLen != sizeof(double)) return false;
   uint32_t now = nowRelMs(s);
-  if (e->expiresAt && e->expiresAt <= now) return false;
+  if (tcExpired(e->expiresAt, now)) return false;
   double cur = 0; memcpy(&cur, s.valOf(e), sizeof(cur));
   if (!(cur == expected)) return false;            // NaN never matches, as with ===
   uint32_t seq = e->seq.load(std::memory_order_relaxed);

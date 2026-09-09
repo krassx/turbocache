@@ -196,7 +196,18 @@ struct Store {
     h->tailPub.store(0, std::memory_order_relaxed);
     h->epochMs = nowMs();
     h->maxLive = (uint64_t)(indexSlots * MAX_LOAD);
-    if (!openHints(nm, true)) return false;
+    if (!openHints(nm, true)) {
+      // Returning false here used to leave `base` mapped and `h` set while idx
+      // and data stayed null, so NEED_STORE passed and the first get()
+      // dereferenced null. It also leaked the segment: nothing unlinked it, and
+      // this is reachable without misuse -- macOS caps shm names at 31 chars and
+      // the hints name appends ".h", so any name of 30+ chars fails HERE, after
+      // the arena object already exists.
+      shmClose(base, mapBytes, &baseHandle);
+      base = nullptr; h = nullptr;
+      shmUnlink(nm);
+      return false;
+    }
     bind();
     memset(idx, 0, indexBytes);
     memset(hints, 0, h->hintsBytes);
@@ -222,7 +233,11 @@ struct Store {
     // Hints live in their OWN segment, opened read-write. The arena fd above is
     // O_RDONLY, so a worker cannot map the arena writable even deliberately -
     // the isolation is a property of the descriptor, not just of the mapping.
-    if (!openHints(nm, false)) return false;
+    if (!openHints(nm, false)) {
+      shmClose(base, mapBytes, &baseHandle);
+      base = nullptr; h = nullptr;
+      return false;
+    }
     bind();
     return true;
   }

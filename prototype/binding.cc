@@ -42,6 +42,19 @@ static bool isBinaryValue(napi_env env, napi_value v) {
   return isBuf || isTa || isAb || isDv;
 }
 
+// TTL from JS, clamped. napi_get_value_int32 applies ToInt32, so a 30-day TTL
+// (2,592,000,000 ms) wrapped to a NEGATIVE value and became "no expiry" -- the
+// value was immortal -- while a 50-day TTL became 25,032,704 ms, expiring in 7
+// hours. Read it as a double and clamp to the range the wrap-aware comparison
+// can represent, so an over-long TTL is capped rather than inverted.
+static inline uint32_t readTtlMs(napi_env env, napi_value v) {
+  double d = 0;
+  if (napi_get_value_double(env, v, &d) != napi_ok) return 0;
+  if (!(d > 0)) return 0;                       // also catches NaN
+  if (d > (double)TC_TTL_MAX_MS) return TC_TTL_MAX_MS;
+  return (uint32_t)d;
+}
+
 static bool readKey(napi_env env, napi_value v, char *buf, size_t *outLen) {
   size_t need = 0;
   if (napi_get_value_string_utf8(env, v, nullptr, 0, &need) != napi_ok) return false;
@@ -82,6 +95,14 @@ static void put(napi_env env, napi_value o, const char *k, double v);
 // Every entry point must tolerate being called before an arena exists or
 // after one was destroyed: both used to dereference a null header and SIGSEGV.
 #define NEED_STORE(ret) if (!g.base || !g.h) { return ret; }
+
+// Mutating entry points must refuse a read-only attachment. Without this a
+// worker that reached set/del/incr/cas/clear/sweep/heartbeat -- or Get's
+// non-LZ4 branch, which increments a counter in the header -- took a SIGBUS on
+// the PROT_READ mapping instead of an exception it could handle.
+#define NEED_WRITABLE(ret) if (!g.writable) { \
+  napi_throw_error(env, nullptr, "turbocache: this process attached the arena read-only; " \
+                                 "only the primary may write"); return ret; }
 
 #define ARG(n) napi_value argv[n]; size_t argc = n; \
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
@@ -284,11 +305,11 @@ static napi_value SubmitSet(napi_env env, napi_callback_info info) {
   if (!readKey(env, argv[0], key, &klen)) return nullptr;
   size_t vlen = 0; uint8_t flags = 0;
   if (!encodeValue(env, argv[1], &vlen, &flags)) { napi_get_boolean(env, false, &r); return r; }
-  int32_t ttlMs = 0, ns = 0;
-  if (argc > 2) napi_get_value_int32(env, argv[2], &ttlMs);
+  int32_t ns = 0;
+  uint32_t ttlMs = argc > 2 ? readTtlMs(env, argv[2]) : 0;
   if (argc > 3) napi_get_value_int32(env, argv[3], &ns);
   bool ok = submitPush(g_submit, (uint32_t)g_ringIdx, SUBMIT_OP_SET, flags,
-                       (uint16_t)ns, (uint32_t)(ttlMs > 0 ? ttlMs : 0),
+                       (uint16_t)ns, ttlMs,
                        key, (uint32_t)klen, scratch, (uint32_t)vlen);
   napi_get_boolean(env, ok, &r); return r;
 }
@@ -360,7 +381,8 @@ static napi_value SubmitDrain(napi_env env, napi_callback_info info) {
         const uint8_t *k = base + off + sizeof(SubmitRec);
         const uint8_t *v = k + rec->keyLen;
         if (rec->op == SUBMIT_OP_SET) {
-          uint32_t expiresAt = rec->ttlMs ? nowRelMs(g) + rec->ttlMs : 0;
+          uint32_t ttl = rec->ttlMs > TC_TTL_MAX_MS ? TC_TTL_MAX_MS : rec->ttlMs;
+          uint32_t expiresAt = ttl ? nowRelMs(g) + ttl : 0;
           storeSet(g, k, (uint16_t)rec->keyLen, v, rec->valLen, rec->valLen,
                    rec->flags, expiresAt, (uint16_t)(i + 1), (uint8_t)rec->ns);
         } else {
@@ -444,6 +466,7 @@ static napi_value SubmitDestroy(napi_env env, napi_callback_info info) {
 static napi_value Set(napi_env env, napi_callback_info info) {
   ARG(5)
   NEED_STORE(nullptr)
+  NEED_WRITABLE(nullptr)
   char key[KEY_MAX + 1]; size_t klen = 0;
   if (!readKey(env, argv[0], key, &klen)) return nullptr;
   size_t vlen = 0;
@@ -460,11 +483,11 @@ static napi_value Set(napi_env env, napi_callback_info info) {
     }
 #endif
   }
-  int32_t writerId = 0, ttlMs = 0, ns = 0;
+  int32_t writerId = 0, ns = 0;
   if (argc > 2) napi_get_value_int32(env, argv[2], &writerId);
-  if (argc > 3) napi_get_value_int32(env, argv[3], &ttlMs);
+  uint32_t ttlMs = argc > 3 ? readTtlMs(env, argv[3]) : 0;
   if (argc > 4) napi_get_value_int32(env, argv[4], &ns);
-  uint32_t expiresAt = ttlMs > 0 ? nowRelMs(g) + (uint32_t)ttlMs : 0;
+  uint32_t expiresAt = ttlMs ? nowRelMs(g) + ttlMs : 0;
   bool ok = storeSet(g, (const uint8_t *)key, (uint16_t)klen, payload, storedLen, rawLen,
                      flags, expiresAt, (uint16_t)writerId, (uint8_t)ns);
   napi_value r; napi_get_boolean(env, ok, &r); return r;
@@ -490,7 +513,7 @@ static napi_value Get(napi_env env, napi_callback_info info) {
     // A compressed entry in a build without LZ4: report a miss rather than
     // hand back compressed bytes. attach() refuses such an arena up front, so
     // this is a belt-and-braces path.
-    g.h->readsSkippedNoLz4++;
+    if (g.writable) g.h->readsSkippedNoLz4++;   // header is read-only in a worker
     return nullptr;
 #endif
   }
@@ -550,6 +573,7 @@ static napi_value Has(napi_env env, napi_callback_info info) {
 static napi_value Del(napi_env env, napi_callback_info info) {
   ARG(2)
   NEED_STORE(nullptr) char key[KEY_MAX + 1]; size_t klen = 0;
+  NEED_WRITABLE(nullptr)
   napi_value r;
   if (!readKey(env, argv[0], key, &klen)) { napi_get_boolean(env, false, &r); return r; }
   int32_t writerId = 0; if (argc > 1) napi_get_value_int32(env, argv[1], &writerId);
@@ -576,6 +600,7 @@ static napi_value NsResolve(napi_env env, napi_callback_info info) {
 static napi_value ClearNamespace(napi_env env, napi_callback_info info) {
   ARG(2)
   NEED_STORE(nullptr) int32_t ns = 0, writerId = 0;
+  NEED_WRITABLE(nullptr)
   napi_get_value_int32(env, argv[0], &ns);
   if (argc > 1) napi_get_value_int32(env, argv[1], &writerId);
   napi_value r;
@@ -594,6 +619,7 @@ static napi_value ClearNamespace(napi_env env, napi_callback_info info) {
 static napi_value Incr(napi_env env, napi_callback_info info) {
   ARG(5)
   NEED_STORE(nullptr)
+  NEED_WRITABLE(nullptr)
   char key[KEY_MAX + 1]; size_t klen = 0;
   if (!readKey(env, argv[0], key, &klen)) return nullptr;
   double by = 1; napi_get_value_double(env, argv[1], &by);
@@ -601,7 +627,7 @@ static napi_value Incr(napi_env env, napi_callback_info info) {
   napi_get_value_int32(env, argv[2], &writerId);
   napi_get_value_int32(env, argv[3], &ttlMs);
   napi_get_value_int32(env, argv[4], &ns);
-  uint32_t expiresAt = ttlMs > 0 ? nowRelMs(g) + (uint32_t)ttlMs : 0;
+  uint32_t expiresAt = ttlMs ? nowRelMs(g) + ttlMs : 0;
   double out = 0;
   if (!storeIncr(g, (const uint8_t *)key, (uint16_t)klen, by, expiresAt,
                  (uint16_t)writerId, (uint8_t)ns, &out)) return nullptr;
@@ -611,6 +637,7 @@ static napi_value Incr(napi_env env, napi_callback_info info) {
 static napi_value Cas(napi_env env, napi_callback_info info) {
   ARG(4)
   NEED_STORE(nullptr)
+  NEED_WRITABLE(nullptr)
   char key[KEY_MAX + 1]; size_t klen = 0;
   if (!readKey(env, argv[0], key, &klen)) return nullptr;
   double expected = 0, next = 0; int32_t writerId = 0;
@@ -626,6 +653,7 @@ static napi_value Cas(napi_env env, napi_callback_info info) {
 static napi_value SweepExpired(napi_env env, napi_callback_info info) {
   ARG(2)
   NEED_STORE(nullptr)
+  NEED_WRITABLE(nullptr)
   double cur = 0; int32_t maxSlots = 0;
   napi_get_value_double(env, argv[0], &cur);
   napi_get_value_int32(env, argv[1], &maxSlots);
@@ -657,6 +685,7 @@ static napi_value SweepExpired(napi_env env, napi_callback_info info) {
 // and stop trusting the arena. The field existed but nothing ever wrote it.
 static napi_value Heartbeat(napi_env env, napi_callback_info) {
   NEED_STORE(nullptr)
+  NEED_WRITABLE(nullptr)
   g.h->heartbeatNs.store(nowNs(), std::memory_order_release);
   return nullptr;
 }
@@ -681,17 +710,37 @@ static napi_value ScanKeys(napi_env env, napi_callback_info info) {
   napi_value arr; napi_create_array(env, &arr);
   uint32_t n = 0;
   uint64_t i = (uint64_t)cur;
+  // Every handle created here lives until this callback returns, and `max` is
+  // caller-controlled, so cap it rather than letting one call pin an unbounded
+  // number of V8 handles. Callers page with the returned cursor anyway.
+  if (max <= 0 || max > 10000) max = 10000;
+  char kbuf[KEY_MAX];
   for (; i < h->indexSlots && (int32_t)n < max; i++) {
     uint64_t hv = g.idx[i].hash.load(std::memory_order_acquire);
     if (hv == HASH_EMPTY || hv == HASH_TOMB) continue;
     uint64_t pos = g.idx[i].off.load(std::memory_order_acquire);
     Entry *e = g.entryAt(pos);
-    if (h->mode != MODE_SLAB && h->tailPub.load(std::memory_order_acquire) > pos) continue;
-    if (ns >= 0 && e->ns != (uint8_t)ns) continue;
+    // COPY, then verify -- the same protocol storeGet uses. This used to read
+    // keyLen and the key bytes directly after checking liveness BEFORE the read,
+    // so a record evicted and overwritten in between handed back whatever now
+    // occupied those bytes: measured 16 garbage keys (value bytes returned as
+    // key text) out of 154M enumerated under concurrent primary writes.
+    uint32_t s1 = e->seq.load(std::memory_order_acquire);
+    if (s1 & 1u) continue;                       // write in progress
     uint16_t kl = e->keyLen;
+    uint8_t ens = e->ns;
+    uint64_t ehash = e->hash;
     if (kl == 0 || kl > KEY_MAX) continue;
+    memcpy(kbuf, g.keyOf(e), kl);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (e->seq.load(std::memory_order_acquire) != s1) continue;   // torn
+    // Liveness AFTER the copy: a monotonic position proves the record was not
+    // reused underneath us, which a seqlock alone cannot (see decision 19).
+    if (h->mode != MODE_SLAB && h->tailPub.load(std::memory_order_acquire) > pos) continue;
+    if (ehash != hv) continue;                   // slot no longer points here
+    if (ns >= 0 && ens != (uint8_t)ns) continue;
     napi_value k;
-    if (napi_create_string_utf8(env, (const char *)g.keyOf(e), kl, &k) != napi_ok) continue;
+    if (napi_create_string_utf8(env, kbuf, kl, &k) != napi_ok) continue;
     napi_set_element(env, arr, n++, k);
   }
   napi_value o; napi_create_object(env, &o);
@@ -707,7 +756,7 @@ static napi_value NsStats(napi_env env, napi_callback_info) {
   napi_value arr; napi_create_array(env, &arr);
   for (uint32_t i = 0; i < g.h->nsCount; i++) {
     napi_value o; napi_create_object(env, &o);
-    napi_value nm; napi_create_string_latin1(env, g.h->nsName[i], NAPI_AUTO_LENGTH, &nm);
+    napi_value nm; napi_create_string_utf8(env, g.h->nsName[i], NAPI_AUTO_LENGTH, &nm);
     napi_set_named_property(env, o, "name", nm);
     put(env, o, "id", i);
     put(env, o, "bytes", (double)g.h->nsBytes[i]);
@@ -721,7 +770,9 @@ static napi_value NsStats(napi_env env, napi_callback_info) {
 
 static napi_value ClearAll(napi_env env, napi_callback_info info) {
   ARG(1)
-  NEED_STORE(nullptr) int32_t writerId = 0; if (argc > 0) napi_get_value_int32(env, argv[0], &writerId);
+  NEED_STORE(nullptr)
+  NEED_WRITABLE(nullptr)
+  int32_t writerId = 0; if (argc > 0) napi_get_value_int32(env, argv[0], &writerId);
   storeClear(g, (uint16_t)writerId);
   return nullptr;
 }
@@ -1030,7 +1081,10 @@ static napi_value RingRead(napi_env env, napi_callback_info info) {
   uint64_t cursor = (uint64_t)cd;
   Header *h = g.h;
   uint64_t head = h->ringHead.load(std::memory_order_acquire);
-  bool wrapped = (head - cursor) > h->ringCap;
+  // `>=`, not `>`: ringAppend writes the record at `head & mask` BEFORE
+  // publishing head+1, so the slot exactly ringCap behind the head is the one
+  // being overwritten right now. Treating it as readable returns a torn record.
+  bool wrapped = (head - cursor) >= h->ringCap;
   if (wrapped) cursor = head > h->ringCap ? head - h->ringCap : 0;
 
   napi_value arr; napi_create_array(env, &arr);
@@ -1047,6 +1101,15 @@ static napi_value RingRead(napi_env env, napi_callback_info info) {
   napi_value o; napi_create_object(env, &o);
   put(env, o, "head", (double)(cursor + n));
   put(env, o, "ringHead", (double)head);
+  // The writer can lap us DURING the loop above -- an 8192-record ring is only a
+  // few milliseconds of primary writes, and one preemption inside this call is
+  // enough. Without re-checking, the reader returns records from a newer lap
+  // while believing it drained the older ones, never reports `wrapped`, and the
+  // worker's L1 keeps stale values with nothing left to correct them.
+  {
+    uint64_t head2 = h->ringHead.load(std::memory_order_acquire);
+    if (!wrapped && (head2 - cursor) >= h->ringCap) wrapped = true;
+  }
   napi_value w; napi_get_boolean(env, wrapped, &w);
   napi_set_named_property(env, o, "wrapped", w);
   napi_set_named_property(env, o, "hashes", arr);

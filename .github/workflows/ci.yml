@@ -39,6 +39,9 @@ jobs:
             echo "--- transport_regression_test.js ($t)"
             TC_T=$t node transport_regression_test.js || { echo "FAILED: transport ($t)"; fail=1; }
           done
+          echo "--- native_regression_test.cc (TTL wrap, log wrap gap)"
+          c++ -std=c++17 -O2 -I. -o /tmp/native_test native_regression_test.cc \
+            && /tmp/native_test || { echo "FAILED: native_regression_test"; fail=1; }
           echo "--- submit_test.cc (submission ring, standalone)"
           c++ -std=c++17 -O2 -o /tmp/submit_test submit_test.cc -lpthread \
             && /tmp/submit_test || { echo "FAILED: submit_test"; fail=1; }
