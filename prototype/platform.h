@@ -27,6 +27,9 @@
   #include <signal.h>
   #include <errno.h>
   #include <time.h>
+  #ifdef __APPLE__
+    #include <mach/mach_time.h>
+  #endif
 #endif
 
 struct ShmHandle {
@@ -210,6 +213,39 @@ static inline uint32_t platformPid() {
   return (uint32_t)getpid();
 #endif
 }
+
+// A monotonic, system-wide tick clock that COUNTS SUSPEND.
+//
+// Everything that crosses a process boundary -- the heartbeat and the TTL epoch
+// -- used nowNs(), i.e. CLOCK_REALTIME. Two consequences: a forward NTP step
+// larger than primaryStaleMs marked a healthy primary dead in every worker at
+// once, and a backward step shifted every TTL. Wall clock is the wrong domain
+// for "how long since" between processes.
+//
+// "Just use CLOCK_MONOTONIC" is not portable in the sense we need: on Linux it
+// EXCLUDES suspend, on macOS it INCLUDES it (there it is mach_continuous_time).
+// Suspend must be counted -- a TTL should still elapse while a laptop sleeps,
+// which is what wall-clock TTL meant -- so each platform gets its explicitly
+// suspend-counting clock rather than the one with the matching name.
+static inline uint64_t ticksNs() {
+#if defined(_WIN32)
+  // Win10+. Exported from kernel32 but its import library is Mincore.lib, which
+  // node-gyp does not link, so resolve it dynamically and keep the gyp file as
+  // it is. GetTickCount64 is the pre-Win10 fallback at 15.6ms resolution.
+  typedef VOID(WINAPI * QITP)(PULONGLONG);
+  static QITP fn = (QITP)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "QueryInterruptTimePrecise");
+  if (fn) { ULONGLONG t = 0; fn(&t); return (uint64_t)t * 100ull; }
+  return GetTickCount64() * 1000000ull;
+#elif defined(__APPLE__)
+  static mach_timebase_info_data_t tb = {0, 0};
+  if (!tb.denom) mach_timebase_info(&tb);
+  return mach_continuous_time() * tb.numer / tb.denom;
+#else
+  struct timespec ts; clock_gettime(CLOCK_BOOTTIME, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+static inline uint64_t ticksMs() { return ticksNs() / 1000000ull; }
 
 static inline uint64_t nowNs() {
 #ifdef _WIN32

@@ -63,6 +63,14 @@ function gcUnsubscribe(inst) {
     if (gcSubscribers.size === 0 && gcObserver) { gcObserver.disconnect(); gcObserver = null; }
 }
 
+// L1 expiry runs on a MONOTONIC clock, matching the arena's tick-based epoch.
+// With Date.now() an NTP step moved L1 and L2 expiry in opposite directions:
+// a backward step made L1 entries immortal while L2 expired them on schedule,
+// and a forward step did the reverse. performance.now() measured 21.5ns against
+// Date.now()'s 23.7ns, so correctness here is free.
+const { performance } = require('perf_hooks');
+const monoMs = () => performance.now();
+
 const MSG = 'tc';
 const RING_MSG = 'tcr';   // doorbell only: 'your submission rings are non-empty'
 // Max second-chance reprieves per L1 insert. Matches the arena's budget in
@@ -71,6 +79,7 @@ const L1_SECOND_CHANCE_BUDGET = 16;
 let storeReady = false;
 let submitName = null;    // primary: the segment it created, null = IPC transport
 let submitReady = null;   // worker: the segment name it successfully opened
+let attachedName = null;  // worker: the arena name, so it can re-attach after a primary death
 let isPrimaryProcess = false;   // set by createPrimary; guards the id-0 write path
 const installedWorkers = new WeakSet();   // workers already wired by install()      // the native store is a per-process singleton
 const instances = new Set();  // live caches in THIS process, for local invalidation
@@ -82,6 +91,7 @@ class TurboCache {
     #l1Iter = null;
     #ringIdx = -1;            // shared-memory submission ring, -1 = use IPC
     #ringMaxValue = 0;        // largest value one ring record can carry
+    #transportOpt = 'shm';
     #pendingDel = new Set();  // keys this worker deleted but the primary has not applied yet
     #pendingDelHash = new Map();   // hash -> key, so the invalidation record can clear it:
                                    // #l1Drop already removed the #byHash entry, so without this
@@ -102,11 +112,11 @@ class TurboCache {
     #timer = null;
     #sweepCursor = 0;
     #drainTicks = 0;
+    #lastStaleCheck = 0;
     #staleMs = 5000;
     #primaryDead = false;
     #keyMax = 1024;
     // Native expiry is milliseconds from the arena's creation time.
-    #arenaEpochMs = 0;
     #id;
     #codec;
     #l1Decoded = true;
@@ -143,7 +153,6 @@ class TurboCache {
         }
         this.#maxValue = native.maxValueBytes();
         this.#keyMax = native.keyMaxBytes();
-        this.#arenaEpochMs = native.epochMs();
         instances.add(this);
         this.#l1Max = opts.l1MaxBytes ?? (2 * 1024 * 1024);
         this.#outboxMaxBytes = opts.outboxMaxBytes ?? (1 << 20);
@@ -159,6 +168,7 @@ class TurboCache {
             throw new Error('turbocache: workerId 0 is the primary; a worker must use ' +
                             'attachWorker() or open() so cluster assigns its id');
         this.#attached = opts.attached !== false;
+        this.#transportOpt = opts.transport || 'shm';
         // 'primitives' mode: accept only string/number/boolean/null. Buys three
         // things the codec mode cannot: byte accounting that is exact rather
         // than a heapFactor estimate, no aliasing hazard (primitives are
@@ -487,6 +497,7 @@ class TurboCache {
         for (let round = 0; round < 64; round++) {
             let r;
             try { r = native.ringRead(TurboCache.#primaryCursor, 1024); } catch { return; }
+            if (!r) return;                        // store detached underneath us
             if (r.wrapped) {                       // fell too far behind: flush wholesale
                 for (const c of instances) c.clearLocal();
                 TurboCache.#primaryCursor = r.head;
@@ -508,6 +519,100 @@ class TurboCache {
     _dropByHash(hash) {
         const k = this.#byHash.get(hash);
         if (k !== undefined) { this.#l1Drop(k); this.#byHash.delete(hash); this.stats.invalidated++; }
+    }
+
+    // --- primary death and recovery --------------------------------------
+    //
+    // A worker whose primary died used to degrade to L1-only PERMANENTLY, even
+    // once a new primary was running. Two things force the shape of the fix:
+    //
+    //   1. A new primary is a NEW SEGMENT. create() unlinks and re-creates, so
+    //      the mapping a degraded worker still holds is an orphan that will
+    //      never receive another update. Detecting a new primary therefore means
+    //      re-opening BY NAME, not watching the header we already hold.
+    //   2. The worker must let go FIRST. On Windows CreateFileMappingA fails
+    //      with ERROR_ALREADY_EXISTS while any process holds a handle, so a
+    //      worker clinging to a dead arena prevents a new primary from ever
+    //      starting. Detaching is mandatory, not hygiene - and free, since a
+    //      degraded worker serves L1 only and never touches the arena.
+    //
+    // State is on the CLASS, not the instance: `native` is process-global, so
+    // one detach/attach drives every cache in the process.
+    static #degraded = false;
+    static #recoverTimer = null;
+    static #lastHb = -1;
+
+    static #degrade(age) {
+        if (TurboCache.#degraded || isPrimaryProcess) return;
+        TurboCache.#degraded = true;
+        for (const c of instances) {
+            c._setDead(true, `primary heartbeat is ${age < 0 ? 'in the future' : age + 'ms old'}; serving L1 only`);
+        }
+        // Give the ring slot back before unmapping, or it stays owned by this pid
+        // in a segment nobody will reclaim.
+        try { native.submitRelease(); } catch { /* not using the ring */ }
+        try { native.submitDestroy(); } catch { /* not created */ }
+        submitReady = null;
+        try { native.detach(); } catch { /* already gone */ }
+        storeReady = false;
+        TurboCache.#lastHb = -1;
+        if (TurboCache.#recoverTimer || !attachedName) return;
+        TurboCache.#recoverTimer = setInterval(() => TurboCache.#tryRecover(), 1000);
+        if (TurboCache.#recoverTimer.unref) TurboCache.#recoverTimer.unref();
+    }
+
+    static #tryRecover() {
+        if (!attachedName) return;
+        if (!native.attach(attachedName)) return;              // no primary yet
+        // A plausible age proves nothing: a dead primary's last stamp still looks
+        // recent until staleMs elapses, and a freshly created arena starts with a
+        // fresh one. Require the heartbeat to ADVANCE between two polls, which
+        // only a live writer can do. The primary stamps every 500ms, so a healthy
+        // one passes within two ticks.
+        const hb = native.heartbeatRaw();
+        const age = native.heartbeatAgeMs();
+        if (hb === TurboCache.#lastHb || age < 0 || age > TurboCache.#staleMsFor()) {
+            TurboCache.#lastHb = hb;
+            try { native.detach(); } catch {}
+            storeReady = false;
+            return;
+        }
+        clearInterval(TurboCache.#recoverTimer);
+        TurboCache.#recoverTimer = null;
+        TurboCache.#degraded = false;
+        storeReady = true;
+        const id = native.arenaId();
+        const sameArena = TurboCache.#arenaId !== null && id === TurboCache.#arenaId;
+        TurboCache.#arenaId = id;
+        for (const c of instances) c._recovered(sameArena);
+    }
+
+    // Half the staleness budget, so "alive" is a stricter test than "dead" was.
+    // The asymmetry is what stops a primary that stalls periodically from
+    // flapping every worker's L1 back and forth.
+    static #staleMsFor() {
+        for (const c of instances) return c._staleMs() / 2;
+        return 2500;
+    }
+    static #arenaId = null;
+
+    _setDead(dead, msg) {
+        this.#primaryDead = dead;
+        if (msg) this.lastError = msg;
+    }
+    _staleMs() { return this.#staleMs; }
+    _recovered(sameArena) {
+        // Everything this worker believed about the arena is now suspect: it
+        // missed every invalidation while detached, and an unapplied delete is a
+        // lost write rather than a pending one.
+        this.clearLocal();
+        this.#cursor = native.ringHead();      // not 0: replaying a ring we already flushed for is waste
+        this.#ringIdx = -1;
+        if (this.#transportOpt !== 'ipc' && attachedName) this.useSubmissionRing(attachedName + '_sub');
+        this.#primaryDead = false;
+        this.lastError = null;
+        this.stats.recoveries = (this.stats.recoveries || 0) + 1;
+        this.stats.lastRecovery = { sameArena, at: Date.now() };
     }
 
     static submitStats() { try { return native.submitStats(); } catch { return null; } }
@@ -557,6 +662,7 @@ class TurboCache {
             throw new Error(`workerId must be an integer >= 1 (0 is reserved for the primary), got ${JSON.stringify(workerId)}`);
         if (!native.attach(name)) throw new Error('arena attach failed');
         storeReady = true;
+        attachedName = name;
         const c = new TurboCache({ ...opts, workerId: wid });
         if (opts.transport !== 'ipc') c.useSubmissionRing(name + '_sub');
         return c;
@@ -655,18 +761,30 @@ class TurboCache {
     // unchanged, before paying for a real drain.
     #drain() {
         if (this.#id === 0) return;
+        // Degraded means the arena is UNMAPPED (we must let go so a new primary
+        // can create one), so every native arena call below would return
+        // undefined and the ring read would then dereference it. The recovery
+        // timer owns re-attaching; until it succeeds this cache is L1-only.
+        if (this.#primaryDead || !storeReady) return;
         // A dead primary cannot invalidate anything, so the arena is frozen and
         // increasingly stale. Degrade to L1-only rather than serve it silently.
-        if (!this.#primaryDead && ++this.#drainTicks >= 256) {
-            this.#drainTicks = 0;
-            const age = native.heartbeatAgeMs();
-            if (age > this.#staleMs) {
-                this.#primaryDead = true;
-                this.lastError = `primary heartbeat is ${age}ms old; serving L1 only`;
+        // Staleness is a question about TIME, so check it on a clock rather than
+        // every 256 drains. Tied to the operation count, a worker doing three
+        // reads a second took 85 seconds to notice a dead primary, and one that
+        // went quiet and came back served stale data on its first read. monoMs()
+        // is ~21ns against the native ringHead() call this function already
+        // makes, so the check is free at any call rate.
+        if (!this.#primaryDead) {
+            const t = monoMs();
+            if (t - this.#lastStaleCheck >= 500) {
+                this.#lastStaleCheck = t;
+                const age = native.heartbeatAgeMs();
+                if (age < 0 || age > this.#staleMs) { TurboCache.#degrade(age); return; }
             }
         }
         if (native.ringHead() === this.#cursor) return;
         const r = native.ringRead(this.#cursor, 512);
+        if (!r) return;                            // detached mid-drain
         if (r.wrapped) {                       // fell too far behind: flush wholesale
             this.#l1.clear(); this.#byHash.clear(); this.#l1Bytes = 0; this.#l1Iter = null; this.#pendingDel.clear(); this.#pendingDelHash.clear();
             this.#cursor = r.head;
@@ -722,7 +840,7 @@ class TurboCache {
         // TTL must be enforced in L1 too. The arena expires lazily on read, but
         // an L1 hit never reaches the arena, so without this an expired value
         // is served indefinitely from L1.
-        if (e !== undefined && e.exp && e.exp <= Date.now()) { this.#l1Drop(key); }
+        if (e !== undefined && e.exp && e.exp <= monoMs()) { this.#l1Drop(key); }
         else if (e !== undefined) {
             e.hits++; this.stats.l1Hits++;
             // Binary is copied on every read (decision 7): it is mutable, and
@@ -739,8 +857,8 @@ class TurboCache {
         // Carry the arena entry's expiry into L1. Without this the refilled L1
         // entry had no TTL at all, so any expiring value read once through L2
         // became immortal in that worker.
-        const expSec = native.lastExpiresAt();
-        const expMs = expSec ? this.#arenaEpochMs + expSec : 0;
+        const rem = native.lastTtlRemainingMs();
+        const expMs = rem ? monoMs() + rem : 0;
         if (this.#codec && !this.#l1Decoded) {          // safe mode: cache the encoded form
             this.#l1Put(key, raw, native.hashKey(key), raw.length, expMs);
             return this.#codec.decode(raw);
@@ -861,7 +979,7 @@ class TurboCache {
             return false;
         }
         this.#l1Put(key, l1Value, keyHash, this.#noCodec ? 0 : enc.length,
-                    ttlMs > 0 ? Date.now() + ttlMs : 0);
+                    ttlMs > 0 ? monoMs() + ttlMs : 0);
         if (this.#id === 0) {
             const ok = native.set(key, enc, 0, ttlMs, this.#nsId) === true;
             if (!ok) { this.stats.rejectedSize++; this.lastError = 'value does not fit the arena'; this.#l1Drop(key); }
@@ -923,7 +1041,7 @@ class TurboCache {
         if (this.#pendingDel.size && this.#pendingDel.has(key)) return false;
         const e = this.#l1.get(key);
         if (e !== undefined) {
-            if (!e.exp || e.exp > Date.now()) return true;
+            if (!e.exp || e.exp > monoMs()) return true;
             this.#l1Drop(key);
         }
         return native.has(key);

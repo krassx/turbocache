@@ -9,7 +9,7 @@ static inline uint64_t align8(uint64_t v) { return (v + 7) & ~7ull; }
 
 // Milliseconds since this arena was created, as a uint32.
 static inline uint32_t nowRelMs(const Store &s) {
-  return (uint32_t)(nowMs() - s.h->epochMs);
+  return (uint32_t)((ticksNs() - s.h->epochTicksNs) / 1000000ull);
 }
 
 // Has `exp` passed, given the current relative time? 0 means "no expiry".

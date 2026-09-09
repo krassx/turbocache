@@ -15,7 +15,7 @@
 #include "vendor/rapidhash.h"
 
 static const uint32_t TC_MAGIC = 0x54430001;
-static const uint32_t TC_LAYOUT = 2;   // 2: BigInt words moved to offset 8 for alignment
+static const uint32_t TC_LAYOUT = 3;   // 2: BigInt words at offset 8; 3: tick-clock epoch + arenaId
 static const uint32_t FEATURE_LZ4 = 1;
 static const uint64_t HASH_EMPTY = 0;
 static const uint64_t HASH_TOMB  = 1;
@@ -84,7 +84,18 @@ struct Header {
   uint64_t dataOff;   uint64_t dataBytes;
   uint64_t ringOff;   uint64_t ringCap;      // power of two
   uint64_t hintsBytes;                       // size of the separate hints segment
-  uint64_t epochMs;                // arena creation time; expiries are ms from here
+  // Expiries are milliseconds from here, measured on the TICK clock, not wall
+  // clock: an NTP step used to shift every TTL and could mark a healthy primary
+  // dead in every worker simultaneously.
+  uint64_t epochTicksNs;
+  // Identity of THIS creation. A worker that lost its primary and re-attaches by
+  // name needs to tell "the same primary resumed" (SIGSTOP, a long GC, laptop
+  // sleep) from "a different primary now owns this name" - the recovery actions
+  // are identical, but conflating them in the logs makes an outage unreadable.
+  // epochMs alone could not do it: wall clock, and two creates can land in one ms.
+  uint64_t arenaId;
+  uint32_t primaryPid;
+  uint32_t _pad2;
   std::atomic<uint64_t> tailPub;   // logTail, republished for readers
   std::atomic<uint64_t> ringHead;
   std::atomic<uint64_t> heartbeatNs;
@@ -204,7 +215,9 @@ struct Store {
     }
     h->bumpPtr = 0; h->clockHand = 0; h->logHead = 0; h->logTail = 0;
     h->tailPub.store(0, std::memory_order_relaxed);
-    h->epochMs = nowMs();
+    h->epochTicksNs = ticksNs();
+    h->arenaId = h->epochTicksNs ^ ((uint64_t)platformPid() << 32) ^ nowNs();
+    h->primaryPid = platformPid();
     h->maxLive = (uint64_t)(indexSlots * MAX_LOAD);
     if (!openHints(nm, true)) {
       // Returning false here used to leave `base` mapped and `h` set while idx

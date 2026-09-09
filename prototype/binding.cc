@@ -696,7 +696,7 @@ static napi_value SweepExpired(napi_env env, napi_callback_info info) {
 static napi_value Heartbeat(napi_env env, napi_callback_info) {
   NEED_STORE(nullptr)
   NEED_WRITABLE(nullptr)
-  g.h->heartbeatNs.store(nowNs(), std::memory_order_release);
+  g.h->heartbeatNs.store(ticksNs(), std::memory_order_release);
   return nullptr;
 }
 static napi_value HeartbeatAgeMs(napi_env env, napi_callback_info) {
@@ -704,9 +704,42 @@ static napi_value HeartbeatAgeMs(napi_env env, napi_callback_info) {
   uint64_t hb = g.h->heartbeatNs.load(std::memory_order_acquire);
   napi_value r;
   if (!hb) { napi_create_double(env, -1, &r); return r; }   // never stamped
-  uint64_t now = nowNs();
-  napi_create_double(env, now > hb ? (double)((now - hb) / 1000000ull) : 0, &r);
+  // Clamping a past-dated stamp to 0 made a DEAD primary look alive whenever the
+  // clock had moved backwards. Ticks never move backwards, so a stamp in the
+  // future now means a corrupt or foreign header, which is not "healthy".
+  uint64_t now = ticksNs();
+  napi_create_double(env, now >= hb ? (double)((now - hb) / 1000000ull) : -1, &r);
   return r;
+}
+
+// The heartbeat stamp itself. Recovery needs to see it ADVANCE across two polls:
+// a plausible-looking age proves nothing, because a dead primary's last stamp
+// keeps looking recent until staleMs elapses, and a freshly created arena starts
+// with a fresh one.
+static napi_value HeartbeatRaw(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
+  napi_value r;
+  napi_create_double(env, (double)g.h->heartbeatNs.load(std::memory_order_acquire), &r);
+  return r;
+}
+
+// Identity of this arena creation, as hex. Distinguishes "the same primary came
+// back" from "a different primary owns this name now".
+static napi_value ArenaId(napi_env env, napi_callback_info) {
+  NEED_STORE(nullptr)
+  char buf[24];
+  snprintf(buf, sizeof buf, "%llx", (unsigned long long)g.h->arenaId);
+  napi_value r; napi_create_string_latin1(env, buf, NAPI_AUTO_LENGTH, &r); return r;
+}
+
+// Unmap without unlinking. A degraded worker MUST let go: on Windows
+// CreateFileMappingA fails with ERROR_ALREADY_EXISTS while any process still
+// holds a handle, so a worker clinging to a dead arena prevents a new primary
+// from ever starting. It costs nothing - a degraded worker serves L1 only and
+// never touches the arena.
+static napi_value Detach(napi_env env, napi_callback_info) {
+  if (g.base && !g.writable) g.destroy();
+  return nullptr;
 }
 
 static napi_value ScanKeys(napi_env env, napi_callback_info info) {
@@ -1180,10 +1213,25 @@ static napi_value Poke(napi_env env, napi_callback_info) {
 // queuing something the primary will silently drop.
 static napi_value EpochMs(napi_env env, napi_callback_info) {
   NEED_STORE(nullptr)
-  napi_value r; napi_create_double(env, (double)g.h->epochMs, &r); return r;
+  // Ticks, not wall clock. Callers must treat this as opaque: it is only
+  // meaningful relative to another ticksNs() reading in this boot.
+  napi_value r; napi_create_double(env, (double)(g.h->epochTicksNs / 1000000ull), &r); return r;
 }
-static napi_value LastExpiresAt(napi_env env, napi_callback_info) {
-  napi_value r; napi_create_double(env, (double)g_lastExpiresAt, &r); return r;
+// Milliseconds REMAINING on the value the last get() returned, or 0 for no TTL.
+//
+// This used to hand back the raw arena-relative expiresAt, which the JS layer
+// added to the arena epoch to get an absolute wall-clock time. That only worked
+// while the epoch was wall clock; it is a tick reading now, and the two domains
+// cannot be mixed. A remaining duration is domain-independent, so the caller
+// adds it to whatever clock it keeps L1 expiry in.
+static napi_value LastTtlRemainingMs(napi_env env, napi_callback_info) {
+  napi_value r;
+  double v = 0;
+  if (g_lastExpiresAt && g.base && g.h) {
+    int32_t d = (int32_t)(g_lastExpiresAt - nowRelMs(g));
+    v = d > 0 ? (double)d : 1;      // already expiring: 1ms, never 0 (0 means immortal)
+  }
+  napi_create_double(env, v, &r); return r;
 }
 static napi_value KeyMaxBytes(napi_env env, napi_callback_info) {
   napi_value r; napi_create_double(env, (double)KEY_MAX, &r); return r;
@@ -1236,7 +1284,8 @@ static napi_value Init(napi_env env, napi_value exports) {
   FN("submitPending", SubmitPending) FN("submitStats", SubmitStats)
   FN("submitDestroy", SubmitDestroy) FN("submitRelease", SubmitRelease)
   FN("submitMaxValue", SubmitMaxValue)
-  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("nsResolve", NsResolve) FN("clearNamespace", ClearNamespace) FN("nsStats", NsStats) FN("scanKeys", ScanKeys) FN("sweepExpired", SweepExpired) FN("incr", Incr) FN("cas", Cas) FN("heartbeat", Heartbeat) FN("heartbeatAgeMs", HeartbeatAgeMs) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastExpiresAt", LastExpiresAt) FN("epochMs", EpochMs) FN("keyMaxBytes", KeyMaxBytes)
+  FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("nsResolve", NsResolve) FN("clearNamespace", ClearNamespace) FN("nsStats", NsStats) FN("scanKeys", ScanKeys) FN("sweepExpired", SweepExpired) FN("incr", Incr) FN("cas", Cas) FN("heartbeat", Heartbeat) FN("heartbeatAgeMs", HeartbeatAgeMs) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastTtlRemainingMs", LastTtlRemainingMs) FN("epochMs", EpochMs) FN("heartbeatRaw", HeartbeatRaw)
+  FN("arenaId", ArenaId) FN("detach", Detach) FN("keyMaxBytes", KeyMaxBytes)
   FN("destroy", Destroy) FN("poke", Poke)
   FN("suppressRefBit", SetSuppressRefBit) FN("secondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin) FN("hasLz4", HasLz4)
   return exports;

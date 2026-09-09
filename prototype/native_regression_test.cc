@@ -29,7 +29,8 @@ int main() {
   };
   const uint32_t TTL = 5000;
   for (auto& c : cases) {
-    s.h->epochMs = nowMs() - c.uptime;
+    // epochTicksNs, not epochMs: the arena epoch is on the tick clock now.
+    s.h->epochTicksNs = ticksNs() - c.uptime * 1000000ull;
     uint32_t now = nowRelMs(s);
     uint32_t exp = now + TTL;
     char m[160];
