@@ -1576,9 +1576,12 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 14. **No packaging at all**: no `package.json`, no README, no CI, no prebuilds.
     The Node-API ABI check means one prebuild per platform would cover every
     Node major, but none is produced.
-15. **Two vendored-in-name-only dependencies.** `lz4` is linked from a Homebrew
-    path in `binding.gyp`, and `rapidhash.h` is a transcription rather than the
-    upstream header. Both need vendoring before this builds anywhere else.
+15. ~~**Two vendored-in-name-only dependencies.**~~ **Done.** LZ4 is now an
+    optional build feature and the default build links nothing external;
+    `prototype/vendor/rapidhash.h` is the upstream header verbatim (rapidhash V3,
+    MIT, commit recorded in `vendor/README.md`) rather than a transcription.
+    A checkout now builds with only a compiler and Node — verified by building
+    from a clean export of the tree.
 
 ## 14. Assumptions
 

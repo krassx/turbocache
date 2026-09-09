@@ -16,7 +16,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <time.h>
-#include "rapidhash.h"
+#include "vendor/rapidhash.h"
 
 static const uint32_t TC_MAGIC = 0x54430001;
 static const uint32_t TC_LAYOUT = 1;

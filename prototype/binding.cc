@@ -458,7 +458,7 @@ static napi_value Probe(napi_env env, napi_callback_info info) {
   NEED_STORE(nullptr)
   char key[KEY_MAX + 1]; size_t klen = 0;
   if (!readKey(env, argv[0], key, &klen)) return nullptr;
-  uint64_t hash = rapidhash(key, klen, 0);
+  uint64_t hash = rapidhash_withSeed(key, klen, 0);
   if (hash <= HASH_TOMB) hash += 2;
   int64_t slot = g.findSlot(hash, (const uint8_t *)key, (uint16_t)klen);
   napi_value out; napi_create_int32(env, (int32_t)slot, &out); return out;
@@ -730,7 +730,7 @@ static napi_value PrimBytes(napi_env env, napi_callback_info info) {
 static napi_value HashKey(napi_env env, napi_callback_info info) {
   ARG(1) char key[KEY_MAX + 1]; size_t klen = 0;
   if (!readKey(env, argv[0], key, &klen)) return nullptr;
-  uint64_t hv = rapidhash(key, klen, 0);
+  uint64_t hv = rapidhash_withSeed(key, klen, 0);
   if (hv <= HASH_TOMB) hv += 2;
   char buf[24]; snprintf(buf, sizeof(buf), "%llx", (unsigned long long)hv);
   napi_value r; napi_create_string_latin1(env, buf, NAPI_AUTO_LENGTH, &r); return r;

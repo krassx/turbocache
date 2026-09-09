@@ -381,7 +381,7 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
                             uint8_t flags, uint32_t expiresAt, uint16_t writerId,
                             uint8_t ns = 0) {
   Header *h = s.h;
-  uint64_t hash = rapidhash(key, keyLen, 0);
+  uint64_t hash = rapidhash_withSeed(key, keyLen, 0);
   if (hash <= HASH_TOMB) hash += 2;   // reserve 0/1 as sentinels
 
   // Keep the index below its load ceiling. The old loop gave up after a fixed
@@ -452,7 +452,7 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
 // Remove a key. Sole-writer path, like storeSet.
 static inline bool storeDelete(Store &s, const uint8_t *key, uint16_t keyLen, uint16_t writerId) {
   Header *h = s.h;
-  uint64_t hash = rapidhash(key, keyLen, 0);
+  uint64_t hash = rapidhash_withSeed(key, keyLen, 0);
   if (hash <= HASH_TOMB) hash += 2;
   int64_t slot = s.findSlot(hash, key, keyLen);
   if (slot < 0) return false;
@@ -502,7 +502,7 @@ static inline void storeClear(Store &s, uint16_t writerId) {
 // and no promotion. Deliberately does not touch the CLOCK reference bit.
 static inline bool storeHas(Store &s, const uint8_t *key, uint16_t keyLen, uint32_t nowMs) {
   Header *h = s.h;
-  uint64_t hash = rapidhash(key, keyLen, 0);
+  uint64_t hash = rapidhash_withSeed(key, keyLen, 0);
   if (hash <= HASH_TOMB) hash += 2;
   int64_t slot = s.findSlot(hash, key, keyLen);
   if (slot < 0) return false;
@@ -519,7 +519,7 @@ static inline bool storeGet(Store &s, const uint8_t *key, uint16_t keyLen,
                             uint8_t *scratch, size_t scratchCap, ReadResult *out,
                             uint32_t nowMs) {
   Header *h = s.h;
-  uint64_t hash = rapidhash(key, keyLen, 0);
+  uint64_t hash = rapidhash_withSeed(key, keyLen, 0);
   if (hash <= HASH_TOMB) hash += 2;
   uint64_t mask = h->indexSlots - 1;
   uint64_t i = hash & mask;
@@ -586,7 +586,7 @@ static inline bool storeIncr(Store &s, const uint8_t *key, uint16_t keyLen,
                              double by, uint32_t expiresAt, uint16_t writerId,
                              uint8_t ns, double *out) {
   Header *h = s.h;
-  uint64_t hash = rapidhash(key, keyLen, 0);
+  uint64_t hash = rapidhash_withSeed(key, keyLen, 0);
   if (hash <= HASH_TOMB) hash += 2;
   int64_t slot = s.findSlot(hash, key, keyLen);
   if (slot < 0) {                                  // absent counts as zero
@@ -627,7 +627,7 @@ static inline bool storeIncr(Store &s, const uint8_t *key, uint16_t keyLen,
 static inline bool storeCas(Store &s, const uint8_t *key, uint16_t keyLen,
                             double expected, double next, uint16_t writerId) {
   Header *h = s.h;
-  uint64_t hash = rapidhash(key, keyLen, 0);
+  uint64_t hash = rapidhash_withSeed(key, keyLen, 0);
   if (hash <= HASH_TOMB) hash += 2;
   int64_t slot = s.findSlot(hash, key, keyLen);
   if (slot < 0) return false;
