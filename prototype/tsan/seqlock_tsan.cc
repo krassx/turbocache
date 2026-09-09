@@ -85,6 +85,10 @@ int main(int argc, char **argv) {
     stop.store(true);
     w.join(); for (auto &t : rs) t.join();
 
+    // The deliberate race lives inside the arena's DATA region and nowhere
+    // else. Publishing the range lets the analyser judge by address rather than
+    // by function name, which inlining makes unreliable.
+    printf("ARENA_DATA %p %p\n", (void *)g.data, (void *)(g.data + g.h->dataBytes));
     printf("  1 writer + %d readers, %ds: %ld writes, %ld reads, %ld misses, CORRUPT=%ld\n",
            nreaders, seconds, writes.load(), reads.load(), misses.load(), corrupt.load());
     g.destroy();

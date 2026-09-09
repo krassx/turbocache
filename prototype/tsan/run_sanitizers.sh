@@ -16,22 +16,13 @@ cd "$(dirname "$0")"
 # TSAN attributes the SUMMARY to whichever thread detects the race, so the
 # READER side of the deliberate payload copy shows up intermittently too.
 # Naming only the writer frames made the gate flaky.
-ALLOWED='logDropTail|storeSet|writer|storeGet|reader'
-
 clang++ -std=c++17 -fsanitize=thread -O1 -g -o seqlock_tsan seqlock_tsan.cc || exit 1
 
 fail=0
 run() {                       # readers seconds arenaKB slots label
   TSAN_OPTIONS="halt_on_error=0 history_size=7 exitcode=0" ./seqlock_tsan "$1" "$2" "$3" "$4" >/tmp/tsan_run.out 2>&1
-  local corrupt races sites
-  corrupt=$(grep -oE 'CORRUPT=[0-9]+' /tmp/tsan_run.out | cut -d= -f2)
-  races=$(grep -c 'WARNING: ThreadSanitizer' /tmp/tsan_run.out)
-  sites=$(grep 'SUMMARY: ThreadSanitizer' /tmp/tsan_run.out | sed -E 's/.* in ([A-Za-z_]+).*/\1/' | sort -u | tr '\n' ' ')
-  printf "  %-26s corrupt=%-4s races=%-4s sites: %s\n" "$5" "${corrupt:-?}" "$races" "${sites:-none}"
-  [ "${corrupt:-1}" != "0" ] && { echo "    FAIL: torn or wrong values observed"; fail=1; }
-  for s in $sites; do
-    echo "$s" | grep -qE "^($ALLOWED)$" || { echo "    FAIL: unexpected race site '$s'"; fail=1; }
-  done
+  printf "  %-26s\n" "$5"
+  node analyze.js /tmp/tsan_run.out || fail=1
 }
 
 echo "  scenario                   result"
