@@ -18,4 +18,8 @@ if (!found) {
         'Install LZ4 (brew install lz4 / apt install liblz4-dev) or set LZ4_PREFIX.\n');
     process.exit(1);
 }
-process.stdout.write(found);
+// Print one field at a time. binding.gyp used to pipe this through `cut`, which
+// does not exist on Windows - the gyp <!() command runs in the platform shell.
+const which = process.argv[2];
+const [inc, lib] = found.split('|');
+process.stdout.write(which === 'lib' ? lib : which === 'include' ? inc : found);

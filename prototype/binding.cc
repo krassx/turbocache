@@ -30,6 +30,18 @@ static const size_t KEY_MAX = 1024;
 // Expiry of the entry the last Get returned, so the JS layer can carry TTL into
 // L1 on a refill. Read only on an L2 hit, so it costs nothing on the hot path.
 static uint32_t g_lastExpiresAt = 0;
+// Plain function rather than a statement-expression: `({ ... })` is a GNU
+// extension that MSVC rejects, and it was the only thing in our own code
+// standing between this file and a Windows compiler.
+static bool isBinaryValue(napi_env env, napi_value v) {
+  bool isBuf = false, isTa = false, isAb = false, isDv = false;
+  napi_is_buffer(env, v, &isBuf);
+  napi_is_typedarray(env, v, &isTa);
+  napi_is_arraybuffer(env, v, &isAb);
+  napi_is_dataview(env, v, &isDv);
+  return isBuf || isTa || isAb || isDv;
+}
+
 static bool readKey(napi_env env, napi_value v, char *buf, size_t *outLen) {
   size_t need = 0;
   if (napi_get_value_string_utf8(env, v, nullptr, 0, &need) != napi_ok) return false;
@@ -124,13 +136,7 @@ static napi_value Set(napi_env env, napi_callback_info info) {
   } else if (vt == napi_boolean) {
     bool bv = false; napi_get_value_bool(env, argv[1], &bv);
     scratch[0] = bv ? 1 : 0; vlen = 1; flags = FLAG_BOOL;
-  } else if (vt == napi_object &&
-             ({ bool isBuf = false, isTa = false, isAb = false, isDv = false;
-                napi_is_buffer(env, argv[1], &isBuf);
-                napi_is_typedarray(env, argv[1], &isTa);
-                napi_is_arraybuffer(env, argv[1], &isAb);
-                napi_is_dataview(env, argv[1], &isDv);
-                isBuf || isTa || isAb || isDv; })) {
+  } else if (vt == napi_object && isBinaryValue(env, argv[1])) {
     // Binary values. Decision 4 lists Buffer/Uint8Array/ArrayBuffer as accepted
     // value types; the native layer only ever handled strings and scalars, so
     // primitives mode rejected them. Stored as raw bytes.

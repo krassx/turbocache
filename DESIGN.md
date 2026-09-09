@@ -1435,6 +1435,72 @@ At 8 workers bugsee's p50 alone reaches 181µs.
 - **`safe`** — best in the cluster, and the friendliest contract (a fresh mutable
   object per read). Pay for it in silent type conversion.
 
+### Windows: the actual gap
+
+Audited rather than estimated. The platform-specific surface is **31 lines out of
+~2,600**, and all of the hard part sits in three functions in `store.h`:
+
+| file | lines | platform-specific |
+|---|---|---|
+| `store.h` | 301 | 24 (8.0%) |
+| `store_ops.h` | 650 | 2 (0.3%) |
+| `binding.cc` | 887 | 4 (0.5%) |
+| `turbocache.js` | 800 | 1 (0.1%) |
+
+**The mechanical part** — `create()`, `attachReadOnly()`, `openHints()`:
+
+| POSIX | Windows |
+|---|---|
+| `shm_open` + `ftruncate` + `mmap(RW)` | `CreateFileMapping(INVALID_HANDLE_VALUE, …)` + `MapViewOfFile(FILE_MAP_ALL_ACCESS)` |
+| `shm_open(O_RDONLY)` + `mmap(PROT_READ)` | `OpenFileMapping(FILE_MAP_READ)` + `MapViewOfFile(FILE_MAP_READ)` |
+| `munmap` + `shm_unlink` | `UnmapViewOfFile` + `CloseHandle` |
+| `fstat` for size | already in the header (`totalBytes`) |
+| `sysconf(_SC_PAGESIZE)` | `GetSystemInfo` — but note view offsets must be multiples of `dwAllocationGranularity` (64KB), not page size. Hints are a separate object mapped at offset 0, so this does not bite today; it would if hints ever moved back inside the main segment. |
+| `clock_gettime(CLOCK_REALTIME)` x3 | `timespec_get` (C11, MSVC has it) |
+| `usleep` (a test hook) | `Sleep` |
+
+**The part that is not mechanical — lifetime semantics.** POSIX shared memory
+persists until `shm_unlink`; a Windows file mapping is **reference-counted** and
+dies when the last handle closes. That inverts one of our fixes: the "a crashed
+primary leaks its segment until reboot" bug cannot occur on Windows, and the
+stable-naming fix becomes merely harmless there. The flip side is that an arena
+cannot outlive every process holding it, so a POSIX-only behaviour — a worker
+attaching to an arena whose creator already died — has no Windows equivalent.
+Any Windows port has to decide whether that divergence is acceptable or whether
+the POSIX side should be constrained to match.
+
+**Naming** also differs: POSIX wants `/name` (≤31 bytes on darwin), Windows wants
+`Local\name` for a session-scoped object (`Global\` needs
+`SeCreateGlobalPrivilege`). `defaultName()` needs a platform branch; `Local\` is
+the right scope for a `cluster`.
+
+**The safety guarantee needs re-establishing, not assuming.** The current claim is
+descriptor-level: the arena fd is `O_RDONLY`, so a worker cannot map it writable
+even deliberately. The Windows analogue is that `OpenFileMapping(FILE_MAP_READ)`
+returns a handle whose access rights forbid a writable view. That *should* be
+equivalent, but `protect.js` proves the POSIX case by observing a SIGBUS, and
+Windows raises `EXCEPTION_ACCESS_VIOLATION` with no signal — so the test needs a
+platform branch and the guarantee needs re-verifying on real hardware rather than
+inherited by analogy.
+
+**Two blockers already removed** while auditing:
+
+- `binding.cc` contained one GNU statement-expression (`({ … })`), which MSVC
+  rejects. Replaced with a plain function; there are now none.
+- `binding.gyp` piped `find_lz4.js` through `cut`, and gyp's `<!()` runs in the
+  platform shell — `cut` does not exist on Windows. `find_lz4.js` now prints a
+  single field on request.
+
+**And one that never existed**, thanks to vendoring: upstream `rapidhash.h`
+already carries `_umul128`/`__umulh` paths for MSVC. The hand transcription it
+replaced used `__uint128_t` unconditionally, which MSVC has no equivalent for —
+so the transcription would have been a Windows blocker in its own right.
+
+**Testing would be partial.** ASan exists for MSVC; **TSAN does not**, so the
+sanitizer gate that guards the lock-free read path could not run on Windows at
+all. That is an argument for treating Linux/macOS as the platforms of record for
+concurrency verification regardless of whether the port happens.
+
 ## 10. Why not V8 fast calls
 
 The original premise. It does not survive contact:

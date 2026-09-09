@@ -16,8 +16,8 @@
     "conditions": [
       ["turbocache_lz4==1", {
         "defines": ["TURBOCACHE_LZ4"],
-        "include_dirs": ["<!(node find_lz4.js | cut -d'|' -f1)"],
-        "libraries": ["-L<!(node find_lz4.js | cut -d'|' -f2)", "-llz4"]
+        "include_dirs": ["<!(node find_lz4.js include)"],
+        "libraries": ["-L<!(node find_lz4.js lib)", "-llz4"]
       }]
     ]
   }]
