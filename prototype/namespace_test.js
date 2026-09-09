@@ -2,6 +2,8 @@
 const { TurboCache } = require('./turbocache');
 const native = require('./build/Release/l2.node');
 let seq = 0;
+let fails = 0;
+const ok = (c, m) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  ${m}`); if (!c) fails++; };
 
 function scenario(label, quotas) {
     // 'cold' writes a small working set once; 'hot' then hammers the arena.
@@ -35,6 +37,37 @@ function scenario(label, quotas) {
 console.log('  8MB arena (~4MB data). cold writes 1000x500B once, hot then writes 30000x500B.\n');
 const noQuota = scenario('no quotas (current behaviour)', { cold: 0, hot: 0 });
 const withQuota = scenario('cold 1MB / hot 2MB quota', { cold: 1 << 20, hot: 2 << 20 });
-console.log(`\n  ${withQuota > noQuota * 5 ? 'PASS' : 'FAIL'}: quota protected the cold namespace ` +
-    `(${noQuota} -> ${withQuota} survivors)`);
-process.exit(withQuota > noQuota * 5 ? 0 : 1);
+// A quota must protect a cold namespace even when the INDEX, not the data
+// region, is the binding constraint. It used to protect nothing there: the
+// index-pressure eviction loop passed a null second-chance budget and dropped
+// unconditionally, so a cold namespace lost every one of its 500 quota-
+// protected entries while liveBytes sat at 0.45MB of 32MB. autoSize() gives one
+// slot per 512B, so any workload averaging under ~384B is index-bound in
+// production and never saw the eviction policy at all.
+{
+    const A = '/tcnsidx' + process.pid;
+    const cold = TurboCache.createPrimary(A, 32 << 20, 1 << 12, {
+        storage: 'bytes', namespace: { name: 'cold', quotaBytes: 4 << 20 }, l1MaxBytes: 1 << 16 });
+    const Ctor = Object.getPrototypeOf(cold).constructor;
+    const hot = new Ctor({ storage: 'bytes', namespace: { name: 'hot' }, l1MaxBytes: 1 << 16 });
+    for (let i = 0; i < 500; i++) cold.set('c' + i, 'C'.repeat(100));
+    cold.clearLocal();
+    for (let i = 0; i < 200000; i++) hot.set('h' + i, 'H'.repeat(100));
+    cold.clearLocal();
+    let survivors = 0;
+    for (let i = 0; i < 500; i++) if (cold.get('c' + i) !== undefined) survivors++;
+    const st = TurboCache.namespaceStats().find(x => x.name === 'cold') || {};
+    console.log(`  index-bound quota: ${survivors}/500 cold survivors, protected=${st.protected} dropped=${st.dropped}`);
+    ok(survivors > 350, 'a quota protects a cold namespace under INDEX pressure, not just data pressure');
+    ok(st.dropped < 200, 'protected entries are not counted as protected and then dropped anyway');
+    cold.close();
+}
+
+// `withQuota > noQuota * 5` is vacuous when noQuota is 0, which it is: 0 > 0 is
+// false, so the whole suite hinged on a comparison that could only ever fail by
+// accident. Assert the thing that actually matters instead.
+ok(noQuota === 0 || withQuota > noQuota * 5,
+   `quota beats no-quota (${noQuota} -> ${withQuota} survivors)`);
+ok(withQuota > 500, `a quota protects most of the cold set (${withQuota}/1000 survived)`);
+console.log(fails ? `\n  ${fails} FAILED` : '\n  all passed');
+process.exit(fails ? 1 : 0);

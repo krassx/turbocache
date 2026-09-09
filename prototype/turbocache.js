@@ -28,6 +28,41 @@ function hasLoneSurrogate(s) {
     return false;
 }
 
+// Mutating methods that bypass Object.freeze because they operate on internal
+// slots rather than properties. Shadowed on frozen values so a mutation raises
+// instead of silently corrupting the cached object. See deepFreeze.
+const DATE_MUTATORS = ['setTime', 'setFullYear', 'setMonth', 'setDate', 'setHours', 'setMinutes',
+    'setSeconds', 'setMilliseconds', 'setUTCFullYear', 'setUTCMonth', 'setUTCDate', 'setUTCHours',
+    'setUTCMinutes', 'setUTCSeconds', 'setUTCMilliseconds', 'setYear'];
+const MAP_MUTATORS = ['set', 'delete', 'clear'];
+const SET_MUTATORS = ['add', 'delete', 'clear'];
+function frozenMutator(name) {
+    return function () {
+        throw new TypeError(`Cannot call ${name}() on a frozen cached value ` +
+            `(turbocache freeze:true). Copy it before mutating.`);
+    };
+}
+
+// A single process-wide GC observer feeding every cache that wants the heap
+// guard. See the constructor for why this is not per-instance.
+let gcObserver = null;
+const gcSubscribers = new Set();
+function gcSubscribe(inst) {
+    gcSubscribers.add(inst);
+    if (gcObserver) return;
+    gcObserver = new PerformanceObserver(list => {
+        for (const e of list.getEntries()) {
+            if (e.detail && e.detail.kind === undefined) continue;
+            for (const c of gcSubscribers) c._onGc();
+        }
+    });
+    gcObserver.observe({ entryTypes: ['gc'] });
+}
+function gcUnsubscribe(inst) {
+    gcSubscribers.delete(inst);
+    if (gcSubscribers.size === 0 && gcObserver) { gcObserver.disconnect(); gcObserver = null; }
+}
+
 const MSG = 'tc';
 const RING_MSG = 'tcr';   // doorbell only: 'your submission rings are non-empty'
 // Max second-chance reprieves per L1 insert. Matches the arena's budget in
@@ -195,15 +230,13 @@ class TurboCache {
         if (g !== false) {
             this.#guardMax = (g && g.maxHeapFraction) || 0.80;
             this.#guardShed = (g && g.shedFraction) || 0.25;
-            const self = this;
-            this.#gcObserver = new PerformanceObserver(list => {
-                for (const e of list.getEntries()) {
-                    if (e.detail && e.detail.kind === undefined) continue;
-                    self.#onGc();
-                }
-            });
-            this.#gcObserver.observe({ entryTypes: ['gc'] });
-            if (this.#gcObserver.disconnect) { /* caller may stop() */ }
+            // ONE observer per process, not one per cache. Each instance used to
+            // register its own, so an application that opens caches without
+            // closing them accumulated observers as well as instances: 20k opens
+            // cost ~24MB. The guard is a process-wide signal; the per-instance
+            // part is only the thresholds.
+            this.#gcObserver = true;
+            gcSubscribe(this);
         }
     }
 
@@ -291,6 +324,21 @@ class TurboCache {
     static deepFreeze(o) {
         if (o === null || typeof o !== 'object' || Object.isFrozen(o)) return o;
         if (ArrayBuffer.isView(o) || o instanceof ArrayBuffer) return o;   // cannot be frozen
+        // Object.freeze does not seal INTERNAL SLOTS, so a "frozen" Date, Map or
+        // Set still mutates through its own methods: d.setTime(0), m.set(k, v)
+        // and s.add(x) all succeeded and corrupted L1 until the entry was
+        // evicted. The whole point of freeze is to turn silent corruption into a
+        // TypeError, so shadow those mutators with throwing own-properties
+        // BEFORE freezing (afterwards the object is non-configurable).
+        const mutators = o instanceof Date ? DATE_MUTATORS
+                       : o instanceof Map ? MAP_MUTATORS
+                       : o instanceof Set ? SET_MUTATORS : null;
+        if (mutators) {
+            for (const m of mutators) {
+                if (typeof o[m] !== 'function') continue;
+                Object.defineProperty(o, m, { value: frozenMutator(m), writable: false, configurable: false, enumerable: false });
+            }
+        }
         Object.freeze(o);
         for (const k in o) TurboCache.deepFreeze(o[k]);
         return o;
@@ -454,6 +502,8 @@ class TurboCache {
             if (n < 1024) return;                  // caught up
         }
     }
+
+    _onGc() { this.#onGc(); }
 
     _dropByHash(hash) {
         const k = this.#byHash.get(hash);
@@ -1054,7 +1104,7 @@ class TurboCache {
 
     get l1Size() { return this.#l1.size; }
 
-    stopGuard() { if (this.#gcObserver) { this.#gcObserver.disconnect(); this.#gcObserver = null; } }
+    stopGuard() { if (this.#gcObserver) { this.#gcObserver = null; gcUnsubscribe(this); } }
 
     flush() {
         this.#flushScheduled = false;

@@ -220,10 +220,10 @@ static inline void logDropTail(Store &s, int *budget) {
     // protected while it is under it and dropped once over, so a hot namespace
     // can no longer evict a cold one. A namespace without a quota keeps the
     // plain CLOCK behaviour and competes freely.
-    bool protect;
+    bool protect, byQuota = false;
     if (liveHere && h->nsQuota[e->ns]) {
       protect = h->nsBytes[e->ns] <= h->nsQuota[e->ns];
-      if (protect) h->nsProtected[e->ns]++;
+      byQuota = protect;
     } else {
       protect = liveHere && s.hints[slot].load(std::memory_order_relaxed);
     }
@@ -247,6 +247,9 @@ static inline void logDropTail(Store &s, int *budget) {
       // pointers gives it another lap for free. No memcpy, no room required.
       if (hp == phys && bsz <= h->dataBytes) {
         (*budget)--; h->reappends++;
+        if (byQuota) h->nsProtected[e->ns]++;   // counted where it is GRANTED, not where
+                                                // it is merely considered: the old placement
+                                                // credited protection to entries it then dropped
         s.hints[slot].store(0, std::memory_order_relaxed);   // chance consumed
         s.idx[slot].off.store(newPos, std::memory_order_release);
         h->logHead += bsz;
@@ -257,6 +260,7 @@ static inline void logDropTail(Store &s, int *budget) {
       if (freeBytes < bsz) h->reappendSkippedNoRoom++;
       if (freeBytes >= bsz && hp + bsz <= h->dataBytes && hp != phys) {
         (*budget)--; h->reappends++;
+        if (byQuota) h->nsProtected[e->ns]++;
         Entry *dst = s.entryAt(hp);
         uint32_t dseq = dst->seq.load(std::memory_order_relaxed);
         dst->seq.store(dseq | 1, std::memory_order_release);
@@ -440,8 +444,23 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
   // logDropTail always advances the tail, so this terminates when the tail
   // catches the head.
   if (h->mode != MODE_SLAB) {
-    while (h->live >= h->maxLive && h->logTail < h->logHead) {
-      logDropTail(s, nullptr);                 // null budget: drop, never re-append
+    // Index pressure, not data pressure. A re-append frees no index SLOT, so
+    // second chance cannot relieve this directly -- which is why this loop used
+    // to pass a null budget and drop unconditionally. But that made quotas and
+    // reference bits vanish entirely whenever the index was the binding
+    // constraint: measured a cold namespace losing all 500 of its quota-
+    // protected entries while liveBytes sat at 0.45MB of 32MB. autoSize() gives
+    // one slot per 512B, so any workload averaging under ~384B is index-bound in
+    // production and never saw the eviction policy at all.
+    //
+    // Give it a bounded budget instead. Re-appending a protected entry lets the
+    // scan step PAST it to find a droppable one, which does free a slot. Once
+    // the budget is spent the loop falls back to unconditional drops, so
+    // progress is still guaranteed even if every entry is protected.
+    int idxBudget = g_secondChanceBudget;
+    uint64_t guard = 0, guardMax = (uint64_t)h->indexSlots * 2 + 64;
+    while (h->live >= h->maxLive && h->logTail < h->logHead && guard++ < guardMax) {
+      logDropTail(s, idxBudget > 0 ? &idxBudget : nullptr);
       h->indexEvictions++;
     }
   }

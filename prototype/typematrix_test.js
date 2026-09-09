@@ -1,4 +1,11 @@
 // json-fastpath-lint: allow
+//
+// This printed a matrix and exited 0 regardless of what it showed, so any
+// silent change in type behaviour -- a mode starting to reject a type it used to
+// accept, or JSON degrading something new -- passed unnoticed. The matrix is the
+// point of the file, so the expectations below ARE the matrix: each cell states
+// what that mode is supposed to do, including the lossy JSON cells, which are
+// correct behaviour rather than bugs (decision 29).
 const v8 = require('v8');
 const { TurboCache } = require('./turbocache');
 const JSONC = { encode: JSON.stringify, decode: JSON.parse };
@@ -49,8 +56,33 @@ function probe(cache, make) {
 }
 
 const modes = [['bytes', { values: 'bytes' }], ['codec: JSON', { codec: JSONC }], ['codec: v8', { codec: V8C }]];
+// rows: input type -> [bytes, JSON, v8]
+const EXPECT = {
+    'string':     ['string(hi)', 'string(hi)', 'string(hi)'],
+    'number':     ['number(42)', 'number(42)', 'number(42)'],
+    'boolean':    ['boolean(true)', 'boolean(true)', 'boolean(true)'],
+    'null':       ['null', 'null', 'null'],
+    'BigInt':     ['BigInt(123456789012345678901234567890)', 'rejected', 'BigInt(123456789012345678901234567890)'],
+    'Date':       ['rejected', 'string(2026-09-08T10:00:00.000Z)', 'Date'],
+    'Array':      ['rejected', 'Array(3)', 'Array(3)'],
+    'Object':     ['rejected', 'Object{a,b}', 'Object{a,b}'],
+    'Map':        ['rejected', 'Object{}', 'Map(1)'],
+    'Set':        ['rejected', 'Object{}', 'Set(2)'],
+    'Uint8Array': ['Uint8Array', 'Object{0,1,2}', 'Uint8Array'],
+};
+let fails = 0;
 console.log('  input        ' + modes.map(m => m[0].padEnd(24)).join(''));
 for (const [label, make] of Object.entries(values)) {
-    const row = modes.map(([, opts]) => { const c = mk(opts); const r = probe(c, make); TurboCache.native().destroy(); return r.padEnd(24); });
-    console.log('  ' + label.padEnd(12) + ' ' + row.join(''));
+    const raw = modes.map(([, opts]) => { const c = mk(opts); const r = probe(c, make); TurboCache.native().destroy(); return r; });
+    console.log('  ' + label.padEnd(12) + ' ' + raw.map(r => r.padEnd(24)).join(''));
+    const want = EXPECT[label];
+    if (!want) { console.log(`  FAIL: no expectation recorded for ${label}`); fails++; continue; }
+    raw.forEach((got, i) => {
+        if (got !== want[i]) {
+            console.log(`  FAIL: ${label} / ${modes[i][0]}: got ${JSON.stringify(got)}, expected ${JSON.stringify(want[i])}`);
+            fails++;
+        }
+    });
 }
+console.log(fails ? `\n  ${fails} FAILED` : '\n  all cells match the documented type matrix');
+process.exit(fails ? 1 : 0);
