@@ -1152,13 +1152,16 @@ in every mode; a read-only worker reads 200/200 correctly in every mode.
 
 | workload | `bytes` | `direct` | `safe` |
 |---|---|---|---|
-| reads dominate, fits L1 | 431k / 1209ns | **1196k / 42ns** | 430k / 1208ns |
-| mixed 90/10, exceeds L1 | **351k** / 1875ns | 174k / 2917ns | 318k / 2000ns |
-| write-heavy 50/50 | **445k** / 1458ns | 118k / 5375ns | 322k / 2000ns |
+| reads dominate, fits L1 | 437k / 99% | **1,173k / 99%** | 438k / 99% |
+| mixed 90/10, exceeds L1 | 314k / 84% | 177k / 84% | 329k / 84% |
+| write-heavy 50/50 | 303k / 85% | 126k / 85% | 328k / 85% |
 
-The swing is nearly an order of magnitude across the diagonal: `direct` is 2.8x
-faster than `primitives` when reads dominate and 3.8x slower when writes do.
-Choose by read/write ratio and type needs, not by a global default.
+Cells are throughput / hit rate. The swing across the diagonal is nearly an
+order of magnitude: `direct` is 2.7x the field when reads dominate and L1 holds
+the working set, and last everywhere else — `v8.serialize` on every write is the
+whole cost. Choose by read/write ratio and type needs, not by a global default.
+Note this ranking **inverts in a cluster**, where `safe` leads; see the full
+matrix above.
 
 ### ThreadSanitizer, run
 
