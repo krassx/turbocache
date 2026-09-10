@@ -1,5 +1,8 @@
-*.node
-.DS_Store
 build/
 node_modules/
-prototype/build/
+*.node
+.DS_Store
+*.dSYM/
+test/tsan/seqlock_*
+!test/tsan/seqlock_tsan.cc
+*.tgz

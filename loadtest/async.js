@@ -16,7 +16,7 @@
 const cluster = require('cluster');
 const os = require('os');
 const { monitorEventLoopDelay, PerformanceObserver, constants } = require('perf_hooks');
-const { TurboCache } = require('../prototype/turbocache');
+const { TurboCache } = require('../src/turbocache');
 
 const WORKERS = Number(process.env.WORKERS || 4);
 const SECONDS = Number(process.env.SECONDS || 60);

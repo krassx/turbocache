@@ -1,7 +1,7 @@
 'use strict';
 // The blended "ns per cache op" hides which of the four flows is expensive.
 // Price each one separately, with the generator cost (measured at 33ns) subtracted.
-const { TurboCache } = require('../prototype/turbocache');
+const { TurboCache } = require('../src/turbocache');
 const N = Number(process.env.N || 2000000);
 const COLD = 200000, HOT = 300;
 const FILL = 'f'.repeat(160);

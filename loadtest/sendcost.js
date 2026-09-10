@@ -7,7 +7,7 @@
 // event loop is frozen for that long, and every other thing that worker is doing
 // -- app IPC, timers, request handling -- waits.
 const cluster = require('cluster');
-const { TurboCache } = require('../prototype/turbocache');
+const { TurboCache } = require('../src/turbocache');
 const ARENA = '/tcsend';
 const SER = process.env.SER === 'advanced' ? 'advanced' : 'json';
 const N = Number(process.env.N || 400000);

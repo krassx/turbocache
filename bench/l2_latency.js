@@ -2,8 +2,8 @@
 // Honest L2 hit latency. The earlier number cycled 2000 keys IN ORDER, so the
 // index and entries (~200KB) stayed cache-resident - a warm, sequential best
 // case, not what a real keyspace does.
-const { TurboCache } = require('../prototype/turbocache');
-const native = require('../prototype/build/Release/l2.node');
+const { TurboCache } = require('../src/turbocache');
+const native = require('../src/native');
 let seq = 0;
 console.log('  values  keyspace   order        L2 hit (getLen, no JS string)   full get()');
 for (const bytes of [64, 1024]) {

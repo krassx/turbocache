@@ -65,6 +65,23 @@ heap guard works on all three: it is driven by a `FinalizationRegistry` rather
 than gc performance entries, which Bun and Deno accept but never emit. One
 Deno-only failure remains under the `direct` codec; see DESIGN.md.
 
+## Layout
+
+```
+index.js  index.mjs  index.d.ts   entry points; consumers never see src/
+binding.gyp                       addon build, at the package root
+src/      turbocache.js           the JS layer (L1, coherence, transports)
+          native.js               single place the addon is resolved
+          binding.cc *.h          the arena, submission rings, platform layer
+          vendor/                 rapidhash, verbatim upstream
+test/     *_test.js  run.js       the suite; `npm test` runs run.js, so does CI
+          *.cc                    standalone C++ tests (arena, rings)
+          tsan/  types/           sanitizer gate, TypeScript declaration tests
+bench/                            microbenchmarks and design experiments
+loadtest/                         sustained multi-worker load harness (Docker)
+scripts/                          build helpers
+```
+
 ## Operational notes
 
 - **Sizing**: on Linux the arena is backed by `/dev/shm`. Docker defaults it to
@@ -80,4 +97,4 @@ rejected — are in [DESIGN.md](DESIGN.md).
 
 ## License
 
-MIT. Vendors [rapidhash](prototype/vendor/rapidhash.h) (MIT).
+MIT. Vendors [rapidhash](src/vendor/rapidhash.h) (MIT).

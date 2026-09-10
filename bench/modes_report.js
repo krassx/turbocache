@@ -1,7 +1,7 @@
 'use strict';
 // json-fastpath-lint: allow
 // Scorecard for the three storage modes: validity, safety, consistency, performance.
-const { TurboCache } = require('../prototype/turbocache');
+const { TurboCache } = require('../src/turbocache');
 const MODES = ['bytes', 'direct', 'safe'];
 let seq = 0;
 const mk = (storage, opts = {}) => TurboCache.createPrimary(

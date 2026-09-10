@@ -7,7 +7,7 @@
 //      batch, and everything else that worker is doing waits behind it.
 const cluster = require('cluster');
 const { monitorEventLoopDelay } = require('perf_hooks');
-const { TurboCache } = require('../prototype/turbocache');
+const { TurboCache } = require('../src/turbocache');
 const T = process.env.T === 'ipc' ? 'ipc' : 'shm';
 const ARENA = '/tctb_' + T;
 const N = Number(process.env.N || 800000);

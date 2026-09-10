@@ -1,7 +1,7 @@
 'use strict';
 // What should the second-chance budget and the ring capacity actually be?
-const { TurboCache } = require('../prototype/turbocache');
-const native = require('../prototype/build/Release/l2.node');
+const { TurboCache } = require('../src/turbocache');
+const native = require('../src/native');
 const { buildPlan, run } = require('./workload');
 
 let seq = 0;

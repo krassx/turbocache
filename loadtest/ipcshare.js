@@ -8,7 +8,7 @@
 // Anything the second phase adds is latency turbocache imposes on code that has
 // nothing to do with the cache.
 const cluster = require('cluster');
-const { TurboCache } = require('../prototype/turbocache');
+const { TurboCache } = require('../src/turbocache');
 const ARENA = '/tcshare';
 const SECS = Number(process.env.SECS || 8);
 const VAL = 'v'.repeat(180);

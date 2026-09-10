@@ -9,7 +9,7 @@
 //                                 OTHER workers drop L1 and refill from L2
 const cluster = require('cluster');
 const os = require('os');
-const { TurboCache } = require('../prototype/turbocache');
+const { TurboCache } = require('../src/turbocache');
 
 const WORKERS  = Number(process.env.WORKERS || 4);
 const MINUTES  = Number(process.env.MINUTES || 12);

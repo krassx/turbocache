@@ -3,7 +3,7 @@
 // real work per iteration too: RNG, key string construction, value building and
 // verification. Run the identical loop against a no-op cache to price that, so
 // the cache's own share is a subtraction rather than an assumption.
-const { TurboCache } = require('../prototype/turbocache');
+const { TurboCache } = require('../src/turbocache');
 const N = Number(process.env.N || 3000000);
 const COLD = 200000, HOT = 300, SHARED = 500;
 const FILL = 'f'.repeat(160);

@@ -36,7 +36,7 @@ if (cluster.isPrimary) {
 
     let applyBatch = null;
     if (IMPL === 'turbo') {
-        const { TurboCache } = require('../prototype/turbocache');
+        const { TurboCache } = require('../src/turbocache');
         TurboCache.createPrimary(ARENA, L2, 1 << 20);       // must exist before fork
         process.env.TC_ARENA = ARENA;
         applyBatch = TurboCache.applyBatch;
@@ -78,7 +78,7 @@ if (cluster.isPrimary) {
         console.log(`  writes               : ${tot.writes}`);
         console.log(`  latency ns (avg of workers): p50=${p50}  p99=${p99}  p99.9=${p999}`);
         if (IMPL === 'turbo') {
-            const st = require('../prototype/turbocache').TurboCache.native().stats();
+            const st = require('../src/turbocache').TurboCache.native().stats();
             console.log(`  primary applied ${applied} IPC batches; L2 holds ${st.live} entries`);
         } else {
             console.log(`  primary L2 holds ${srv.l2.itemCount} entries, ${(srv.l2.length/1048576).toFixed(1)}MB of ${L2/1048576}MB`);
@@ -91,7 +91,7 @@ if (cluster.isPrimary) {
         const id = Number(process.env.WORKER_ID);
         let c;
         if (IMPL === 'turbo') {
-            const { TurboCache } = require('../prototype/turbocache');
+            const { TurboCache } = require('../src/turbocache');
             // Was passing codec:null with no storage preset, which selects the
             // un-nameable "raw" mode and skips the flatten that 'primitives'
             // pays - so the headline number omitted ~20% of the default mode's

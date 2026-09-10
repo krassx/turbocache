@@ -22,30 +22,32 @@
     "napi"
   ],
   "type": "commonjs",
-  "main": "./prototype/turbocache.js",
-  "module": "./prototype/index.mjs",
-  "types": "./prototype/index.d.ts",
+  "main": "./index.js",
+  "module": "./index.mjs",
+  "types": "./index.d.ts",
   "exports": {
     ".": {
-      "types": "./prototype/index.d.ts",
-      "import": "./prototype/index.mjs",
-      "require": "./prototype/turbocache.js",
-      "default": "./prototype/turbocache.js"
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js",
+      "default": "./index.js"
     },
     "./package.json": "./package.json"
   },
   "files": [
-    "prototype/turbocache.js",
-    "prototype/index.mjs",
-    "prototype/index.d.ts",
-    "prototype/binding.cc",
-    "prototype/store.h",
-    "prototype/store_ops.h",
-    "prototype/submit.h",
-    "prototype/platform.h",
-    "prototype/vendor/",
-    "prototype/binding.gyp",
-    "prototype/find_lz4.js",
+    "index.js",
+    "index.mjs",
+    "index.d.ts",
+    "src/turbocache.js",
+    "src/native.js",
+    "src/binding.cc",
+    "src/store.h",
+    "src/store_ops.h",
+    "src/submit.h",
+    "src/platform.h",
+    "src/vendor/",
+    "binding.gyp",
+    "scripts/find_lz4.js",
     "DESIGN.md",
     "README.md",
     "LICENSE"
@@ -55,9 +57,10 @@
   },
   "gypfile": true,
   "scripts": {
-    "install": "node-gyp rebuild --directory=prototype",
-    "build": "node-gyp rebuild --directory=prototype",
-    "test": "node scripts/test.js"
+    "install": "node-gyp rebuild",
+    "build": "node-gyp rebuild",
+    "test": "node test/run.js",
+    "test:types": "tsc -p test/types/tsconfig.json"
   },
   "devDependencies": {
     "node-gyp": "^10.0.0",

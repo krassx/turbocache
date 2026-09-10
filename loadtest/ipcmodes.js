@@ -11,7 +11,7 @@
 // Both configurations run the identical worker loop back to back, so the ratio
 // between them is meaningful even under external CPU load.
 const cluster = require('cluster');
-const { TurboCache } = require('../prototype/turbocache');
+const { TurboCache } = require('../src/turbocache');
 const ARENA = '/tcipc_' + (process.env.SER || 'json');
 const SER = process.env.SER === 'advanced' ? 'advanced' : 'json';
 const N = Number(process.env.N || 600000);

@@ -20,32 +20,18 @@ jobs:
         with: { node-version: '${{ matrix.node }}' }
 
       - name: Build the addon (no external dependencies)
-        working-directory: prototype
         run: npx --yes node-gyp configure build
 
       - name: Core suite
-        working-directory: prototype
         shell: bash
         run: |
           fail=0
-          for t in test.js api_test.js codec_test.js prim_test.js json_fastpath_test.js \
-                   v8codec_test.js storage_modes_test.js namespace_test.js \
-                   review_regression_test.js gaps_test.js typeflow_test.js \
-                   typematrix_test.js perf_regression_test.js guard_test.js; do
-            echo "--- $t"
-            node "$t" || { echo "FAILED: $t"; fail=1; }
-          done
-          for t in shm ipc; do
-            echo "--- transport_regression_test.js ($t)"
-            TC_T=$t node transport_regression_test.js || { echo "FAILED: transport ($t)"; fail=1; }
-          done
-          echo "--- recovery_test.js (primary death, stall, recovery)"
-          node recovery_test.js || { echo "FAILED: recovery_test"; fail=1; }
-          echo "--- native_regression_test.cc (TTL wrap, log wrap gap)"
-          c++ -std=c++17 -O2 -I. -o /tmp/native_test native_regression_test.cc \
+          node test/run.js || fail=1
+          echo "--- native_regression_test.cc (TTL wrap, log wrap gap, geometry)"
+          c++ -std=c++17 -O2 -Isrc -o /tmp/native_test test/native_regression_test.cc \
             && /tmp/native_test || { echo "FAILED: native_regression_test"; fail=1; }
           echo "--- submit_test.cc (submission ring, standalone)"
-          c++ -std=c++17 -O2 -o /tmp/submit_test submit_test.cc -lpthread \
+          c++ -std=c++17 -O2 -Isrc -o /tmp/submit_test test/submit_test.cc -lpthread \
             && /tmp/submit_test || { echo "FAILED: submit_test"; fail=1; }
           exit $fail
 
@@ -53,21 +39,19 @@ jobs:
         shell: bash
         run: |
           npm i --no-save --silent typescript@5.4
-          ./node_modules/.bin/tsc -p types/tsconfig.json
+          ./node_modules/.bin/tsc -p test/types/tsconfig.json
 
       - name: Cross-process behaviour
-        working-directory: prototype
         shell: bash
         run: |
-          node cluster_api_test.js
-          node protect.js
-          node hints.js
+          node test/cluster_api_test.js
+          node test/protect.js
+          node test/hints.js
 
       - name: Concurrency stress (cross-process, zero torn reads expected)
-        working-directory: prototype
         shell: bash
         run: |
-          ARENA=4194304 NKEYS=2000 WORKERS=4 SECONDS=6 node multiproc.js | tee /tmp/mp.txt
+          ARENA=4194304 NKEYS=2000 WORKERS=4 SECONDS=6 node test/multiproc.js | tee /tmp/mp.txt
           grep -q "CORRUPT/TORN READS: 0" /tmp/mp.txt
 
   sanitizers:
@@ -81,7 +65,7 @@ jobs:
       # can only run on POSIX. That is why Linux/macOS are the platforms of
       # record for concurrency verification.
       - name: Sanitizer gate
-        working-directory: prototype/tsan
+        working-directory: test/tsan
         run: ./run_sanitizers.sh
 
   lz4-optional:
@@ -93,7 +77,6 @@ jobs:
         with: { node-version: '24' }
       - run: sudo apt-get update && sudo apt-get install -y liblz4-dev
       - name: Build with --turbocache_lz4=1 and verify compression works
-        working-directory: prototype
         run: |
           npx --yes node-gyp configure build --turbocache_lz4=1
           node -e "

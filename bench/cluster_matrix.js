@@ -18,7 +18,7 @@ const ARENA = '/tccm' + process.pid;
 if (cluster.isPrimary) {
     let srv = null;
     if (IMPL === 'turbo') {
-        const { TurboCache } = require('../prototype/turbocache');
+        const { TurboCache } = require('../src/turbocache');
         TurboCache.createPrimary(ARENA, L2, 1 << 20, turboOpts(MODE, L1));
         process.env.TC_ARENA = ARENA;
         TurboCache.install(cluster);
@@ -53,7 +53,7 @@ if (cluster.isPrimary) {
         const id = Number(process.env.WORKER_ID);
         let adapter;
         if (IMPL === 'turbo') {
-            const { TurboCache } = require('../prototype/turbocache');
+            const { TurboCache } = require('../src/turbocache');
             const c = TurboCache.attachWorker(process.env.TC_ARENA, id, turboOpts(MODE, L1));
             adapter = turboAdapter(MODE, c);
             adapter._flush = () => c.flush();

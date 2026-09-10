@@ -1,6 +1,6 @@
 'use strict';
 const { run, buildPlan, BUGSEE } = require('./workload');
-const { TurboCache } = require('../prototype/turbocache');
+const { TurboCache } = require('../src/turbocache');
 const { TURBO_MODES, turboOpts, turboAdapter, bugseeAdapter } = require('./adapters');
 const bugsee = require(BUGSEE);
 

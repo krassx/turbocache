@@ -2,7 +2,7 @@
 // Single-process comparison. Neither cache has an IPC peer here, so nothing is
 // waiting on a later tick and the workload does not yield the event loop.
 const { run, buildPlan, BUGSEE } = require('./workload');
-const { TurboCache } = require('../prototype/turbocache');
+const { TurboCache } = require('../src/turbocache');
 const bugsee = require(BUGSEE);
 
 const OPS = Number(process.env.OPS || 300000);

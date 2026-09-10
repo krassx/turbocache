@@ -7,7 +7,7 @@
 //   (b) the cluster IPC channel cannot CARRY them fast enough
 // These have opposite fixes, so measure them separately.
 const cluster = require('cluster');
-const { TurboCache } = require('../prototype/turbocache');
+const { TurboCache } = require('../src/turbocache');
 const ARENA = process.env.ARENA || '/tcceil';
 const L2 = Number(process.env.L2 || 192 * 1024 * 1024);
 const N = Number(process.env.N || 400000);
