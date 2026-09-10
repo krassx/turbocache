@@ -4,7 +4,7 @@
 // processes sharing an mmap, which is the real deployment. So the primary and
 // the workers are modelled as threads over the same arena code: identical
 // atomics, fences and seqlock, with only the isolation boundary changed.
-#include "../store_ops.h"
+#include "../../src/store_ops.h"
 #include <thread>
 #include <atomic>
 #include <vector>

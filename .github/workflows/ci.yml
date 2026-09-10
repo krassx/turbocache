@@ -80,7 +80,7 @@ jobs:
         run: |
           npx --yes node-gyp configure build --turbocache_lz4=1
           node -e "
-            const n=require('./build/Release/l2.node');
+            const n=require('./build/Release/turbocache.node');
             if (!n.hasLz4()) { console.error('hasLz4() false in an LZ4 build'); process.exit(1); }
             n.create('/tcci'+process.pid, 16<<20, 1<<16, 2); n.setCompressMin(256,1);
             const v='{'+Array.from({length:200},(_,i)=>'\"k'+i+'\":'+i).join(',')+'}';
