@@ -5,6 +5,18 @@
 
 ---
 
+## Reading this document
+
+Sections 1–8 describe **what the system is now** and are kept current. Section 9
+is the **measurement record** and section 12 the **decision log** — both are
+append-only history, including ideas that were built and then rejected, and they
+are deliberately not rewritten when the design moves on. Section 13 tracks what
+is still open.
+
+If you only read one thing: §3 for the shape, §12 for why it is that shape.
+
+---
+
 ## 1. Understanding
 
 **What.** A layered in-memory key/value cache for Node.js services running under `node:cluster`. Two tiers: **L1**, private to each worker; **L2**, owned by the primary process and exposed to workers as a read-only shared memory mapping. A future **L3** (Valkey/Redis) sits behind both.
@@ -13,159 +25,151 @@
 
 **Who.** Node services on multi-core hosts, caching values hot enough that decode cost matters.
 
-**Non-goals for v1.** Persistence. Distribution. Arbitrary JS object values. Windows. Atomic read-modify-write. Async APIs.
+**Non-goals for v1.** Persistence. Distribution. Async APIs.
+
+*Three of the original non-goals were reached anyway and are now supported:*
+arbitrary JS object values (the `direct` and `safe` codec modes, §9), Windows
+(every OS call is behind `src/platform.h`, and `windows-latest` is in CI), and
+atomic read-modify-write (`incr`/`cas`, with the role-dependent return type
+recorded in §13.1). The cache also runs unmodified on **Bun** and **Deno** — the
+addon is Node-API, so one binary serves all three — with the caveats in the
+runtime notes of the README.
 
 ---
 
 ## 2. Public API (v1)
 
+The authoritative declaration is `index.d.ts`, which is type-checked in CI
+against deliberate misuses (`test/types/`). This section is the shape and the
+reasoning; the file is the contract.
+
 ```js
 const { Cache } = require('turbocache');   // alias of TurboCache
+// or: import { TurboCache } from 'turbocache';
 const cluster = require('cluster');
 
 // Primary, BEFORE forking. Sizes itself from the machine, names its own
 // segment, and passes the name to workers through the environment.
-const cache = Cache.open({ storage: 'primitives' });
+const cache = Cache.open();
 Cache.install(cluster);          // the entire primary-side wiring
 
 // Worker. Same call; it detects that it is a worker and attaches. Throws if the
 // primary has not opened the arena yet: a worker must never create one, or it
 // silently shadows the primary's.
-const cache = Cache.open({ storage: 'primitives' });
+const cache = Cache.open();
 
 // A second namespace in the same process binds to the arena already open.
 const other = Cache.open({ namespace: { name: 'sessions', quotaBytes: 32 << 20 } });
 ```
 
 ```ts
-class Cache {
+class Cache<T> {
   constructor(opts?: {
-    storage?: 'bytes' | 'direct' | 'safe';        // default 'bytes'
-    namespace?: string;        // prefixed into the key
-    l1MaxBytes?: number;       // default: heapLimit x 0.5%, clamped 512KB..2MB
-    arenaBytes?: number;       // default: totalRAM x 1%, clamped 16MB..128MB
-    indexSlots?: number;       // default: derived from arenaBytes
-    codec?: { encode, decode };// overrides the storage preset's codec
-    freeze?: boolean;          // codec modes; default true
-    heapGuard?: false | { maxHeapFraction?: number };
+    storage?: 'bytes' | 'direct' | 'safe';   // default 'bytes'
+    codec?: { encode, decode };              // explicit codec instead of a preset
+    allowSlowCodec?: boolean;                // permit a replacer/reviver; default false
+    freeze?: boolean;                        // codec modes; also neutralises
+                                             //   Date/Map/Set mutators
+    isolate?: boolean;                       // decode per set, so L1 never aliases
+    namespace?: string | { name, quotaBytes };
+    l1MaxBytes?: number;                     // default heapLimit x 0.5%, 512KB..2MB
+    heapFactor?: number;                     // encoded bytes -> retained heap; ~3
+    heapGuard?: false | { maxHeapFraction?, shedFraction?, minIntervalMs? };
+    transport?: 'shm' | 'ipc';               // default 'shm'
+    outboxMaxBytes?: number;                 // IPC fallback buffer; default 1MB
+    maxInFlightBytes?: number;               // IPC send window; default 8MB
+    primaryStaleMs?: number;                 // degrade threshold; default 5000
+    maintenance?: boolean;                   // primary heartbeat + expiry sweep
   });
 
-  get(key: string): Value | undefined;
-  set(key: string, value: Value, opts?: { ttlMs?: number }): boolean;
+  get(key: string): T | undefined;
+  set(key: string, value: T, opts?: { ttlMs?: number }): boolean;   // never throws
   has(key: string): boolean;
-  delete(key: string): boolean;
-  clearLocal(): void;          // this process's L1 only
-  clearAll(): void;            // the shared arena AND every worker's L1
-  clearNamespace(): void;      // just this cache's namespace
+  delete(key: string): boolean;              // whether it was present at call time
+  clearLocal(): void;                        // this process's L1 only
+  clearAll(): void;                          // the shared arena AND every L1
+  clearNamespace(): number;
+  flush(): void;                             // push buffered worker writes now
   close(): void;
 
-  incr(key: string, by?: number, opts?: { ttlMs?: number }): number | undefined | false;
-  cas(key: string, expected: number, next: number): boolean;   // primary only
+  incr(key, by?, opts?): number | undefined; // primary returns the value; a
+                                             //   worker queues it and returns
+                                             //   undefined — no request/response
+                                             //   path exists until L3
+  cas(key, expected, next, opts?): boolean;  // primary only; throws in a worker
 
-  keys(opts?: { limit?, batch? }): Iterable<string>;   // this namespace
-  readonly size: number;                               // live entries here
-
-  readonly stats: { l1Hits, l2Hits, misses, sets, deletes, invalidated,
-                    rejectedType, rejectedSize, flushes, sent };
+  keys(opts?: { limit?, batch? }): Generator<string>;   // this namespace
+  readonly size: number;                     // counts by enumerating, O(slots)
+  readonly transport: 'shm' | 'ipc';         // what this handle negotiated
+  readonly stats: CacheStats;                // hits, misses, writesShed,
+                                             //   recoveries, lastRecovery, ...
   readonly lastError: string | null;
+  readonly liveHeapFraction: number;         // 0 until the guard has sampled
 
-  static open(opts?): Cache;   // create (primary) or attach (worker)
-  static install(cluster): void;
-  static namespaceStats(): Array<{name, id, bytes, quota, protected, dropped}>;
-  static arenaStats(): { live, evictions, liveBytes, dataBytes, ... };
-  static primaryAgeMs(): number;   // ms since the primary last stamped the arena
+  static open(opts?): Cache;                 // create (primary) or attach (worker)
+  static createPrimary(name, arenaBytes, indexSlots, opts?): Cache;
+  static attachWorker(name, workerId, opts?): Cache;   // workerId >= 1; 0 is the
+                                                       //   primary and is refused
+  static install(cluster): void;             // idempotent
+  static drainSubmissions(budget?): number;  // primary: apply worker records
+  static arenaStats(): ArenaStats;
+  static namespaceStats(): NamespaceStat[];
+  static submitStats(): SubmitStats | null;
+  static heapGuardPace(): { evaluations, debounced, minIntervalMs };
+  static primaryAgeMs(): number;             // heartbeat age; -1 if never stamped
+  static autoSize(): { arenaBytes, indexSlots, l1MaxBytes };
+  static defaultName(): string;              // derived from app identity
+  static hasCompression(): boolean;          // was the addon built with LZ4
 }
 ```
 
-Keys are UTF-8 and capped at **1024 bytes**; longer keys are rejected. They were
-previously read into a fixed `char[512]` as latin1, so a 512-byte key was
-truncated to its prefix and any character above U+00FF folded to its low byte —
-distinct keys collided and returned *each other's values*.
-```
+Everything is **synchronous**. Async variants are reserved for L3 (§13.9) and
+deliberately not stubbed, because a `Promise`-returning shim over a synchronous
+call costs 100–300ns of allocation and a microtask tick on a ~21ns operation.
 
-Four API decisions worth stating, because each rejects a plausible alternative:
-
-**`set` returns a boolean and never throws — for anything.** Not merely for
-capacity: a codec that throws (JSON on a BigInt or a cycle) and a codec that
-returns `undefined` rather than throwing (`JSON.stringify` of a function, a
-symbol, or `undefined` itself) both surface as `false`. Because a total function
-makes failure quiet, every rejection increments `stats.rejectedType` or
-`stats.rejectedSize` and records `lastError`.
-
-**`set` reports acceptance, not durability.** `true` means the value was
-accepted, successfully serialised and queued — not that it is in L2 yet, since a
-worker's write is applied by the primary about a tick later. That distinction
-forces the size check to happen at the call site: a worker now compares against
-the arena's maximum value size locally, because otherwise an oversized value
-would be queued, silently dropped by the primary, and reported as success.
-
-**There is no `clear()`.** `clearLocal()` drops this process's L1 and nothing
-else; `clearAll()` wipes the shared arena and makes every worker drop its L1 via
-a flush record on the invalidation ring. A single `clear()` would let any worker
-wipe a shared cache for the whole cluster with a call that reads as local.
-
-**`has` is a pure probe.** No decode, no promotion into L1, not counted as a hit,
-and it does not set the CLOCK reference bit — so an existence check cannot
-distort hit-rate statistics or eviction order. It matters more than it sounds:
-because `null` is a storable value, `get(k) === undefined` is not an existence
-check, and `has` is the only way to ask the question.
-
-**`delete` reports presence at call time.** A worker's delete is applied a tick
-later, so it answers "was this key here when you asked" — matching what the
-primary returns. It previously returned an unconditional `true` in a worker, so
-a worker and the primary disagreed about the same absent key.
-
-**Enumeration exists.** `keys()` and `size` scan the index and read the stored
-key text. Decision 3 named this as a benefit of verifying keys with `memcmp`,
-but nothing ever exposed it, so there was no way to see what a cache held. It is
-O(index slots) and meant for operations, not the hot path.
-
-**Values may be binary.** `Buffer`, any `TypedArray`, `ArrayBuffer` and
-`DataView` are accepted by `bytes` mode and stored as raw bytes. They come
-back as a `Buffer` (a `Uint8Array` subclass, so `instanceof` still holds) and are
-**copied on every read** — decision 7's rule for mutable values, applied on both
-the L1 and the L2 refill path.
-
-**`incr` and `cas` are atomic, because there is only one writer.** On the primary
-`incr` returns the new value and `cas` returns whether it replaced. In a worker
-the write is applied a tick later, so:
-
-- `incr` **queues the delta** and returns `undefined`; read the value back with
-  `get()`. Queuing a *delta* rather than a value is what makes it lossless —
-  measured: 4 workers x 500 concurrent increments produce exactly 2000.
-- `cas` **throws** in a worker. A queued compare-and-set whose outcome the caller
-  never learns is not a compare-and-set, so it is primary-only rather than
-  quietly returning a misleading `true`.
-
-A missing key counts as zero. `incr` returns `false` if the key holds a
-non-numeric value, matching `set`'s "accepted" contract.
-
-**TTL is enforced in both tiers.** The arena expires lazily on read, but an L1
-hit never reaches the arena, so L1 entries carry their own expiry. Without that,
-an expired value is served from L1 indefinitely — which is exactly what the
-first implementation did.
+---
 
 ## 3. Architecture
 
 ```
-┌─ primary process ────────────────────────────────────────────┐
-│  L2 arena  (shm_open + mmap, READ/WRITE — sole writer)       │
-│    ├── header (magic, layout ver, heartbeat, sizes)          │
-│    ├── invalidation ring buffer                              │
-│    ├── hash index (open addressing)                          │
-│    ├── hints (separate shm segment, workers map it O_RDWR)   │
-│    └── circular log + second-chance re-append (LOG2)         │
-│  IPC receiver  ← batched writes from workers                 │
-│  eviction on the write path (no background sweeper exists)   │
-└──────────────────────────────────────────────────────────────┘
-        ▲ writes (batched IPC)        │ mmap READ-ONLY
-        │                             ▼
-┌─ worker process ─────────────────────────────────────────────┐
-│  L1: JS Map<string, Entry>          ~21 ns/hit               │
-│      small values  → ordinary V8 strings                     │
-│      large values  → external strings over off-heap arena    │
-│  native addon (Node-API): rapidhash, LZ4, seqlock L2 reader  │
-└──────────────────────────────────────────────────────────────┘
+┌─ primary process ─────────────────────────────────────────────────┐
+│  L2 arena   shm, mapped READ/WRITE — the primary is the sole writer│
+│    ├── header      magic (published last), geometry, heartbeat,    │
+│    │               arenaId, namespace table                        │
+│    ├── hash index  open addressing, backward-shift delete, 75% cap │
+│    ├── invalidation ring   primary → workers, carries writerId     │
+│    └── data        circular log, bounded second-chance re-append   │
+│  hints segment     CLOCK reference bits; workers map this O_RDWR   │
+│  submission rings  one SPSC ring per worker slot, drained here     │
+│  maintenance timer heartbeat + a slice of TTL expiry per tick      │
+└───────────────────────────────────────────────────────────────────┘
+     ▲ records (shared memory)          │ arena mapped READ-ONLY
+     │ + edge-triggered doorbell        │ hints mapped READ-WRITE
+     │                                  ▼
+┌─ worker process ──────────────────────────────────────────────────┐
+│  L1   JS Map<string, entry>, FIFO + budgeted second chance         │
+│       byte budget, plus a post-collection heap guard as backstop   │
+│  reads   seqlock + monotonic log position over the arena           │
+│  writes  encode → push into this worker's submission ring          │
+│  coherence  drain the invalidation ring; drop matching L1 entries  │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### Repository layout
+
+```
+index.js  index.mjs  index.d.ts   entry points; consumers never see src/
+binding.gyp                       addon build, at the package root
+src/   turbocache.js              the JS layer: L1, coherence, transports
+       native.js                  the one place the addon is resolved
+       binding.cc  *.h            arena, submission rings, platform layer
+       vendor/                    rapidhash, verbatim upstream
+test/  *_test.js  run.js          the suite; npm test and CI both use run.js
+       *.cc                       standalone C++ tests (arena, rings)
+       tsan/  types/              sanitizer gate, declaration tests
+bench/                            microbenchmarks and design experiments
+loadtest/                         sustained multi-worker load harness (Docker)
+scripts/                          build helpers
 ```
 
 ### Why the primary is the only writer
@@ -174,10 +178,10 @@ This is the load-bearing decision. A single writer means:
 
 - **No cross-process locks.** No shared allocator under contention, no write-side seqlock, no CAS loops.
 - **No robust-mutex problem.** macOS has no `PTHREAD_MUTEX_ROBUST`. With multiple writers, a `SIGKILL`ed worker holding a lock deadlocks the arena permanently, and there is no portable recovery. With one writer, that failure mode does not exist.
-- **A worker physically cannot corrupt L2.** Its mapping has no write permission. Worker crashes are contained by the MMU, not by discipline.
-- **The primary is off the read path**, so it is not a throughput bottleneck. It only absorbs writes, which are batched.
+- **A worker physically cannot corrupt L2.** The arena fd is opened `O_RDONLY`, so the restriction is enforced by the kernel rather than by discipline. Workers *do* map two things read-write — the hints segment and their own submission ring — and both are treated as untrusted input by the primary (decisions 18, 36c).
+- **The primary is off the read path**, so it is not a throughput bottleneck. It only absorbs writes.
 
-The cost is that `set()` reaches L2 asynchronously (next tick). For a cache, that is the right trade.
+The cost is that a worker's `set()` reaches L2 asynchronously. For a cache, that is the right trade.
 
 ---
 
@@ -191,25 +195,21 @@ L1 is a **JS `Map`**, not a native store. Measurements drove this:
 | native, copy out | 30 ns | 439 ns | new V8 string every hit |
 | native, external string per call | 58 ns | 59 ns | new external + finalizer every hit |
 
-A native store must build a fresh V8 string on **every hit** — so it does not avoid GC pressure, it *manufactures* it. A `Map` returns the identical immutable string with zero allocation.
+A native store must build a fresh V8 string on **every hit** — so it does not avoid GC pressure, it *manufactures* it. A `Map` returns the identical immutable value with zero allocation.
 
-### Off-heap bytes without the per-hit cost
-
-External strings (`node_api_create_external_string_latin1`) let V8 point directly at off-heap memory. Created *per call* they are slower than copying below ~1KB. Created **once at insert** and cached in the `Map`, they give ~21ns hits at every size *and* keep the bytes off the V8 heap.
-
-So:
-
-- value `< externMinBytes` (1KB) → ordinary V8 string, copied once at insert
-- value `>= externMinBytes` → external string over a per-worker off-heap arena, created once at insert
-
-Both are ~21ns to read thereafter.
-
-**The catch: eviction becomes GC-gated.** The external string holds a raw pointer into the arena. Dropping the `Map` entry does not free the arena slot — the finalizer only runs when V8 collects the string, and a caller holding a long-lived reference pins those bytes indefinitely. The `l1Bytes` cap is therefore *soft* for the external tier.
-**Mitigation:** track pinned bytes; when the arena is full and every slot is pinned, fall back to copied heap strings for new inserts until pressure drops. Degrades gracefully instead of stalling.
+> **Not built:** decision 6 proposed a second tier holding large values as
+> external strings over a per-worker off-heap arena, created once at insert.
+> It was never implemented — there is no `externMinBytes` and no external-string
+> path in the code. The idea is recorded there for its measurements; the
+> eviction-becomes-GC-gated problem it introduces is why it stayed unbuilt.
 
 L1 keys are JS strings in a `Map` — V8 already hashes and caches those. **rapidhash is used for L2 only.**
 
-Eviction is **CLOCK / sampled**, not strict LRU: strict LRU in a JS `Map` means `delete`+`set` on every hit (~50–80ns), which would triple hit cost. A per-entry counter bumped on read is ~1ns.
+Eviction is **FIFO with a budgeted second chance**, not strict LRU: strict LRU in a JS `Map` means `delete`+`set` on every hit (~50–80ns), which would triple hit cost. A per-entry counter bumped on read is ~1ns, and an entry that has been re-read gets one reprieve — bounded, because a reprieve frees no bytes and an unbounded one makes a single insert walk the whole map (decision 34b).
+
+Finding the oldest entry uses a **retained** `Map` iterator. A fresh `entries().next()` per eviction is O(n): V8 tombstones deletions and only compacts on rehash, so each call re-scans the hole prefix. That made cold reads get *slower* as L1 grew (decision 34).
+
+The byte budget is exact in `bytes` mode and a `heapFactor` estimate whenever a codec is in use, so a **post-collection heap guard** backs it up — driven by a `FinalizationRegistry` rather than gc performance entries, which two of the three supported runtimes never emit (decision 43).
 
 ---
 
@@ -292,21 +292,26 @@ If `head - cursor > capacity` the ring has wrapped past that worker; it flushes 
 ## 6. Data flow
 
 **`get(key)`**
-1. Drain invalidation ring (one atomic load, usually a no-op).
-2. `l1.get(key)` → hit: check TTL, bump CLOCK bit, return. **~21ns.**
-3. Miss → native L2 probe: rapidhash64 → open-address probe → seqlock read → `memcmp` key → LZ4 decompress if flagged → build JS value → insert into L1 → return. **~150–400ns**, size-dependent.
-4. Miss → `undefined`. (Future: fall through to L3, async only.)
+1. Drain the invalidation ring (one atomic load, usually a no-op) and, at most every 500ms, check the primary's heartbeat.
+2. `l1.get(key)` → hit: check TTL against a monotonic clock, bump the reference bit, return. **~21ns.**
+3. Miss → native L2 probe: rapidhash64 → open-address probe → copy under the seqlock → verify `seq` unchanged **and** `tailPub <= pos` → `memcmp` the key → rebuild the JS value by its type tag → refill L1 carrying the remaining TTL → return. **~50–500ns**, size- and locality-dependent.
+4. Still a miss → `undefined`. (Reserved: fall through to L3, async only — unbuilt.)
 
 **`set(key, value, {ttlMs})`**
-1. *(Only if compression is explicitly enabled — it is **off by default**, see §9.)* Compress in the **worker** if `rawLen >= compressMinBytes` and LZ4 shrinks it by >12.5%.
-2. Insert into L1, evicting to stay under budget.
-3. Append to a per-tick outbox.
-4. Flush the outbox to the primary on `setImmediate` — one IPC message per tick, `serialization: 'advanced'` so `Buffer`s cross without base64.
+1. Reject what cannot be stored: an over-long key, an empty key, an unpaired surrogate, a value past the arena or ring limit, a type the mode does not accept. Reported as `false` with a reason in `lastError` — `set` never throws.
+2. Encode once. `bytes` writes the value's own bytes with a type tag; `direct` and `safe` run the codec.
+3. Insert into L1, evicting to stay under budget.
+4. **Primary:** apply straight to the arena, then publish an invalidation record.
+   **Worker:** `memcpy` the encoded record into this worker's submission ring and ring the doorbell if the primary might be idle. If the ring is full the write is *shed* — counted in `stats.writesShed`, never silent — and L1 still holds it, so the effect is a miss for other workers, never a wrong value.
 5. Return (synchronous).
 
-Compressing in the worker distributes ~200–250ns of CPU across all workers instead of concentrating it in the primary, and shrinks the IPC payload. The primary then only `memcpy`s the already-compressed blob — this is the "propagate without recomputing" property, preserved exactly.
+The primary drains the rings, applies each record as the sole writer, and then invalidates its own L1 for records other workers wrote — skipping its own, which it already has correct.
 
-Batching means a `set` in worker A is visible to worker B after ~1 tick. **Documented, bounded staleness.**
+Staleness is bounded by the drain, not by a tick: a worker's write is visible to another worker once the primary has applied it and the reader has drained the invalidation ring.
+
+> `incr`, `clearAll` and `clearNamespace` still travel over cluster IPC rather
+> than the rings. The primary drains the rings to empty before applying an IPC
+> batch, which is what keeps one worker's operations in order (decision 36).
 
 ---
 
@@ -321,30 +326,44 @@ Computed once at startup, then fixed. A fixed mapping is the single biggest simp
 
 Both overridable via constructor options.
 
+**Capacity is quantised to powers of two.** The log masks offsets with
+`dataBytes - 1`, so a 24MB, 26MB, 28MB or 32MB arena all yield exactly 16MB of
+data. The formulas above therefore describe an upper bound that is then rounded
+down to the previous power of two, which makes them misleading as written — see
+§13.4. `autoSize()` reports what a given machine actually gets.
+
+The submission rings are sized separately: `submitRings` slots (default 32) of
+`submitRingBytes` each (default 1MB), in their own segment. A value larger than
+half a ring can never be delivered, so `set` rejects it at the call site rather
+than reporting success on a write that will always shed.
+
 ---
 
 ## 8. Failure modes
 
 | Failure | Behaviour |
 |---|---|
-| Worker `SIGKILL`ed | Arena untouched — worker had no write permission. Its unflushed outbox is lost. |
+| Worker `SIGKILL`ed | Arena untouched — the worker had no write permission. Records already published to its submission ring are still applied; anything half-written is never published, and the slot is reclaimed by the next worker that finds its owner pid dead. |
 | Worker killed mid-read | Nothing held; no lock, no cleanup. |
-| Primary crashes | **Not handled.** `heartbeatNs` exists but is never written or read, so a worker cannot tell a stale arena from a live one. Under `cluster` workers usually die with the primary, which is the only thing saving this today. The segment is reclaimed on restart because its name derives from the application's identity, not its pid. |
-| Ring wrap | Lagging worker flushes its whole L1. |
-| Layout change across versions | `magic` + `layoutVersion` in the header; mismatch refuses to attach rather than misreading. |
+| Primary crashes | **Handled.** Workers see the heartbeat go stale, detach (mandatory — on Windows a held handle blocks a new primary from creating the segment at all), keep serving their warm L1, and poll the name. They re-attach only when a heartbeat *advances* across two polls, then flush L1, reset the invalidation cursor and re-claim a ring slot. `arenaId` distinguishes a new primary from the same one resuming. See §13.11. |
+| Primary stalls (long GC, `SIGSTOP`, paused container, laptop sleep) | Same path as a crash, and it recovers when the primary resumes. Ticks are monotonic and suspend-counting, so a wall-clock step cannot trigger this and a sleep does not permanently degrade. |
+| Invalidation ring wrap | The lagging worker flushes its whole L1. Detected on the wrap boundary *and* on being lapped mid-read. |
+| Submission ring full | The write is shed and counted in `stats.writesShed`. L1 still holds it, so other workers see a miss, never a wrong value. |
+| Corrupt submission ring (hostile or buggy worker) | The primary snapshots geometry and validation bounds at create and never re-reads them from shared memory; `head - tail` is clamped to capacity, and every record is bounds-checked. A rejected record stops that one ring — the worker loses its own writes and nothing else. |
+| Layout change across versions | `magic` (published last, with release ordering) + `layout` + full geometry validation; a mismatch refuses to attach rather than misreading. |
 | Corrupt length field | Bounds-checked before every `memcpy`. |
 | Backing filesystem smaller than the arena | Reserved at `create()` via `posix_fallocate`, so it fails there with a message naming `--shm-size` rather than `SIGBUS`ing on first touch. |
-| Synchronous write burst with no event-loop yield | L2 propagation stalls: the drain callback cannot fire, so writes shed. L1 still serves them. A server that returns to the event loop between requests is unaffected. |
-| IPC channel congested | Worker keeps batching to the outbox cap, then sheds L2 writes and counts them in `stats.writesShed`. L1 is unaffected; the shed writes are simply never promoted. |
-| L1 arena fully pinned by live external strings | Fall back to copied heap strings until finalizers release slots. |
+| Synchronous write burst with no event-loop yield | On the ring transport the records land immediately; only the doorbell waits for the loop. On the IPC fallback, propagation stalls entirely — the drain callback cannot fire, so writes shed. L1 serves them either way. |
+| Worker attaches read-only and tries to write | Every mutating entry point refuses with an exception rather than taking a `SIGBUS` on the read-only mapping. |
+| Clock stepped (NTP, manual) | No effect. Heartbeats and TTLs are on a monotonic tick clock, and L1 expiry is on `performance.now()`. |
 
-**Security boundary:** the segment is uid-scoped, mode 0600. Any process running as the same user can read every cached value. This is not safe for untrusted co-tenants, and must be documented plainly.
+**Security boundary:** the segment is uid-scoped, mode 0600. Any process running as the same user can read every cached value. This is not safe for untrusted co-tenants, and must be documented plainly. Note also that workers map two segments read-write — hints and their own submission ring — so the isolation claim is specifically about the *arena*, and the primary treats both writable surfaces as untrusted input.
 
 ---
 
 ## 9. Measurements
 
-Apple Silicon, Node 24.15.0, V8 13.6.233. Harness in `prototype/`.
+Apple Silicon, Node 24.15.0, V8 13.6.233. Harness in `src/`.
 
 > **Payload entropy matters enormously.** An earlier draft of this document reported
 > LZ4 figures measured against `'x'.repeat(n)`, which compresses to nothing and is
@@ -1189,7 +1208,7 @@ TSAN **cannot observe races between processes** sharing an mmap — it tracks
 happens-before within one process, and the real deployment is a writing primary
 and reading workers. So the harness models them as threads over the same arena
 code: identical atomics, fences and seqlock, with only the isolation boundary
-changed. `prototype/tsan/run_tsan.sh` builds and runs it.
+changed. `src/tsan/run_tsan.sh` builds and runs it.
 
 **It found a real bug.** The CLOCK reference bits were a plain `uint8_t` array,
 written by the primary (clearing and relocating them) while every worker
@@ -1342,7 +1361,7 @@ restart finds the previous run's data gone.
 
 An independent adversarial review attacked the six load-bearing invariants, ran
 ASan and UBSan for the first time, and audited the benchmarks. It found **six
-severity-1 defects**. All are fixed; `prototype/review_regression_test.js` pins
+severity-1 defects**. All are fixed; `src/review_regression_test.js` pins
 every one.
 
 | # | Defect | Fix |
@@ -1518,13 +1537,29 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
 
 ## 11. Testing
 
-- **Unit (native):** hash table probing and tombstones, slab allocator, LZ4 round-trip, seqlock under a deliberately racing writer.
-- **Sanitizers:** `prototype/tsan/run_sanitizers.sh` runs TSAN across four arena configurations and ASan+UBSan across three, asserting zero torn values, zero sanitizer reports, and that the set of TSAN race sites never grows beyond the known seqlock payload copy. There is no CI to run it in.
-- **Multi-process integration:** fork N workers, run randomized op streams against a JS `Map` reference model, assert every read is either correct-current or correct-stale-within-bound.
-- **Crash tests:** `SIGKILL` a worker mid-`set`; assert the arena stays readable and self-consistent, and that surviving workers are unaffected.
-- **Fuzzing:** feed the entry decoder adversarial arena bytes (corrupt lengths, torn seq values) and assert no out-of-bounds access.
-- **GC-pressure tests:** hold long-lived references to external-string values, assert the pinned-bytes fallback engages and no use-after-free occurs.
-- **Benchmarks:** L1 hit, L2 hit, miss, `set`, versus `lru-cache` and Redis over a unix socket.
+`npm test` and CI both run `test/run.js`, which is the single list of JS suites — the list used to live in the workflow only, which is how a test stops being run without anyone noticing.
+
+**JS suites** (`test/`)
+- `test.js`, `api_test.js` — core behaviour and the public API surface.
+- `codec_test.js`, `prim_test.js`, `v8codec_test.js`, `storage_modes_test.js`, `typeflow_test.js`, `typematrix_test.js` — the three storage modes. `typematrix_test.js` asserts a full input-type × mode matrix, including the cells JSON is *supposed* to degrade.
+- `json_fastpath_test.js` — that no codec falls off Node's JSON fast path.
+- `namespace_test.js` — quotas, including under index pressure rather than only data pressure.
+- `cluster_api_test.js`, `transport_regression_test.js` — cross-process behaviour, the latter over **both** transports, driving the public API in a real worker rather than the internals.
+- `recovery_test.js` — primary death, restart, stall and resume, using `child_process.fork` because under `cluster` a worker dies with its primary and none of those cases arise.
+- `guard_test.js` — that the heap guard actually fires, on the registry path and on the backstop alone.
+- `review_regression_test.js`, `gaps_test.js`, `perf_regression_test.js` — one case per defect found by adversarial review; the last asserts *ratios* between configurations, never absolute times, so a slow CI machine moves both sides together.
+
+**Native** (`test/*.cc`, no Node required)
+- `submit_test.cc` — the SPSC ring: wrap, varied record sizes, a full ring, malformed records, a hostile header, a SKIP flood, and SPSC concurrency under TSAN.
+- `native_regression_test.cc` — TTL across the uint32 epoch wrap, the log's wrap gap against a canary, and header geometry validation.
+
+**Sanitizers** (`test/tsan/run_sanitizers.sh`) — TSAN across four arena configurations then ASan+UBSan across three, judging races by *address* within the arena data region rather than by symbol name, after a name-based gate was shown to pass a deliberately injected race.
+
+**Types** (`test/types/`) — `tsc` against `index.d.ts`, with `@ts-expect-error` on six deliberate misuses. A declaration file that accepts everything type-checks fine and is worthless; tsc fails on an *unused* expect-error, so the file only passes when each of those really is an error.
+
+**Load** (`loadtest/`) — a Docker harness running four flows across multiple workers for 10+ minutes, self-verifying every value, with leak detection on the post-GC floor and CPU accounting per operation.
+
+**What is not tested:** no fuzzing of the entry decoder against adversarial arena bytes, and TSAN cannot observe cross-process races at all, so the multi-process evidence remains empirical.
 
 ---
 
@@ -1687,11 +1722,11 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
     the addon and works on Node, Bun and Deno. Still missing: **prebuilds** and a
     publish workflow, so every consumer needs a compiler. The Node-API ABI check
     means one prebuild per platform would cover every Node major. Also unmoved:
-    the sources still live under `prototype/`, which the `exports` map hides from
+    the sources still live under `src/`, which the `exports` map hides from
     consumers but which is the wrong name for shipped code.
 15. ~~**Two vendored-in-name-only dependencies.**~~ **Done.** LZ4 is now an
     optional build feature and the default build links nothing external;
-    `prototype/vendor/rapidhash.h` is the upstream header verbatim (rapidhash V3,
+    `src/vendor/rapidhash.h` is the upstream header verbatim (rapidhash V3,
     MIT, commit recorded in `vendor/README.md`) rather than a transcription.
     A checkout now builds with only a compiler and Node — verified by building
     from a clean export of the tree.
