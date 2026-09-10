@@ -83,10 +83,17 @@ if (process.env.TC_ROLE === 'primary') {
 
         // 3. the SAME primary merely stalls: recover, and do not double-count
         sawDead = false;
-        prim.send({ t: 'stall', ms: 4000 });
-        await wait(4500);
-        ok(last.dead === true, 'a stalled primary degrades the worker');
-        await wait(5000);          // the stall lapses on its own; the primary resumes stamping
+        // Stall for longer than the observation window, and assert on whether
+        // the worker was EVER seen degraded rather than on its state at one
+        // instant. A single-instant check is a race: on a slower runner with
+        // coarser timers the worker can degrade and recover inside the wait, and
+        // the sample lands after the recovery. That is what failed on Windows,
+        // while the two assertions after it - recoveries=2, sameArena=true -
+        // proved the degrade and recovery had both happened.
+        prim.send({ t: 'stall', ms: 8000 });
+        await wait(5000);          // mid-stall: staleMs is 2000, so it must be degraded by now
+        ok(sawDead, 'a stalled primary degrades the worker');
+        await wait(6000);          // the stall lapses on its own; the primary resumes stamping
         ok(sawDead && last.dead === false, 'worker recovers when the same primary resumes');
         ok(last.recoveries === 2 && last.last.sameArena === true,
            `resume is recognised as the SAME arena (recoveries=${last.recoveries}, same=${last.last && last.last.sameArena})`);
@@ -101,5 +108,5 @@ if (process.env.TC_ROLE === 'primary') {
         console.log(fails ? `\n${fails} FAILED` : '\nall passed');
         process.exit(fails ? 1 : 0);
     })();
-    setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 60000);
+    setTimeout(() => { console.log('TIMEOUT'); process.exit(1); }, 90000);
 }
