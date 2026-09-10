@@ -26,6 +26,6 @@ for (const [label, v] of cases) {
     console.log(`  ${label.padEnd(8)} ${(typeof v).padEnd(11)} ${String(fromL1).padEnd(10)}${(typeof fromL1).padEnd(8)}` +
         `${(inL2 === undefined ? 'NO' : 'yes').padEnd(14)}${afterEvict === undefined ? 'LOST' : String(afterEvict) + ' (' + typeof afterEvict + ')'}`);
 }
-TurboCache.native().destroy();
+c.close();   // not native().destroy(): that leaves the instance registered
 console.log(fails ? `\n  ${fails} FAILED` : '\n  all passed');
 process.exit(fails ? 1 : 0);

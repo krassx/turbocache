@@ -73,7 +73,12 @@ const EXPECT = {
 let fails = 0;
 console.log('  input        ' + modes.map(m => m[0].padEnd(24)).join(''));
 for (const [label, make] of Object.entries(values)) {
-    const raw = modes.map(([, opts]) => { const c = mk(opts); const r = probe(c, make); TurboCache.native().destroy(); return r; });
+    // close(), not native().destroy(). Reaching past the instance to destroy the
+    // arena leaves the cache registered in `instances` and the module's
+    // storeReady flag set, so every cell of this matrix accumulated another live
+    // instance that later invalidations still walked. close() releases the ring
+    // slot, stops the guard, and deregisters.
+    const raw = modes.map(([, opts]) => { const c = mk(opts); const r = probe(c, make); c.close(); return r; });
     console.log('  ' + label.padEnd(12) + ' ' + raw.map(r => r.padEnd(24)).join(''));
     const want = EXPECT[label];
     if (!want) { console.log(`  FAIL: no expectation recorded for ${label}`); fails++; continue; }
