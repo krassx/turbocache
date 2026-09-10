@@ -88,12 +88,17 @@ function gcArm() {
 // by more than 4x across them under identical churn: 6.3/s on Node, 9.7/s on
 // Bun, 28.6/s on Deno. Two reasons not to follow it:
 //
-//   - the sample is not free, and on Bun it is expensive out of all proportion.
-//     v8.getHeapStatistics() costs ~200ns on Node and Deno but 426us-2.6ms on
-//     Bun, so Bun's 9.7/s would be 25ms/s - 2.5% of a core, permanently, just
-//     to watch memory.
-//   - shedding is not free either. Acting 28 times a second churns L1 far
-//     harder than a memory guard needs to.
+//   - the sample is not free, and on Bun 1.4.2 it is expensive out of all
+//     proportion: v8.getHeapStatistics() is ~110ns and constant-time on Node,
+//     but O(heap) on Bun -- 3.2ms at a 17MB heap rising to 74ms at 411MB.
+//     Reported upstream and being fixed (oven-sh/bun#30596, unmerged as of
+//     2026-09-10), so treat that figure as dated rather than permanent.
+//   - shedding is not free either, and this reason does not expire. Acting 28
+//     times a second churns L1 far harder than a memory guard needs to, on
+//     every runtime.
+//
+// So the debounce stays even once Bun's sampling cost is fixed: it was never
+// only about that.
 //
 // A guard acts on a timescale of seconds, so 500ms is ample. The registry is
 // re-armed on EVERY callback regardless: dropping a sample must never drop the

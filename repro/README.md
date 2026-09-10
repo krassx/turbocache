@@ -3,6 +3,12 @@
 Run: `node heapstats-cost.mjs` / `bun heapstats-cost.mjs`
 (no dependencies, no native addons, single file)
 
+## Status
+
+Reported upstream; a fix is in progress in **oven-sh/bun#30596**, unmerged as of
+2026-09-10. The measurements below describe Bun 1.4.2 and should be re-run
+against any release that includes that PR before being cited.
+
 ## Summary
 
 On Bun, `v8.getHeapStatistics()` takes time proportional to heap size — 3.2ms at
