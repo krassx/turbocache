@@ -1650,8 +1650,14 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
     deployments, while the "the same primary was stalled" half — a long GC, a
     paused container, a laptop sleep — applies everywhere and used to be a
     permanent outage.
-12. **Windows.** Needs `CreateFileMapping` — a second shared-memory
-    implementation.
+12. ~~**Windows.**~~ **Done** — every OS call is behind `platform.h`, using
+    `CreateFileMapping`/`MapViewOfFile`, `QueryInterruptTimePrecise` for the tick
+    clock and `OpenProcess` for ring-owner liveness. `windows-latest` is in the
+    CI matrix and green: the arena, both transports, the submission rings,
+    geometry validation and recovery all build and pass there. Note Windows
+    mappings are reference-counted, so `shmUnlink` is a no-op and a worker
+    holding a handle blocks a new primary from creating the segment — which is
+    why a degraded worker must detach (decision 41).
 
 ### Operational, still open
 
@@ -1675,9 +1681,14 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
     payload race, which remains UB by the standard. `run_tsan.sh` is the gate.
     Still outstanding: TSAN cannot cover the cross-process case at all, so the
     multi-process evidence remains empirical.
-14. **No packaging at all**: no `package.json`, no README, no CI, no prebuilds.
-    The Node-API ABI check means one prebuild per platform would cover every
-    Node major, but none is produced.
+14. **Packaging is partly done.** `package.json` with dual CJS/ESM `exports`,
+    hand-written `index.d.ts` guarded by `types/types.test.ts`, README, LICENSE
+    and CI across ubuntu/macos/windows all exist, and a tarball install compiles
+    the addon and works on Node, Bun and Deno. Still missing: **prebuilds** and a
+    publish workflow, so every consumer needs a compiler. The Node-API ABI check
+    means one prebuild per platform would cover every Node major. Also unmoved:
+    the sources still live under `prototype/`, which the `exports` map hides from
+    consumers but which is the wrong name for shipped code.
 15. ~~**Two vendored-in-name-only dependencies.**~~ **Done.** LZ4 is now an
     optional build feature and the default build links nothing external;
     `prototype/vendor/rapidhash.h` is the upstream header verbatim (rapidhash V3,

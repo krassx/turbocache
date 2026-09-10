@@ -15,9 +15,23 @@ const ARENA = process.env.TC_ARENA || ('/tcrecov' + process.pid);
 
 if (process.env.TC_ROLE === 'primary') {
     const { TurboCache } = require('./turbocache');
-    const c = TurboCache.createPrimary(ARENA, 16 << 20, 1 << 14, { storage: 'bytes' });
+    // maintenance:false so this test OWNS the heartbeat. The library's own
+    // maintenance timer stamps it independently, so pausing a second interval
+    // alongside it stalls nothing - SIGSTOP only appeared to work because it
+    // froze the whole process, library timer included.
+    const c = TurboCache.createPrimary(ARENA, 16 << 20, 1 << 14, { storage: 'bytes', maintenance: false });
     c.set('k', process.env.TC_VALUE);
-    setInterval(() => { try { require('./build/Release/l2.node').heartbeat(); } catch {} }, 500);
+    // A stalled primary is simulated by pausing the heartbeat rather than by
+    // SIGSTOP: signals are the wrong tool here. SIGSTOP does not exist on
+    // Windows (ERR_UNKNOWN_SIGNAL), and pausing the stamp exercises exactly the
+    // code path under test - a worker seeing the heartbeat go stale - on every
+    // platform, without freezing a process the harness still needs to talk to.
+    let paused = 0;
+    setInterval(() => {
+        if (Date.now() < paused) return;
+        try { require('./build/Release/l2.node').heartbeat(); } catch {}
+    }, 500);
+    process.on('message', (m) => { if (m && m.t === 'stall') paused = Date.now() + m.ms; });
     process.send({ t: 'up' });
     setInterval(() => {}, 1000);
 } else if (process.env.TC_ROLE === 'worker') {
@@ -69,11 +83,10 @@ if (process.env.TC_ROLE === 'primary') {
 
         // 3. the SAME primary merely stalls: recover, and do not double-count
         sawDead = false;
-        prim.kill('SIGSTOP');
+        prim.send({ t: 'stall', ms: 4000 });
         await wait(4500);
         ok(last.dead === true, 'a stalled primary degrades the worker');
-        prim.kill('SIGCONT');
-        await wait(5000);
+        await wait(5000);          // the stall lapses on its own; the primary resumes stamping
         ok(sawDead && last.dead === false, 'worker recovers when the same primary resumes');
         ok(last.recoveries === 2 && last.last.sameArena === true,
            `resume is recognised as the SAME arena (recoveries=${last.recoveries}, same=${last.last && last.last.sameArena})`);
