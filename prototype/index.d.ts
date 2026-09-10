@@ -49,15 +49,21 @@ export interface NamespaceOptions {
     quotaBytes?: number;
 }
 
-/** Bounds L1 by live heap measured after a GC, since the byte budget is only
- *  an estimate. Pass `false` to disable.
- *  NOTE: this relies on gc PerformanceObserver entries, which Bun and Deno
- *  accept but never emit — the guard is inert on those runtimes. */
+/** Bounds L1 by live heap measured after a collection, since the byte budget is
+ *  only an estimate. Pass `false` to disable. Driven by a FinalizationRegistry,
+ *  which works on Node, Bun and Deno, with a floor-polling backstop for when
+ *  finalizers go quiet. */
 export interface HeapGuardOptions {
     /** Shed L1 once live heap exceeds this fraction of the limit. Default 0.80. */
     maxHeapFraction?: number;
     /** Fraction of L1 bytes to release when it fires. Default 0.25. */
     shedFraction?: number;
+    /** Minimum gap between guard evaluations. Collection frequency is the
+     *  runtime's business (6.3/s on Node, 9.7/s on Bun, 28.6/s on Deno under
+     *  identical churn) and sampling is not free — `v8.getHeapStatistics()`
+     *  costs ~200ns on Node and Deno but 426µs–2.6ms on Bun. Default 500ms.
+     *  The signal is process-wide, so the most eager subscriber sets the pace. */
+    minIntervalMs?: number;
 }
 
 export interface CacheOptions<T = unknown> {
@@ -207,6 +213,9 @@ export declare class TurboCache<T = unknown> {
     static hasCompression(): boolean;
     /** Apply pending worker submissions on the primary. Returns records applied. */
     static drainSubmissions(budget?: number): number;
+    /** Heap-guard cadence: evaluations performed, finalizer signals dropped by
+     *  the debounce, and the interval currently in force. */
+    static heapGuardPace(): { evaluations: number; debounced: number; minIntervalMs: number };
 
     get(key: string): T | undefined;
     set(key: string, value: T, options?: SetOptions): boolean;
@@ -242,8 +251,8 @@ export declare class TurboCache<T = unknown> {
     readonly stats: CacheStats;
     /** Why the last operation failed, or null. */
     lastError: string | null;
-    /** Live heap fraction sampled after the last GC. Stays 0 on runtimes that
-     *  do not emit gc performance entries (Bun, Deno). */
+    /** Live heap fraction sampled after the last collection. 0 until the guard
+     *  has taken its first reading. */
     readonly liveHeapFraction: number;
 }
 

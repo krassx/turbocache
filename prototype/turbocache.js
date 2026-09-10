@@ -9,7 +9,6 @@ const native = require('./build/Release/l2.node');
 const fs = require('fs');
 const v8 = require('v8');
 const v8ser = require('v8');
-const { PerformanceObserver } = require('perf_hooks');
 
 // An unpaired surrogate encodes to U+FFFD in UTF-8, so '\uD800', '\uDC00' and
 // '\uFFFD' all became ONE key in the arena and returned each other's values --
@@ -45,23 +44,121 @@ function frozenMutator(name) {
 
 // A single process-wide GC observer feeding every cache that wants the heap
 // guard. See the constructor for why this is not per-instance.
-let gcObserver = null;
+// The heap guard needs the LIVE heap: a reading taken after a collection.
+// used_heap_size sampled at an arbitrary moment includes uncollected garbage,
+// so it rises when you shed and the guard thrashes (decision 22).
+//
+// A gc PerformanceObserver was the original signal. It is Node-only -- Bun and
+// Deno accept the subscription and never emit an entry, so the guard was
+// silently inert on both -- and it is less accurate than it looks, because it
+// fires on scavenges too, which do not collect old space, so most of its
+// samples are taken mid-garbage.
+//
+// A FinalizationRegistry callback runs only once its sentinel has actually been
+// collected, so sampling there is a genuine post-collection reading, and it
+// exists on all three runtimes. Measured against a known 42.7MB live set under
+// heavy churn: observer mean 147.3MB, FinalizationRegistry mean 52.2MB.
+//
+// The spec promises nothing about whether or when finalizers run, so a floor
+// poll backs it up: the minimum of a rolling window approximates the post-GC
+// floor with no GC event at all (mean 85.3MB -- worse than the registry, far
+// better than raw polling's 147.1MB, and available unconditionally).
+const GC_POLL_MS = 1000;      // backstop cadence; unref'd, so it never holds the process open
+const GC_WINDOW = 16;         // samples retained for the floor estimate
+const GC_QUIET_MS = 5000;     // finalizers silent this long -> fall back to the floor
+const GC_MIN_INTERVAL_MS = 500;   // debounce; see gcOnFinalizer
+// -Infinity, not 0: monoMs() is performance.now(), which also starts near zero,
+// so a 0 initialiser made the FIRST reading look like it arrived moments after a
+// previous one and debounced it away. The guard then sat idle until the second
+// collection, and at a long minInterval it could stay idle for a long time.
+let gcRegistry = null, gcTimer = null, gcLastSignal = -Infinity, gcLastEval = -Infinity;
+let gcMinInterval = GC_MIN_INTERVAL_MS;
+let gcEvals = 0, gcDebounced = 0;
 const gcSubscribers = new Set();
-function gcSubscribe(inst) {
-    gcSubscribers.add(inst);
-    if (gcObserver) return;
-    gcObserver = new PerformanceObserver(list => {
-        for (const e of list.getEntries()) {
-            if (e.detail && e.detail.kind === undefined) continue;
-            for (const c of gcSubscribers) c._onGc();
-        }
-    });
-    gcObserver.observe({ entryTypes: ['gc'] });
+const gcWindow = [];
+
+function gcArm() {
+    // The sentinel is unreachable the moment this returns, so the next
+    // collection finalizes it and re-arms the signal.
+    if (gcRegistry) { try { gcRegistry.register({}, 1); } catch { /* registry unusable */ } }
 }
+
+// How often the guard is willing to LOOK, independent of how often the runtime
+// happens to collect. Collection frequency is the runtime's business and varies
+// by more than 4x across them under identical churn: 6.3/s on Node, 9.7/s on
+// Bun, 28.6/s on Deno. Two reasons not to follow it:
+//
+//   - the sample is not free, and on Bun it is expensive out of all proportion.
+//     v8.getHeapStatistics() costs ~200ns on Node and Deno but 426us-2.6ms on
+//     Bun, so Bun's 9.7/s would be 25ms/s - 2.5% of a core, permanently, just
+//     to watch memory.
+//   - shedding is not free either. Acting 28 times a second churns L1 far
+//     harder than a memory guard needs to.
+//
+// A guard acts on a timescale of seconds, so 500ms is ample. The registry is
+// re-armed on EVERY callback regardless: dropping a sample must never drop the
+// signal, or the chain stops and the guard goes quiet permanently.
+function gcOnFinalizer() {
+    gcArm();                                   // first and unconditional
+    const now = monoMs();
+    if (now - gcLastEval < gcMinInterval) { gcDebounced++; return; }
+    gcLastEval = now;
+    gcLastSignal = now;
+    gcEvals++;
+    // Canonical source. process.memoryUsage().heapUsed is far cheaper and equals
+    // it exactly on Node and Deno (ratio 1.000), but on Bun it tracks something
+    // else - it stayed flat at 9.4MB while used_heap_size grew - and Bun's
+    // heap_size_limit is not constant either (318MB -> 644MB as the heap grew),
+    // so neither the numerator nor the denominator can be shortcut.
+    const h = v8.getHeapStatistics();
+    gcWindow.length = 0;                       // a real post-GC reading supersedes the floor
+    gcNotify(h.used_heap_size, h.heap_size_limit);
+}
+
+function gcNotify(used, limit) {
+    for (const c of gcSubscribers) c._onGc(used, limit);
+}
+
+function gcSubscribe(inst, minIntervalMs) {
+    const first = gcSubscribers.size === 0;
+    gcSubscribers.add(inst);
+    // The signal is process-wide but the cadence is per-caller, so the most
+    // eager subscriber sets the pace for everyone.
+    if (typeof minIntervalMs === 'number' && minIntervalMs >= 0) {
+        gcMinInterval = first ? minIntervalMs : Math.min(gcMinInterval, minIntervalMs);
+    }
+    if (gcTimer) return;                       // already running for this process
+    if (typeof FinalizationRegistry === 'function') {
+        gcRegistry = new FinalizationRegistry(gcOnFinalizer);
+        gcArm();
+    }
+    gcTimer = setInterval(() => {
+        const h = v8.getHeapStatistics();
+        gcWindow.push(h.used_heap_size);
+        if (gcWindow.length > GC_WINDOW) gcWindow.shift();
+        // While the registry is delivering, its readings are strictly better;
+        // the floor only takes over once finalizers go quiet.
+        if (gcRegistry && monoMs() - gcLastSignal < GC_QUIET_MS) return;
+        if (!gcWindow.length) return;
+        gcLastEval = monoMs(); gcEvals++;
+        gcNotify(Math.min(...gcWindow), h.heap_size_limit);
+    }, GC_POLL_MS);
+    if (gcTimer.unref) gcTimer.unref();
+}
+
 function gcUnsubscribe(inst) {
     gcSubscribers.delete(inst);
-    if (gcSubscribers.size === 0 && gcObserver) { gcObserver.disconnect(); gcObserver = null; }
+    if (gcSubscribers.size) return;
+    if (gcTimer) { clearInterval(gcTimer); gcTimer = null; }
+    gcRegistry = null;                         // drops any pending registration with it
+    gcWindow.length = 0;
+    gcLastSignal = -Infinity; gcLastEval = -Infinity;
+    gcMinInterval = GC_MIN_INTERVAL_MS;
 }
+
+// Observable pace, so a caller can see the guard is alive and how often it is
+// actually looking - rather than how often the runtime happens to collect.
+function gcPace() { return { evaluations: gcEvals, debounced: gcDebounced, minIntervalMs: gcMinInterval }; }
 
 // L1 expiry runs on a MONOTONIC clock, matching the arena's tick-based epoch.
 // With Date.now() an NTP step moved L1 and L2 expiry in opposite directions:
@@ -246,7 +343,7 @@ class TurboCache {
             // cost ~24MB. The guard is a process-wide signal; the per-instance
             // part is only the thresholds.
             this.#gcObserver = true;
-            gcSubscribe(this);
+            gcSubscribe(this, g && g.minIntervalMs);
         }
     }
 
@@ -514,7 +611,7 @@ class TurboCache {
         }
     }
 
-    _onGc() { this.#onGc(); }
+    _onGc(used, limit) { this.#onGc(used, limit); }
 
     _dropByHash(hash) {
         const k = this.#byHash.get(hash);
@@ -614,6 +711,10 @@ class TurboCache {
         this.stats.recoveries = (this.stats.recoveries || 0) + 1;
         this.stats.lastRecovery = { sameArena, at: Date.now() };
     }
+
+    /** Guard cadence: evaluations performed, finalizer signals dropped by the
+     *  debounce, and the interval in force. */
+    static heapGuardPace() { return gcPace(); }
 
     static submitStats() { try { return native.submitStats(); } catch { return null; } }
 
@@ -733,9 +834,12 @@ class TurboCache {
 
     // Runs right after a GC, so used_heap_size is the LIVE set, not live+garbage.
     // The byte budget is an estimate; this is not.
-    #onGc() {
-        const h = v8.getHeapStatistics();
-        this.liveHeapFraction = h.used_heap_size / h.heap_size_limit;
+    #onGc(used, limit) {
+        if (used === undefined) {
+            const h = v8.getHeapStatistics();
+            used = h.used_heap_size; limit = h.heap_size_limit;
+        }
+        this.liveHeapFraction = used / limit;
         if (this.liveHeapFraction < this.#guardMax) return;
         const target = this.#l1Bytes * (1 - this.#guardShed);
         for (const [k, e] of this.#l1) {

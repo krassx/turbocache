@@ -57,15 +57,13 @@ supported arrangement.
 |---|---|---|---|
 | addon, cluster, both transports | yes | yes | yes |
 | CJS + ESM entry points | yes | yes | yes |
-| post-GC heap guard | yes | **no** | **no** |
+| post-collection heap guard | yes | yes | yes |
 
 Bun runs the entire suite green — every unit test, both transports, and the full
-primary-death recovery sequence — at roughly 15% below Node's throughput. Its
-one real gap is the heap guard: Bun and Deno accept a `gc` `PerformanceObserver`
-and never emit entries, so the post-GC guard never fires and L1 is bounded only
-by the `heapFactor` byte estimate, with nothing correcting it under memory
-pressure. One further Deno-only failure remains under the `direct` codec; see
-DESIGN.md.
+primary-death recovery sequence — at roughly 15% below Node's throughput. The
+heap guard works on all three: it is driven by a `FinalizationRegistry` rather
+than gc performance entries, which Bun and Deno accept but never emit. One
+Deno-only failure remains under the `direct` codec; see DESIGN.md.
 
 ## Operational notes
 
