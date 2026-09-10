@@ -49,6 +49,12 @@ jobs:
             && /tmp/submit_test || { echo "FAILED: submit_test"; fail=1; }
           exit $fail
 
+      - name: TypeScript declarations
+        shell: bash
+        run: |
+          npm i --no-save --silent typescript@5.4
+          ./node_modules/.bin/tsc -p types/tsconfig.json
+
       - name: Cross-process behaviour
         working-directory: prototype
         shell: bash
