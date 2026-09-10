@@ -44,8 +44,12 @@ to 13.59ms at p99. Rings replace that with a memcpy:
 | `safe` | JSON | silently degrades them | 1789 ns/op |
 | `direct` | `v8.serialize` | yes | 3250 ns/op |
 
-`direct`'s format is runtime-specific: Bun's differs from Node's and Deno's, so
-an arena written by one runtime cannot be read by another.
+`direct` uses each runtime's own `v8.serialize`, whose format differs between
+Node and Bun. That is not reachable in practice: a cluster is built from
+processes of one runtime, and an arena never outlives the primary that created
+it — `create()` unlinks any prior segment and starts empty. Worth knowing only
+if you attach to an arena from outside its own cluster, which is not a
+supported arrangement.
 
 ## Runtime support
 
@@ -55,9 +59,13 @@ an arena written by one runtime cannot be read by another.
 | CJS + ESM entry points | yes | yes | yes |
 | post-GC heap guard | yes | **no** | **no** |
 
-Bun and Deno accept a `gc` `PerformanceObserver` but never emit entries, so the
-heap guard is inert there and L1 is bounded only by the byte estimate. One known
-Deno failure remains under the `direct` codec; see DESIGN.md.
+Bun runs the entire suite green — every unit test, both transports, and the full
+primary-death recovery sequence — at roughly 15% below Node's throughput. Its
+one real gap is the heap guard: Bun and Deno accept a `gc` `PerformanceObserver`
+and never emit entries, so the post-GC guard never fires and L1 is bounded only
+by the `heapFactor` byte estimate, with nothing correcting it under memory
+pressure. One further Deno-only failure remains under the `direct` codec; see
+DESIGN.md.
 
 ## Operational notes
 
