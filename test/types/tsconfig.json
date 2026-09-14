@@ -8,5 +8,8 @@
     "skipLibCheck": true,
     "types": []
   },
-  "files": ["types.test.ts"]
+  "files": [
+    "types.test.ts",
+    "esm.test.mts"
+  ]
 }
