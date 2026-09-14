@@ -1733,6 +1733,26 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
     surface (decision 45), the background-compaction machinery is deleted
     (decision 47), the native size estimator went with it, and `SLAB`/`LOG` are
     removed so `LOG2` is the only arena mode (decision 49).
+19. **The addon segfaults on load under Node 18 and 20.** `engines` says
+    `>=18.0.0`, but the CI matrix is `node: [24]`, so the minimum supported
+    version has never been exercised. Measured on a constant distro
+    (`node:<v>-bookworm`, arm64, native, source build — not a prebuild, and not
+    emulation): **18 SIGSEGV, 20 SIGSEGV, 22 loads, 24 loads**. Pre-existing —
+    `44b9c54`, before the prebuild work, crashes identically. The crash is
+    inside Node's own `napi_module_register_by_symbol`, *before* our `Init`
+    runs (instrumented: an `fprintf` at the top of `Init` never prints), and a
+    minimal N-API addon built in the same container loads fine, so it is
+    specific to this addon rather than the toolchain. Not yet root-caused: it is
+    not a missing symbol (every `napi_*` the binary imports is exported by Node
+    20, and nothing newer than NAPI 6 is used), and both this addon and the
+    working minimal one export the same `napi_register_module_v1` /
+    `node_api_module_get_api_version_v1` pair. Practical impact: Amazon Linux
+    2023's default `nodejs` package **is 18.20.8**, so `dnf install nodejs`
+    plus turbocache crashes; with `nodejs22` the same arena works end to end.
+    The decision to make is whether to fix the crash or raise `engines` to
+    `>=22`; either way CI must test the minimum it claims, which is the process
+    gap that let this hide.
+
 18. **`bytes` mode copies every string value on `set`.** `flatten` is
     unconditional because Node-API cannot tell a flat string from a slice, and a
     slice of any size can retain an arbitrarily large parent. That is the right

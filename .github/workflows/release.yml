@@ -38,7 +38,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: '20' }
+        # 22, not 20: the addon currently segfaults on load under Node 18 and 20
+        # (pre-existing, reproduced on a plain source build, see open item 19),
+        # so the verification step below would fail the whole release on 20.
+        # The prebuild itself is Node-API and version-independent either way.
+        with: { node-version: '22' }
 
       # ubuntu-22.04 rather than -latest deliberately: a prebuild links the
       # glibc it was built against, so the OLDEST supported runner gives the
@@ -74,7 +78,7 @@ jobs:
   prebuild-musl:
     name: linux-x64-musl
     runs-on: ubuntu-22.04
-    container: node:20-alpine
+    container: node:22-alpine
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
@@ -113,7 +117,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
       - uses: actions/download-artifact@v4
