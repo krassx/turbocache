@@ -1597,6 +1597,13 @@ class TurboCache {
         // Passing a callback routes the failure here instead - and tells us when
         // the message actually reached the channel, which is our drain signal.
         const self = this;
+        // Declared OUTSIDE the try: the catch below reads it, and a `let` inside
+        // the try block is not in scope there. It was, which made the catch throw
+        // `ReferenceError: sendThrew is not defined` instead of returning the
+        // reserved bytes -- so the very wedge the comment below describes still
+        // happened, plus an unexpected error out of flush(). Never executed by
+        // any test until one was written for it.
+        let sendThrew = true;
         try {
             // Reserve AFTER the call cannot throw synchronously. process.send
             // throws for a value the serializer cannot represent (a BigInt under
@@ -1604,7 +1611,6 @@ class TurboCache {
             // never returned those bytes -- eight such batches wedged the worker
             // for its lifetime while every set() still reported success.
             this.#inFlightBytes += batchBytes;
-            let sendThrew = true;
             const accepted = process.send({ t: MSG, id: this.#id, b: batch }, err => {
                 self.#inFlightBytes -= batchBytes;
                 if (self.#inFlightBytes < 0) self.#inFlightBytes = 0;

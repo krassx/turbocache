@@ -39,7 +39,14 @@ if (process.env.TC_ROLE === 'primary') {
     const c = TurboCache.attachWorker(ARENA, 1, { storage: 'bytes', primaryStaleMs: 2000 });
     c.get('k');                                    // warm L1 so degraded reads still work
     process.send({ t: 'ready' });
-    setInterval(() => {
+    // Leave on request rather than only on a signal. A normal exit is what
+    // writes V8 coverage; relying on the SIGTERM handler made the recovery
+    // machinery's 53 lines land or not land depending on a race, which moved
+    // whole-suite coverage by ~5 points between runs.
+    process.on('message', (m) => {
+        if (m && m.t === 'bye') { clearInterval(poll); process.exit(0); }
+    });
+    const poll = setInterval(() => {
         process.send({
             t: 'poll', v: c.get('k'), dead: !!c.lastError && /serving L1 only/.test(c.lastError),
             recoveries: c.stats.recoveries || 0, last: c.stats.lastRecovery || null,
@@ -104,7 +111,21 @@ if (process.env.TC_ROLE === 'primary') {
         ok(last.recoveries === before && last.dead === false,
            `no spurious degrade over 6s of healthy operation (${before} -> ${last.recoveries})`);
 
-        prim.kill('SIGKILL'); w.kill('SIGKILL');
+        // The PRIMARY dies hard above -- that is the scenario. This is only
+        // teardown, and the worker is where #degrade, #tryRecover and
+        // _recovered actually run, so it gets SIGTERM: a SIGKILLed process
+        // cannot flush V8 coverage, and 55 lines of the recovery machinery
+        // were being reported as untested purely because of how the test ended.
+        prim.kill('SIGKILL');
+        // Wait for the worker to actually exit rather than guessing: under
+        // coverage it flushes in its SIGTERM handler, and racing that flush
+        // made measured coverage swing several points between runs.
+        await new Promise((res) => {
+            const t = setTimeout(() => { w.kill('SIGTERM'); res(); }, 5000);
+            t.unref && t.unref();
+            w.once('exit', () => { clearTimeout(t); res(); });
+            w.send({ t: 'bye' });          // clean exit: coverage is written on it
+        });
         console.log(fails ? `\n${fails} FAILED` : '\nall passed');
         process.exit(fails ? 1 : 0);
     })();

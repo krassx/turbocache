@@ -1,14 +1,26 @@
 {
   "all": true,
-  "include": ["src/**/*.js", "index.js", "index.mjs"],
-  "exclude": ["src/vendor/**", "**/node_modules/**"],
-  "reporter": ["text", "text-summary", "lcov", "json-summary"],
+  "include": [
+    "src/**/*.js",
+    "index.js",
+    "index.mjs"
+  ],
+  "exclude": [
+    "src/vendor/**",
+    "**/node_modules/**"
+  ],
+  "reporter": [
+    "text",
+    "text-summary",
+    "lcov",
+    "json-summary",
+    "json"
+  ],
   "report-dir": "coverage",
   "temp-directory": "coverage/tmp",
-
-  "//": "Floors, not targets. Set from what the suite actually reaches (89.21 / 83.12 / 83.33, identical across runs) minus ~2 points of slack for platform-dependent branches, since CI measures on Linux and development happens on macOS. Raise them when coverage rises; never lower them to make a red build green.",
+  "//": "Floors, not targets. Measured over four consecutive runs after the worker-exit races were removed: lines 95.38-95.73, branches 83.27-84.31, functions 92.3 exactly. Each floor sits below the MINIMUM observed, never the best run. Linux reads slightly higher because the /dev/shm branch of #createError only executes there. Raise them when coverage rises; never lower one to make a red build green.",
   "check-coverage": true,
-  "lines": 87,
-  "branches": 81,
-  "functions": 81
+  "lines": 95,
+  "branches": 82,
+  "functions": 91
 }

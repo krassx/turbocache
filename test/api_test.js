@@ -66,3 +66,26 @@ ok(typeof c.close === 'function', 'close() exists');
 c.close();
 console.log(fail ? `  ${fail} FAILURES` : '  all passed');
 process.exit(fail ? 1 : 0);
+
+// --- a failed create explains itself -------------------------------------
+//
+// The arena is sized from l2Bytes and the failure a user actually hits is a
+// container whose /dev/shm is smaller than that -- which is precisely what the
+// suite itself hit in Docker. The message has to name the constraint, not just
+// say "failed", or the next person spends an afternoon on it.
+{
+    let msg = null;
+    try {
+        // Far larger than any /dev/shm; create must fail rather than succeed.
+        TurboCache.createPrimary('/tcfail' + process.pid, 1024 * (1 << 30), 1 << 16, {});
+    } catch (e) { msg = e.message; }
+    ok(msg !== null, 'an impossible arena size fails loudly instead of silently');
+    ok(/arena create failed/.test(msg || ''),
+       `the failure names what failed (got ${JSON.stringify(msg)})`);
+    if (process.platform === 'linux') {
+        ok(/\/dev\/shm holds .*free.*arena needs/.test(msg || ''),
+           `on Linux it names the /dev/shm constraint and the shortfall (got ${JSON.stringify(msg)})`);
+        ok(/--shm-size=/.test(msg || ''),
+           'and tells the reader the Docker flag that fixes it');
+    }
+}
