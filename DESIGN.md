@@ -1742,6 +1742,16 @@ Also, fast calls only accept `const FastOneByteString&`, so any two-byte key wou
     symptom was a bare SIGSEGV inside `require()` with no diagnostic. Now 8,
     matching the `engines` floor, and the CI matrix covers 18/20/22/24.
 
+20. **The test suite needs more than 2GB of `/dev/shm`.** Running it in a
+    container with Docker's 64MB default fails most tests, and 2GB is still not
+    enough; 8GB is clean. Tests create arenas and submission rings (32MB each)
+    and `Store::create()` on an already-created store neither closes the old
+    mapping nor unlinks its name, so segments accumulate across a run — the
+    adversarial review measured 19 leaked from one file alone, fixed there
+    (decision 50) but not systematically. Invisible on CI runners, where
+    `/dev/shm` is half of RAM, and invisible to `npm test` on a developer
+    machine; it bites only in containers, which is where the load harness runs.
+
 18. **`bytes` mode copies every string value on `set`.** `flatten` is
     unconditional because Node-API cannot tell a flat string from a slice, and a
     slice of any size can retain an arbitrarily large parent. That is the right

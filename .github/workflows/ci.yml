@@ -14,6 +14,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         node: [24]
+        # The floor `engines` claims has to be tested somewhere, or a runtime we
+        # say we support can be broken outright without anyone noticing. It was:
+        # `#define NAPI_VERSION 10` made Node 18 and 20 refuse the module, and
+        # Node's refusal path is a null deref, so `require()` was a bare SIGSEGV.
+        # A matrix of one version could never have caught it.
+        include:
+          - { os: ubuntu-latest, node: 18 }
+          - { os: ubuntu-latest, node: 20 }
+          - { os: ubuntu-latest, node: 22 }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
