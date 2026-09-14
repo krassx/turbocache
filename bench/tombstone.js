@@ -1,5 +1,5 @@
 const l2 = require('../src/native');
-const { makePayload } = require('./payload');
+const { makePayload } = require('../test/payload');
 const SLOTS = 1 << 16;
 const val = makePayload(2048);
 // Small data region => constant eviction => constant tombstone creation,

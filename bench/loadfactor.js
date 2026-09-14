@@ -1,5 +1,5 @@
 const l2 = require('../src/native');
-const { makePayload } = require('./payload');
+const { makePayload } = require('../test/payload');
 const SLOTS = 1 << 16;                       // 65536 index slots
 const val = makePayload(128);
 l2.create('/tc-lf-' + process.pid, 256 << 20, SLOTS, 2);   // data region far larger than the index needs

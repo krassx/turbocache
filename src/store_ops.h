@@ -37,12 +37,7 @@ struct ReadResult {
   uint8_t *buf = nullptr;   // caller-owned scratch, filled with stored bytes
 };
 
-// ---------------------------------------------------------------- slab ----
-static inline int slabClassFor(Header *h, uint32_t need) {
-  for (int i = 0; i < NCLASS; i++) if (h->classSize[i] >= need) return i;
-  return -1;
-}
-
+// ------------------------------------------------------------ index ----
 // Knuth 6.4 Algorithm R - backward-shift deletion for linear probing.
 // Closes the gap by relocating entries instead of leaving a tombstone, so probe
 // chains stay at their natural length forever instead of degrading with churn.
@@ -103,74 +98,17 @@ static inline void indexRemove(Store &s, uint64_t i) {
   }
 }
 
-// Unlink an index slot and (slab only) return its block to the free list.
+// Unlink an index slot. The log reclaims the block when the tail reaches it, so
+// there is no free list to return it to.
 static inline void unlinkSlot(Store &s, uint64_t slot) {
   Header *h = s.h;
   uint64_t pos = s.idx[slot].off.load(std::memory_order_relaxed);
   indexRemove(s, slot);
   Entry *e = s.entryAt(pos);
-  if (h->mode == MODE_SLAB) {
-    int cls = slabClassFor(h, e->blockSize);
-    if (cls >= 0) {
-      // memcpy, not a cast: the free-list link sits at offset 4 inside the
-      // entry, so a direct uint64_t store is misaligned (UBSAN flagged it).
-      uint64_t next = h->freeHead[cls];
-      memcpy((uint8_t *)e + sizeof(std::atomic<uint32_t>), &next, sizeof(next));
-      h->freeHead[cls] = pos + 1;
-    }
-  }
   h->live--;
   h->liveBytes -= e->blockSize;
   h->nsBytes[e->ns] -= e->blockSize;
   h->evictions++;
-}
-
-// CLOCK: sweep index slots looking for a victim of the requested size class.
-// Slab calcification is real and deliberately not hidden here - if no victim of
-// the right class exists, the insert fails rather than silently succeeding.
-static inline bool slabEvictForClass(Store &s, int cls) {
-  Header *h = s.h;
-  uint64_t scanned = 0, limit = h->indexSlots * 4;
-  while (scanned++ < limit) {
-    uint64_t i = h->clockHand;
-    h->clockHand = (h->clockHand + 1) & (h->indexSlots - 1);
-    uint64_t hv = s.idx[i].hash.load(std::memory_order_relaxed);
-    if (hv == HASH_EMPTY || hv == HASH_TOMB) continue;
-    uint64_t off = s.idx[i].off.load(std::memory_order_relaxed);
-    if (off >= h->dataBytes) continue;
-    Entry *e = s.entryAt(off);
-    if (s.hints[i].load(std::memory_order_relaxed)) {    // second chance
-      s.hints[i].store(0, std::memory_order_relaxed); continue; }
-    if (slabClassFor(h, e->blockSize) != cls) continue;  // wrong class, no help
-    unlinkSlot(s, i);
-    return true;
-  }
-  return false;
-}
-
-static inline int64_t slabAlloc(Store &s, uint32_t need) {
-  Header *h = s.h;
-  int cls = slabClassFor(h, need);
-  if (cls < 0) return -1;                       // larger than the biggest class
-  uint32_t bsz = h->classSize[cls];
-  for (int attempt = 0; attempt < 2; attempt++) {
-    if (h->freeHead[cls]) {
-      uint64_t off = h->freeHead[cls] - 1;
-      Entry *e = s.entryAt(off);
-      uint64_t next = 0;
-      memcpy(&next, (uint8_t *)e + sizeof(std::atomic<uint32_t>), sizeof(next));
-      h->freeHead[cls] = next;
-      return (int64_t)off;
-    }
-    if (h->bumpPtr + bsz <= h->dataBytes) {
-      uint64_t off = h->bumpPtr;
-      h->bumpPtr += bsz;
-      h->allocBytes += bsz;
-      return (int64_t)off;
-    }
-    if (!slabEvictForClass(s, cls)) return -1;
-  }
-  return -1;
 }
 
 // ----------------------------------------------------------------- log ----
@@ -227,7 +165,7 @@ static inline void logDropTail(Store &s, int *budget) {
     } else {
       protect = liveHere && s.hints[slot].load(std::memory_order_relaxed);
     }
-    if (liveHere && h->mode == MODE_LOG2 && protect && budget && *budget > 0) {
+    if (liveHere && protect && budget && *budget > 0) {
       uint64_t newPos = h->logHead;
       uint64_t hp = newPos % h->dataBytes;
       uint64_t freeBytes = h->dataBytes - (h->logHead - h->logTail);
@@ -366,7 +304,7 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
   // still full, and `live` crept to 100%. Bound by real progress instead:
   // logDropTail always advances the tail, so this terminates when the tail
   // catches the head.
-  if (h->mode != MODE_SLAB) {
+  {
     // Index pressure, not data pressure. A re-append frees no index SLOT, so
     // second chance cannot relieve this directly -- which is why this loop used
     // to pass a null budget and drop unconditionally. But that made quotas and
@@ -389,7 +327,7 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
   }
 
   uint32_t need = (uint32_t)align8(sizeof(Entry) + keyLen + storedLen);
-  int64_t off = (h->mode == MODE_SLAB) ? slabAlloc(s, need) : logAlloc(s, need);
+  int64_t off = logAlloc(s, need);
   if (off < 0) return false;                   // nothing touched yet
 
   // The slot must be secured BEFORE the old entry is unlinked, and the log
@@ -399,7 +337,7 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
   // head, whose garbage blockSize desynced the tail walk and bricked the arena.
   int64_t slot = s.findFreeSlot(hash);
   if (slot < 0) {
-    if (h->mode != MODE_SLAB) {                // leave a skippable PAD record
+    {                                          // leave a skippable PAD record
       Entry *p = s.entryAt((uint64_t)off);
       uint32_t pseq = p->seq.load(std::memory_order_relaxed);
       p->seq.store(pseq | 1, std::memory_order_release);
@@ -424,7 +362,7 @@ static inline bool storeSet(Store &s, const uint8_t *key, uint16_t keyLen,
 
   e->slot = (uint32_t)slot; e->hash = hash; e->version = ++h->inserts;
   e->expiresAt = expiresAt; e->rawLen = rawLen; e->storedLen = storedLen;
-  e->blockSize = (h->mode == MODE_SLAB) ? h->classSize[slabClassFor(h, need)] : (uint32_t)align8(need);
+  e->blockSize = (uint32_t)align8(need);
   e->keyLen = keyLen; e->flags = flags; e->ns = ns;
   memcpy(s.keyOf(e), key, keyLen);
   memcpy(s.valOf(e), val, storedLen);
@@ -485,8 +423,6 @@ static inline void storeClear(Store &s, uint16_t writerId) {
   h->tailPub.store(h->logTail, std::memory_order_release);
   h->live = 0; h->liveBytes = 0;
   for (int i = 0; i < NS_MAX; i++) h->nsBytes[i] = 0;
-  for (int i = 0; i < NCLASS; i++) h->freeHead[i] = 0;
-  h->bumpPtr = 0;
   ringAppend(s, RING_FLUSH_ALL, ++h->inserts, writerId);   // tells workers to drop L1
 }
 
@@ -501,7 +437,7 @@ static inline bool storeHas(Store &s, const uint8_t *key, uint16_t keyLen, uint3
   uint64_t pos = s.idx[slot].off.load(std::memory_order_acquire);
   Entry *e = s.entryAt(pos);
   uint32_t exp = e->expiresAt;
-  if (h->mode != MODE_SLAB && h->tailPub.load(std::memory_order_seq_cst) > pos) return false;
+  if (h->tailPub.load(std::memory_order_seq_cst) > pos) return false;
   return !tcExpired(exp, nowMs);
 }
 
@@ -557,7 +493,7 @@ static inline bool storeGet(Store &s, const uint8_t *key, uint16_t keyLen,
       // logTail <= pos. Loading the published tail after the copy therefore
       // proves the record was live for the whole copy (tail only increases).
       // seq_cst so the copy cannot be reordered after this load.
-      if (h->mode != MODE_SLAB && h->tailPub.load(std::memory_order_seq_cst) > pos) return false;
+      if (h->tailPub.load(std::memory_order_seq_cst) > pos) return false;
       if (tcExpired(exp, nowMs)) return false;               // lazily expired
       // Reference bit lives in the hints region, which workers map READ-WRITE
       // even though the rest of the segment is read-only to them. Load first:

@@ -1,8 +1,10 @@
-// turbocache L2 arena prototype.
+// turbocache L2 arena.
 //
-// One open-addressed index, two data allocators behind it:
-//   MODE_SLAB : size-class free lists + CLOCK eviction   (memcached-style)
-//   MODE_LOG  : circular append-only log, evict from tail (FIFO-ish)
+// One open-addressed index over a circular append-only log that evicts from the
+// tail, with a bounded second-chance re-append (MODE_LOG2). A size-class slab
+// allocator and a plain log were measured against it and removed in decision 49;
+// the mode field survives so a future allocator can be added without a layout
+// change, but LOG2 is the only value create() accepts.
 //
 // The primary is the sole writer; workers map the segment PROT_READ and use the
 // per-entry seqlock to detect torn reads. This prototype exercises both roles.
@@ -15,14 +17,15 @@
 #include "vendor/rapidhash.h"
 
 static const uint32_t TC_MAGIC = 0x54430001;
-static const uint32_t TC_LAYOUT = 4;   // 2: BigInt words at 8; 3: tick epoch + arenaId; 4: data region no longer power-of-two
+static const uint32_t TC_LAYOUT = 5;   // 2: BigInt words at 8; 3: tick epoch + arenaId; 4: data region no longer power-of-two; 5: slab state out of Header
 static const uint32_t FEATURE_LZ4 = 1;
 static const uint64_t HASH_EMPTY = 0;
 static const uint64_t HASH_TOMB  = 1;
 // Ring sentinel: 'drop your entire L1', used by clearAll.
 static const uint64_t RING_FLUSH_ALL = 0xFFFFFFFFFFFFFFFFull;
 
-enum { MODE_SLAB = 0, MODE_LOG = 1, MODE_LOG2 = 2 };  // LOG2 = log + second-chance re-append
+enum { MODE_LOG2 = 2 };   // log + bounded second-chance re-append. Values 0/1 were
+                          // SLAB and LOG; they are retired, not reusable.
 
 // Value type travels WITH the bytes, so a worker reading the arena directly
 // reconstructs the right JS type. Without this, non-string primitives lived
@@ -62,7 +65,6 @@ struct RingRec { uint64_t hash; uint32_t version; uint16_t writerId; uint16_t _p
 static const double MAX_LOAD = 0.75;
 static const uint64_t MIN_DATA_BYTES = 1u << 16;
 
-#define NCLASS 32
 #define NS_MAX 16
 #define NS_NAMELEN 24
 
@@ -99,12 +101,6 @@ struct Header {
   std::atomic<uint64_t> tailPub;   // logTail, republished for readers
   std::atomic<uint64_t> ringHead;
   std::atomic<uint64_t> heartbeatNs;
-
-  // slab state
-  uint32_t classSize[NCLASS];
-  uint64_t freeHead[NCLASS];   // offset+1 of first free block, 0 = none
-  uint64_t bumpPtr;            // unallocated frontier in the data region
-  uint64_t clockHand;
 
   // log state
   uint64_t logHead, logTail;   // monotonic byte counters; % dataBytes to index
@@ -212,16 +208,7 @@ struct Store {
     uint64_t avail = (totalBytes - h->dataOff) & ~7ull;
     h->dataBytes = avail;
 
-    // size classes, growth factor 1.25 (memcached-style) to bound internal waste
-    uint32_t sz = 64;
-    for (int i = 0; i < NCLASS; i++) {
-      h->classSize[i] = sz;
-      h->freeHead[i] = 0;
-      uint32_t next = (uint32_t)(sz * 1.25);
-      sz = (next + 7) & ~7u;
-      if (sz <= h->classSize[i]) sz = h->classSize[i] + 8;
-    }
-    h->bumpPtr = 0; h->clockHand = 0; h->logHead = 0; h->logTail = 0;
+    h->logHead = 0; h->logTail = 0;
     h->tailPub.store(0, std::memory_order_relaxed);
     h->epochTicksNs = ticksNs();
     h->arenaId = h->epochTicksNs ^ ((uint64_t)platformPid() << 32) ^ nowNs();
@@ -288,7 +275,7 @@ struct Store {
   static bool geometryOk(const Header *hh, uint64_t mapBytes) {
     auto pow2 = [](uint64_t v) { return v && !(v & (v - 1)); };
     const uint64_t T = hh->totalBytes;
-    if (hh->mode > MODE_LOG2) return false;
+    if (hh->mode != MODE_LOG2) return false;
     // <= not ==: Windows rounds a mapped view up to the allocation granularity.
     if (T < sizeof(Header) || T > mapBytes) return false;
     if (!pow2(hh->indexSlots) || hh->indexSlots < 16 || hh->indexSlots > (1ull << 32)) return false;

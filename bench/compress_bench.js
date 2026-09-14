@@ -1,6 +1,6 @@
 // At a FIXED memory budget, what does compression actually buy?
 const l2 = require('../src/native');
-const { makePayload } = require('./payload');
+const { makePayload } = require('../test/payload');
 
 const NKEYS = 40000, OPS = 300000;
 const ARENA = (Number(process.env.ARENA_MB) || 24) << 20;

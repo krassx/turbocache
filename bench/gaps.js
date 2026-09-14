@@ -1,5 +1,5 @@
 const l2 = require('../src/native');
-const { makePayload } = require('./payload');
+const { makePayload } = require('../test/payload');
 
 function mkRng(s0) { let s = s0 >>> 0; return () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296; }
 function mkZipf(N, rnd) {
@@ -14,9 +14,14 @@ function mkZipf(N, rnd) {
 console.log('GAP 1: can LOG2 second-chance work when readers cannot set reference bits?\n');
 const NKEYS = 40000, OPS = 300000;
 const sizeFor = i => [256, 512, 1024, 2048, 4096][((i * 2654435761) >>> 0) % 5];
-function hitRate(mode, suppress) {
-  l2.create(`/tc-g1-${mode}-${suppress}-${process.pid}`, 24 << 20, 1 << 18, mode);
+// The "no second chance" baseline used to be arena mode 1 (LOG), removed in
+// decision 49. A second-chance budget of 0 makes LOG2 behave identically -- it
+// is what the budget gates -- and isolates the variable better, since the
+// comparison no longer spans two different allocators.
+function hitRate(budget, suppress) {
+  l2.create(`/tc-g1-${budget}-${suppress}-${process.pid}`, 24 << 20, 1 << 18, 2);
   l2.setCompressMin(1 << 30);
+  l2.__unsafeSecondChanceBudget(budget);
   l2.__unsafeSuppressRefBit(suppress);
   const rnd = mkRng(777), pick = mkZipf(NKEYS, rnd), src = new Map();
   let h = 0, m = 0;
@@ -27,12 +32,14 @@ function hitRate(mode, suppress) {
     let v = src.get(k); if (v === undefined) { v = makePayload(sizeFor(i)); src.set(k, v); }
     l2.set(k, v);
   }
-  const r = h / (h + m); l2.__unsafeSuppressRefBit(false); l2.destroy(); return r;
+  const r = h / (h + m);
+  l2.__unsafeSuppressRefBit(false); l2.__unsafeSecondChanceBudget(16);
+  l2.destroy(); return r;
 }
-const logPlain   = hitRate(1, false);
-const log2Bits   = hitRate(2, false);
-const log2NoBits = hitRate(2, true);
-console.log(`  LOG  (FIFO, no second chance)              ${(logPlain*100).toFixed(1)}%`);
+const logPlain   = hitRate(0, false);    // second chance disabled: plain FIFO
+const log2Bits   = hitRate(16, false);
+const log2NoBits = hitRate(16, true);
+console.log(`  FIFO (second-chance budget 0)              ${(logPlain*100).toFixed(1)}%`);
 console.log(`  LOG2, reference bits set (in-process)      ${(log2Bits*100).toFixed(1)}%   <- what every earlier benchmark measured`);
 console.log(`  LOG2, reference bits NOT set (real topology) ${(log2NoBits*100).toFixed(1)}%   <- what workers would actually get`);
 console.log(`  => second chance is worth ${((log2Bits-logPlain)*100).toFixed(1)} points, and ${((log2Bits-log2NoBits)*100).toFixed(1)} of that is lost\n`);

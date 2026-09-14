@@ -815,7 +815,7 @@ static napi_value ScanKeys(napi_env env, napi_callback_info info) {
     if (e->seq.load(std::memory_order_acquire) != s1) continue;   // torn
     // Liveness AFTER the copy: a monotonic position proves the record was not
     // reused underneath us, which a seqlock alone cannot (see decision 19).
-    if (h->mode != MODE_SLAB && h->tailPub.load(std::memory_order_acquire) > pos) continue;
+    if (h->tailPub.load(std::memory_order_acquire) > pos) continue;
     if (ehash != hv) continue;                   // slot no longer points here
     if (ns >= 0 && ens != (uint8_t)ns) continue;
     napi_value k;
@@ -1101,7 +1101,6 @@ static napi_value Stats(napi_env env, napi_callback_info) {
   put(env, o, "tailLive", (double)h->tailLive);
   put(env, o, "liveBytes", (double)h->liveBytes);
   put(env, o, "dataBytes", (double)h->dataBytes);
-  put(env, o, "bumpPtr", (double)h->bumpPtr);
   put(env, o, "logHead", (double)h->logHead);
   put(env, o, "logTail", (double)h->logTail);
   put(env, o, "indexSlots", (double)h->indexSlots);

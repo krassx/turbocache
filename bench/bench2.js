@@ -1,5 +1,5 @@
 const l2 = require('../src/native');
-const { makePayload } = require('./payload');
+const { makePayload } = require('../test/payload');
 const KEYS = 2000;
 const keys = Array.from({length: KEYS}, (_, i) => 'user:session:' + i);
 const _native = require('../src/native');

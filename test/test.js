@@ -3,7 +3,9 @@ const { makePayload } = require('./payload');
 let fails = 0;
 const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fails++; } };
 
-for (const [mode, name] of [[0, 'SLAB'], [1, 'LOG'], [2, 'LOG2']]) {
+// One arena mode remains; SLAB and LOG were measured against it and removed
+// (decision 49). The loop stays so a future allocator drops straight in.
+for (const [mode, name] of [[2, 'LOG2']]) {
   console.log(`\n=== ${name} ===`);
   l2.create(`/tc-test-${mode}`, 8 << 20, 1 << 15, mode);
 

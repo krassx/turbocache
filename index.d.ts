@@ -161,7 +161,7 @@ export interface ArenaStats {
     mode: number; live: number; inserts: number; evictions: number;
     reappends: number; reappendSkippedNoRoom: number; dropped: number;
     tailAdvances: number; tailLive: number;
-    liveBytes: number; dataBytes: number; bumpPtr: number;
+    liveBytes: number; dataBytes: number;
     logHead: number; logTail: number; indexSlots: number; ringHead: number;
     [k: string]: number;
 }

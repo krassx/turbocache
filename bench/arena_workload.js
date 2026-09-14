@@ -1,5 +1,5 @@
 const l2 = require('../src/native');
-const { makePayload } = require('./payload');
+const { makePayload } = require('../test/payload');
 
 // Zipfian key generator (s=1.0) over N keys.
 function zipf(N) {
@@ -53,7 +53,9 @@ function run(mode, phases) {
   return out;
 }
 
-const MODES = [[0, 'SLAB'], [1, 'LOG'], [2, 'LOG2']];
+// Was a three-way allocator comparison; SLAB and LOG were removed in decision
+// 49, so this is now a hit-rate/utilisation curve for the one that shipped.
+const MODES = [[2, 'LOG2']];
 
 function report(title, phases) {
   console.log(`\n${title}`);

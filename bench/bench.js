@@ -1,5 +1,5 @@
 const l2 = require('../src/native');
-const { makePayload } = require('./payload');
+const { makePayload } = require('../test/payload');
 
 const KEYS = 2000;
 const keys = Array.from({length: KEYS}, (_, i) => 'user:session:' + i);
@@ -12,7 +12,9 @@ function timeit(fn, N) {
   return { ns: Number(process.hrtime.bigint() - t) / N, s };
 }
 
-for (const [mode, name] of [[0, 'SLAB'], [1, 'LOG'], [2, 'LOG2']]) {
+// SLAB and LOG were removed in decision 49; the loop shape stays so a future
+// allocator can be compared against LOG2 without restructuring the bench.
+for (const [mode, name] of [[2, 'LOG2']]) {
   console.log(`\n===== ${name} =====`);
   console.log('bytes'.padStart(7), 'probe'.padStart(8), 'getLen'.padStart(8), 'get(full)'.padStart(10),
               'set'.padStart(8), 'jsMapGet'.padStart(9), '   note');
