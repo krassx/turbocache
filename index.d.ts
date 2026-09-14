@@ -67,11 +67,16 @@ export interface HeapGuardOptions {
 }
 
 export interface CacheOptions<T = unknown> {
-    /** @see StorageMode. Default `'bytes'`. */
+    /** @see StorageMode. Default `'bytes'`.
+     *  @throws TypeError if the value is not one of the modes. */
     storage?: StorageMode;
-    /** Legacy alias for `storage`. */
+    /** Legacy alias for `storage`.
+     *  @throws TypeError if the value is not one of the modes. */
     values?: StorageMode;
-    /** Explicit codec. Mutually exclusive with a `storage` mode that implies one. */
+    /** Explicit codec. Mutually exclusive with a `storage` mode that implies one.
+     *  @throws TypeError unless it is an object with `encode` and `decode`
+     *  functions — in particular `codec: 'direct'` is rejected, since the modes
+     *  are named with `storage`. */
     codec?: Codec<T>;
     /** Permit a codec that takes a replacer/reviver or indentation. Off by default
      *  because it silently costs 2-3.5x. */

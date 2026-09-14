@@ -188,6 +188,9 @@ const monoMs = () => performance.now();
 // Reject anything that is not already a string.
 function isStringKey(k) { return typeof k === 'string'; }
 
+// The storage presets. Anything else is a misconfiguration, not a mode.
+const STORAGE_MODES = ['bytes', 'direct', 'safe', 'primitives'];
+
 const MSG = 'tc';
 const RING_MSG = 'tcr';   // doorbell only: 'your submission rings are non-empty'
 // Max second-chance reprieves per L1 insert. Matches the arena's budget in
@@ -317,7 +320,15 @@ class TurboCache {
         //                get a fresh mutable object and cannot corrupt anything.
         //                Cheap writes, and JSON's silent type conversions apply:
         //                Date becomes a string, Map/Set become {}.
-        const preset = opts.storage;
+        TurboCache.#assertStorageOptions(opts);
+        // `values` is documented as a legacy alias for `storage`, and until now
+        // it was not one: only 'bytes'/'primitives' did anything, because those
+        // happen to coincide with the internal no-codec flag this option also
+        // sets. `values: 'direct'` and `values: 'safe'` silently selected BYTES
+        // mode -- so a caller following the declaration got objects rejected on
+        // every set(). It is a real alias now.
+        const preset = opts.storage !== undefined && opts.storage !== null
+            ? opts.storage : opts.values;
         if (preset === 'direct') {
             opts = { isolate: true, freeze: true, ...opts,
                      codec: opts.codec || TurboCache.V8_CODEC };
@@ -563,6 +574,56 @@ class TurboCache {
     // A create() failure is nearly always the backing filesystem being too small
     // rather than anything about the arena itself. On Linux that is /dev/shm,
     // which containers default to 64MB -- so say so instead of "create failed".
+    // `storage` and `codec` are one keystroke apart in meaning, and getting them
+    // wrong used to cost nothing at construction and everything afterwards: the
+    // cache was built, set() reported success, and every get() returned
+    // undefined with nothing anywhere to say why. Nine of the ten malformed
+    // combinations behaved exactly that way -- `codec: 'direct'` (a string where
+    // a codec object belongs, and the single most natural way to write what the
+    // author meant), a typo or wrong case in `storage`, a codec missing either
+    // half. The tenth failed later, at the first read, with
+    // "this[#codec].decode is not a function".
+    //
+    // Same principle as freeze (decision 26) and the Date/Map/Set mutators
+    // (decision 38b): turn silent corruption into a TypeError at the point the
+    // mistake was made.
+    static #assertStorageOptions(opts) {
+        const { codec } = opts;
+        const list = STORAGE_MODES.map(m => `'${m}'`).join(', ');
+
+        for (const key of ['storage', 'values']) {
+            const v = opts[key];
+            if (v === undefined || v === null || STORAGE_MODES.includes(v)) continue;
+            const near = typeof v === 'string' &&
+                STORAGE_MODES.find(m => m === v.trim().toLowerCase());
+            throw new TypeError(
+                `turbocache: ${key} must be one of ${list}; got ${JSON.stringify(v)}` +
+                (near ? `. Did you mean '${near}'?` : '.'));
+        }
+
+        if (codec === undefined || codec === null) return;   // absent: the mode decides
+
+        if (typeof codec === 'string') {
+            throw new TypeError(
+                `turbocache: codec must be an object with encode and decode functions, ` +
+                `but got the string ${JSON.stringify(codec)}. ` +
+                (STORAGE_MODES.includes(codec)
+                    ? `Did you mean storage: '${codec}'?`
+                    : `The storage MODES are named with the storage option: ${list}.`));
+        }
+        if (typeof codec !== 'object') {
+            throw new TypeError(`turbocache: codec must be an object with encode and decode ` +
+                                `functions; got ${typeof codec}.`);
+        }
+        const missing = ['encode', 'decode'].filter(k => typeof codec[k] !== 'function');
+        if (missing.length) {
+            throw new TypeError(
+                `turbocache: codec is missing ${missing.map(m => `${m}()`).join(' and ')}. ` +
+                `A codec is { encode(value) -> string, decode(string) -> value }; ` +
+                `TurboCache.JSON_CODEC and TurboCache.V8_CODEC are the built-in ones.`);
+        }
+    }
+
     static #createError(arenaBytes) {
         let hint = '';
         if (process.platform === 'linux') {

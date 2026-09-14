@@ -69,5 +69,75 @@ for (const storage of ['direct', 'safe']) {
     ok(c.get('b') === 2n ** 70n, 'bytes: BigInt round-trips');
     __native.destroy();
 }
+// --- a misconfigured storage/codec must throw where the mistake was made
+//
+// These two options are one keystroke apart in meaning, and getting them wrong
+// used to cost nothing at construction and everything afterwards: the cache was
+// built, set() reported success, and every get() returned undefined with nothing
+// to say why. Nine of the ten combinations below behaved exactly that way; the
+// tenth failed at the first read with "this[#codec].decode is not a function".
+{
+    const n0 = n;
+    // Rendered by hand: a JSON replacer would trip the fast-path lint.
+    const label = o => '{ ' + Object.keys(o).map(k => {
+        const v = o[k];
+        if (v && typeof v === 'object') return `${k}: {${Object.keys(v).join(',')}}`;
+        return `${k}: ${typeof v === 'string' ? `'${v}'` : String(v)}`;
+    }).join(', ') + ' }';
+    const throws = (opts, mustMention) => {
+        let e = null;
+        try { TurboCache.createPrimary('/tcsmx' + process.pid + '_' + (n++), 8 << 20, 1 << 13, opts); }
+        catch (err) { e = err; }
+        ok(e instanceof TypeError, `rejects ${label(opts)} with a TypeError`);
+        ok(e != null && mustMention.every(w => e.message.includes(w)),
+           `the error for ${label(opts)} names ${mustMention.join(' + ')}` +
+           (e ? ` (got: ${e.message.slice(0, 70)})` : ''));
+    };
+
+    // the single most natural way to write what the author meant
+    throws({ codec: 'direct' }, ['codec', "storage: 'direct'"]);
+    throws({ codec: 'safe' },   ['codec', "storage: 'safe'"]);
+    // an unknown mode is a misconfiguration, not a mode
+    throws({ storage: 'diret' },  ['storage', 'diret']);
+    throws({ storage: 'DIRECT' }, ['storage', "Did you mean 'direct'?"]);
+    throws({ storage: 42 },       ['storage']);
+    // `values` is a documented alias, so it gets the same treatment
+    throws({ values: 'diret' },   ['values', 'diret']);
+    // a codec that is not one
+    throws({ codec: {} },                          ['encode()', 'decode()']);
+    throws({ codec: { encode: JSON.stringify } },  ['decode()']);
+    throws({ codec: { decode: JSON.parse } },      ['encode()']);
+    throws({ codec: 7 },                           ['codec']);
+
+    // ...while everything legitimate still constructs
+    let built = 0;
+    for (const opts of [{}, { storage: 'bytes' }, { storage: 'direct' }, { storage: 'safe' },
+                        { storage: 'primitives' }, { codec: null },
+                        { codec: { encode: JSON.stringify, decode: JSON.parse } },
+                        { codec: TurboCache.V8_CODEC }]) {
+        try {
+            TurboCache.createPrimary('/tcsmok' + process.pid + '_' + (n++), 8 << 20, 1 << 13, opts);
+            built++;
+        } catch (e) { ok(false, `valid options rejected: ${label(opts)} -> ${e.message}`); }
+    }
+    ok(built === 8, `all 8 valid configurations still construct (got ${built})`);
+    ok(n - n0 === 18, 'every configuration above was actually attempted');
+
+    // `values` was declared "legacy alias for storage" but was not one: only
+    // 'bytes'/'primitives' did anything, because they coincide with the
+    // internal no-codec flag this option also sets. 'direct' and 'safe'
+    // silently selected BYTES mode, so a caller following the declaration had
+    // every object rejected by set().
+    for (const mode of ['direct', 'safe']) {
+        const c = TurboCache.createPrimary('/tcsmal' + process.pid + '_' + (n++), 8 << 20, 1 << 13,
+                                           { values: mode, freeze: false });
+        ok(c.storage === mode, `values: '${mode}' selects ${mode} mode (got '${c.storage}')`);
+        c.set('o', { a: 1 });
+        const got = c.get('o');
+        ok(got != null && got.a === 1, `values: '${mode}' round-trips an object`);
+    }
+    __native.destroy();
+}
+
 console.log(fail ? `  ${fail} FAILURES` : '  all passed');
 process.exit(fail ? 1 : 0);
