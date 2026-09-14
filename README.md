@@ -68,8 +68,15 @@ supported arrangement.
 Bun runs the entire suite green — every unit test, both transports, and the full
 primary-death recovery sequence — at roughly 15% below Node's throughput. The
 heap guard works on all three: it is driven by a `FinalizationRegistry` rather
-than gc performance entries, which Bun and Deno accept but never emit. One
-Deno-only failure remains under the `direct` codec; see DESIGN.md.
+than gc performance entries, which Bun and Deno accept but never emit.
+
+The `direct` codec used to return zero-filled typed arrays on Deno. `v8.deserialize`
+does not copy an `ArrayBufferView` out of its input — it returns a view over it —
+and the buffer it was given was a slice of Node's shared 8KB pool, so the value's
+correctness rested on the runtime deriving an address from a non-zero
+`byteOffset`. Deno 2.8.3 adds that offset twice. Decoding into an unpooled,
+exactly-sized buffer removes the dependency (and stops each cached typed array
+pinning a pool slab on every runtime); see DESIGN.md decision 46.
 
 ## Layout
 

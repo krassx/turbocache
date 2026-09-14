@@ -445,7 +445,24 @@ class TurboCache {
     static get JSON_CODEC() { return { encode: JSON.stringify, decode: JSON.parse }; }
     static get V8_CODEC() {
         return { encode: v => v8ser.serialize(v).toString('latin1'),
-                 decode: s => v8ser.deserialize(Buffer.from(s, 'latin1')) };
+                 // allocUnsafeSlow, NOT Buffer.from: deserialize does not copy a
+                 // typed array out of its input. Node's DefaultSerializer sets
+                 // _setTreatArrayBufferViewsAsHostObjects(true), so an
+                 // ArrayBufferView is written as a host object and read back as a
+                 // VIEW over whatever buffer we pass in. Buffer.from() returns a
+                 // slice of the shared 8KB pool, which made every cached typed
+                 // array pin a whole pool slab, and left the view's correctness
+                 // resting on the runtime deriving its address from a NON-ZERO
+                 // byteOffset -- which Deno 2.8.3 gets wrong, adding that offset
+                 // twice, so values came back zero-filled or threw RangeError.
+                 // An unpooled, exactly-sized buffer has byteOffset 0 (nothing to
+                 // double) and is owned outright by the value decoded from it.
+                 // latin1 is one byte per code unit, so length is the byte count.
+                 decode: s => {
+                     const b = Buffer.allocUnsafeSlow(s.length);
+                     b.write(s, 'latin1');
+                     return v8ser.deserialize(b);
+                 } };
     }
 
     // KNOWN HOLE: Object.freeze throws on an ArrayBuffer view with elements,
