@@ -10,7 +10,7 @@ const SUITE = [
     'v8codec_test.js', 'storage_modes_test.js', 'namespace_test.js', 'cluster_api_test.js',
     'review_regression_test.js', 'gaps_test.js', 'typeflow_test.js', 'typematrix_test.js',
     'perf_regression_test.js', 'guard_test.js', 'recovery_test.js',
-    'review2_regression_test.js',
+    'review2_regression_test.js', 'entrypoints_test.js',
 ];
 // Same file, both transports: the shared-memory path is the default and the IPC
 // path is the fallback, and a regression in either is a regression.

@@ -68,9 +68,12 @@
     "build": "node-gyp rebuild",
     "test": "node test/run.js",
     "test:types": "tsc -p test/types/tsconfig.json",
-    "prebuild": "prebuildify --napi --strip"
+    "prebuild": "prebuildify --napi --strip",
+    "coverage": "c8 --config .c8rc.json node scripts/coverage.js",
+    "coverage:native": "node scripts/coverage-native.js"
   },
   "devDependencies": {
+    "c8": "^12.0.0",
     "node-gyp": "^10.0.0",
     "prebuildify": "^6.0.1",
     "typescript": "^5.4.0"

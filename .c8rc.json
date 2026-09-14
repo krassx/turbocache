@@ -1,0 +1,14 @@
+{
+  "all": true,
+  "include": ["src/**/*.js", "index.js", "index.mjs"],
+  "exclude": ["src/vendor/**", "**/node_modules/**"],
+  "reporter": ["text", "text-summary", "lcov", "json-summary"],
+  "report-dir": "coverage",
+  "temp-directory": "coverage/tmp",
+
+  "//": "Floors, not targets. Set from what the suite actually reaches (89.21 / 83.12 / 83.33, identical across runs) minus ~2 points of slack for platform-dependent branches, since CI measures on Linux and development happens on macOS. Raise them when coverage rises; never lower them to make a red build green.",
+  "check-coverage": true,
+  "lines": 87,
+  "branches": 81,
+  "functions": 81
+}

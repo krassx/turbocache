@@ -69,6 +69,44 @@ jobs:
           ARENA=4194304 NKEYS=2000 WORKERS=4 SECONDS=6 node test/multiproc.js | tee /tmp/mp.txt
           grep -q "CORRUPT/TORN READS: 0" /tmp/mp.txt
 
+  coverage:
+    name: coverage (JS + native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+
+      - name: Dependencies
+        run: npm install --no-audit --no-fund
+
+      # The JS gate. Thresholds live in .c8rc.json and are floors taken from what
+      # the suite actually reaches, not round numbers -- c8 exits non-zero below
+      # them. The hook in scripts/ is what makes cluster workers count: they are
+      # killed with SIGTERM, and V8 writes nothing on a signal.
+      - name: JS coverage
+        run: npm run coverage
+
+      # Native coverage is REPORTED, not gated. gcov counts lines in a way that
+      # is not comparable to V8's statement counting -- header-only code is
+      # attributed to every translation unit that includes it -- so a threshold
+      # here would be a number nobody could act on. Set TC_NATIVE_MIN to gate it
+      # once the measurement has been watched for a while.
+      - name: Native coverage
+        run: npm run coverage:native
+
+      - name: Publish the reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage/lcov.info
+            coverage/coverage-summary.json
+            coverage/native-summary.json
+          if-no-files-found: warn
+          retention-days: 14
+
   sanitizers:
     name: TSan + ASan + UBSan (POSIX only)
     runs-on: ubuntu-latest
