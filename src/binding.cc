@@ -872,127 +872,6 @@ static void put(napi_env env, napi_value o, const char *k, double v) {
   napi_value n; napi_create_double(env, v, &n); napi_set_named_property(env, o, k, n);
 }
 
-// -------------------------------------------------- background compaction ----
-static uint64_t cApplied = 0, cStale = 0, cNoGain = 0, cScanned = 0;
-static int64_t  cReclaimed = 0;
-
-struct Job {
-  napi_async_work work = nullptr;
-  napi_ref cbRef = nullptr;
-  std::vector<CompactItem> items;
-  uint32_t delayUs = 0;
-  uint32_t applied = 0, stale = 0, noGain = 0;
-  int64_t  reclaimed = 0;
-};
-
-// Runs on the libuv threadpool. Touches ONLY the private capture buffers -
-// never the arena, never napi. This is the whole point: the expensive part is
-// off the writer thread, and it cannot observe or mutate shared state.
-static void CompactExecute(napi_env, void *data) {
-  Job *j = (Job *)data;
-  if (j->delayUs) platformSleepUs(j->delayUs);   // test hook: widen the capture->apply window
-  for (auto &it : j->items) {
-#ifdef TURBOCACHE_LZ4
-    int c = LZ4_compress_default((const char *)it.raw, (char *)it.comp,
-                                 (int)it.rawLen, (int)LZ4_compressBound(it.rawLen));
-    it.compLen = c > 0 ? (uint32_t)c : 0;
-#else
-    it.compLen = 0;                       // no compression available; nothing to apply
-#endif
-  }
-}
-
-// Back on the writer thread. Nothing else can be mutating the arena here, so
-// validate-then-publish needs no lock - only the version re-check.
-static void CompactComplete(napi_env env, napi_status, void *data) {
-  Job *j = (Job *)data;
-  for (auto &it : j->items) {
-    if (it.compLen == 0) { it.noGain = true; }
-    else compactApply(g, it);
-    if (it.applied) {
-      j->applied++;
-      j->reclaimed += (int64_t)it.oldBlockSize - (int64_t)align8(sizeof(Entry) + it.keyLen + it.compLen);
-    } else if (it.stale) j->stale++;
-    else j->noGain++;
-    free(it.raw); free(it.comp);
-  }
-  cApplied += j->applied; cStale += j->stale; cNoGain += j->noGain; cReclaimed += j->reclaimed;
-
-  napi_value cb, undef, arg;
-  napi_get_reference_value(env, j->cbRef, &cb);
-  napi_get_undefined(env, &undef);
-  napi_create_object(env, &arg);
-  put(env, arg, "applied", j->applied);
-  put(env, arg, "stale", j->stale);
-  put(env, arg, "noGain", j->noGain);
-  put(env, arg, "reclaimed", (double)j->reclaimed);
-  napi_call_function(env, undef, cb, 1, &arg, nullptr);
-  napi_delete_reference(env, j->cbRef);
-  napi_delete_async_work(env, j->work);
-  delete j;
-}
-
-// compactAsync(maxItems, minBytes, delayUs, coldOnly, cb)
-static napi_value CompactAsync(napi_env env, napi_callback_info info) {
-  ARG(5)
-  NEED_STORE(nullptr)
-  NEED_WRITABLE(nullptr)
-  int32_t maxItems, minBytes, delayUs; bool coldOnly = false;
-  napi_get_value_int32(env, argv[0], &maxItems);
-  napi_get_value_int32(env, argv[1], &minBytes);
-  napi_get_value_int32(env, argv[2], &delayUs);
-  napi_get_value_bool(env, argv[3], &coldOnly);
-
-  Job *j = new Job();
-  j->delayUs = (uint32_t)delayUs;
-  napi_create_reference(env, argv[4], 1, &j->cbRef);
-
-  // Capture candidates walking forward from the tail - the entries the log is
-  // about to reach. Compressing these turns "second chance at full size" into
-  // "second chance at compressed size".
-  Header *h = g.h;
-  uint64_t cur = h->logTail;
-  int scanned = 0;
-  while (cur < h->logHead && (int)j->items.size() < maxItems && scanned < maxItems * 8) {
-    uint64_t phys = cur % h->dataBytes;
-    Entry *e = g.entryAt(phys);
-    uint32_t bsz = e->blockSize;
-    if (bsz == 0 || bsz > h->dataBytes) break;
-    cur += bsz; scanned++;
-    if (e->slot == SLOT_PAD) continue;
-    if (e->flags & FLAG_COMPRESSED) continue;
-    if (e->rawLen < (uint32_t)minBytes) continue;
-    // Compressing a hot entry taxes every future read of it. Only compress
-    // entries that have not been touched since their last second chance -
-    // the ones about to be evicted anyway.
-    if (coldOnly && g.hints[e->slot].load(std::memory_order_relaxed)) continue;
-    if (e->keyLen > 256) continue;
-    uint32_t slot = e->slot;
-    if (slot >= h->indexSlots) continue;
-    if (g.idx[slot].off.load(std::memory_order_relaxed) != phys) continue;   // not live here
-    if (g.idx[slot].hash.load(std::memory_order_relaxed) != e->hash) continue;
-
-    CompactItem it;
-    it.slot = slot; it.off = phys; it.hash = e->hash; it.version = e->version;
-    it.rawLen = e->rawLen; it.oldBlockSize = bsz; it.keyLen = e->keyLen;
-    memcpy(it.key, g.keyOf(e), e->keyLen);
-    it.raw = (uint8_t *)malloc(it.rawLen);
-#ifdef TURBOCACHE_LZ4
-    it.comp = (uint8_t *)malloc(LZ4_compressBound(it.rawLen));
-#else
-    it.comp = (uint8_t *)malloc(it.rawLen + 64);
-#endif
-    memcpy(it.raw, g.valOf(e), it.rawLen);     // storedLen == rawLen: uncompressed
-    j->items.push_back(it);
-  }
-  cScanned += scanned;
-
-  napi_value name; napi_create_string_latin1(env, "compact", NAPI_AUTO_LENGTH, &name);
-  napi_create_async_work(env, nullptr, name, CompactExecute, CompactComplete, j, &j->work);
-  napi_queue_async_work(env, j->work);
-  napi_value out; napi_create_int32(env, (int32_t)j->items.size(), &out); return out;
-}
-
 // hashKey(key) -> hex string, so JS can map ring records back to L1 entries
 // Structural size estimate for a JS value, walked through Node-API.
 // V8 gives embedders no per-object size (GetShallowSize exists only on a
@@ -1229,16 +1108,6 @@ static napi_value SetSuppressRefBit(napi_env env, napi_callback_info info) {
 }
 
 // missProbe(key) -> probe cost for a key that is NOT present
-static napi_value CompactStats(napi_env env, napi_callback_info) {
-  napi_value o; napi_create_object(env, &o);
-  put(env, o, "applied", (double)cApplied);
-  put(env, o, "stale", (double)cStale);
-  put(env, o, "noGain", (double)cNoGain);
-  put(env, o, "scanned", (double)cScanned);
-  put(env, o, "reclaimed", (double)cReclaimed);
-  return o;
-}
-
 // Deliberately writes through the mapping, to prove a read-only worker faults.
 static napi_value Poke(napi_env env, napi_callback_info) {
   NEED_STORE(nullptr)
@@ -1331,7 +1200,7 @@ static napi_value Init(napi_env env, napi_value exports) {
   FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("nsResolve", NsResolve) FN("clearNamespace", ClearNamespace) FN("nsStats", NsStats) FN("scanKeys", ScanKeys) FN("sweepExpired", SweepExpired) FN("incr", Incr) FN("cas", Cas) FN("heartbeat", Heartbeat) FN("heartbeatAgeMs", HeartbeatAgeMs) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastTtlRemainingMs", LastTtlRemainingMs) FN("epochMs", EpochMs) FN("heartbeatRaw", HeartbeatRaw)
   FN("arenaId", ArenaId) FN("detach", Detach) FN("keyMaxBytes", KeyMaxBytes)
   FN("destroy", Destroy) FN("__unsafePokeArena", Poke)
-  FN("__unsafeSuppressRefBit", SetSuppressRefBit) FN("__unsafeSecondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("__unsafeBackwardShift", SetBackwardShift) FN("__unsafeClearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin) FN("hasLz4", HasLz4)
+  FN("__unsafeSuppressRefBit", SetSuppressRefBit) FN("__unsafeSecondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("__unsafeBackwardShift", SetBackwardShift) FN("__unsafeClearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("setCompressMin", SetCompressMin) FN("hasLz4", HasLz4)
   return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)
