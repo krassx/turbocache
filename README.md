@@ -59,11 +59,27 @@ supported arrangement.
 | CJS + ESM entry points | yes | yes | yes |
 | post-collection heap guard | yes | yes | yes |
 
-> **Installing under Bun:** Bun blocks postinstall scripts by default, so the
-> addon is never compiled and `require('turbocache')` fails. Add
-> `"trustedDependencies": ["turbocache"]` to your `package.json`, or install
-> with npm. Verified: without it, `bun add` reports "Blocked 1 postinstall" and
-> produces no binary.
+### Installing
+
+Prebuilt binaries ship inside the npm tarball, so a normal install needs no
+compiler and no network fetch. The addon is Node-API, so one prebuild per
+platform serves every supported Node major:
+
+| | x64 | arm64 |
+|---|---|---|
+| Linux (glibc) | yes | yes |
+| Linux (musl) | yes | — |
+| macOS | yes | yes |
+| Windows | yes | — |
+
+Anything not listed falls back to compiling from source at install time, which
+needs a compiler and Python, exactly as before.
+
+> **Bun:** this used to need `"trustedDependencies": ["turbocache"]`, because
+> Bun blocks lifecycle scripts by default and the addon was therefore never
+> compiled. With prebuilds it no longer does — `bun add` still reports
+> "Blocked 1 postinstall", and the package works anyway, because the binary is
+> already there. On a platform with no prebuild the old caveat still applies.
 
 Bun runs the entire suite green — every unit test, both transports, and the full
 primary-death recovery sequence — at roughly 15% below Node's throughput. The

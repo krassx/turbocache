@@ -19,6 +19,12 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '${{ matrix.node }}' }
 
+      - name: Runtime dependencies
+        # node-gyp-build resolves the addon (prebuild, else build/Release), so it
+        # must be present before anything requires src/native. --ignore-scripts
+        # because the explicit node-gyp step below does the build.
+        run: npm install --omit=dev --ignore-scripts --no-audit --no-fund
+
       - name: Build the addon (no external dependencies)
         run: npx --yes node-gyp configure build
 
@@ -76,6 +82,12 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '24' }
       - run: sudo apt-get update && sudo apt-get install -y liblz4-dev
+      - name: Runtime dependencies
+        # node-gyp-build resolves the addon (prebuild, else build/Release), so it
+        # must be present before anything requires src/native. --ignore-scripts
+        # because the explicit node-gyp step below does the build.
+        run: npm install --omit=dev --ignore-scripts --no-audit --no-fund
+
       - name: Build with --turbocache_lz4=1 and verify compression works
         run: |
           npx --yes node-gyp configure build --turbocache_lz4=1

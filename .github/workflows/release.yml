@@ -1,0 +1,153 @@
+# Prebuilds and publish.
+#
+# The addon is Node-API, so its ABI is stable across Node majors: ONE prebuild
+# per (platform, arch, libc) serves every supported Node, and there is no
+# per-version matrix to maintain. prebuildify puts them in prebuilds/ and they
+# ship INSIDE the npm tarball, so installing needs no network and no compiler.
+#
+# That also fixes the Bun install: node-gyp-build's install script is a no-op
+# when a matching prebuild is present, and if Bun blocks it entirely (Bun blocks
+# lifecycle scripts unless the package is in trustedDependencies) require-time
+# resolution still finds the prebuild. Platforms WITHOUT a prebuild below fall
+# back to compiling from source, exactly as before.
+name: prebuild and publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish to npm (otherwise build prebuilds only)'
+        type: boolean
+        default: false
+
+jobs:
+  prebuild:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false        # one platform failing must not hide the others
+      matrix:
+        include:
+          - { name: linux-x64-glibc,   os: ubuntu-22.04 }
+          - { name: linux-arm64-glibc, os: ubuntu-22.04-arm }
+          - { name: darwin-x64,        os: macos-15-intel }
+          - { name: darwin-arm64,      os: macos-14 }
+          - { name: win32-x64,         os: windows-2022 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      # ubuntu-22.04 rather than -latest deliberately: a prebuild links the
+      # glibc it was built against, so the OLDEST supported runner gives the
+      # widest compatibility. Building on 24.04 would refuse to load on 22.04.
+      - name: Build prebuild
+        run: npx --yes prebuildify@^6 --napi --strip
+
+      - name: It must load, and it must be the prebuild that loaded
+        shell: bash
+        run: |
+          rm -rf build                        # so only prebuilds/ can satisfy it
+          node -e "
+            const path = require('node-gyp-build').path('.');
+            if (!path.includes('prebuilds')) { console.error('resolved ' + path + ', not a prebuild'); process.exit(1); }
+            const n = require('node-gyp-build')('.');
+            if (typeof n.create !== 'function') { console.error('addon loaded but has no create()'); process.exit(1); }
+            console.log('loaded ' + path);
+          "
+
+      - name: Smoke test the suite against the prebuild
+        run: node test/run.js
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-${{ matrix.name }}
+          path: prebuilds/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Linux musl (Alpine) is a separate job because it needs a container rather
+  # than a runner image. node-gyp-build picks .musl/.glibc by reading the
+  # running process's libc, so both can sit in the same prebuilds/ tree.
+  prebuild-musl:
+    name: linux-x64-musl
+    runs-on: ubuntu-22.04
+    container: node:20-alpine
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: apk add --no-cache python3 make g++
+      - name: Build prebuild
+        run: npx --yes prebuildify@^6 --napi --strip --tag-libc
+      - name: It must load, and it must be the prebuild that loaded
+        run: |
+          rm -rf build
+          node -e "
+            const path = require('node-gyp-build').path('.');
+            if (!path.includes('prebuilds')) { console.error('resolved ' + path); process.exit(1); }
+            require('node-gyp-build')('.');
+            console.log('loaded ' + path);
+          "
+      - name: Smoke test the suite against the prebuild
+        run: node test/run.js
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-linux-x64-musl
+          path: prebuilds/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish to npm
+    needs: [prebuild, prebuild-musl]
+    runs-on: ubuntu-latest
+    # Only a tag push publishes. A manual run builds and checks the prebuilds
+    # without publishing unless it is asked to.
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    permissions:
+      contents: read
+      id-token: write           # npm provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: prebuild-*
+          merge-multiple: true      # every job wrote prebuilds/<tuple>/, so they merge
+
+      - name: Collect the prebuilds
+        shell: bash
+        run: |
+          mkdir -p prebuilds
+          cp -r artifacts/* prebuilds/ 2>/dev/null || true
+          find prebuilds -type f | sort
+          count=$(find prebuilds -name '*.node' | wc -l | tr -d ' ')
+          echo "prebuilds: $count"
+          # 5 runner targets + musl. Publishing with a platform silently missing
+          # is worse than not publishing: that platform gets a source build with
+          # no warning, and on Bun no build at all.
+          [ "$count" -eq 6 ] || { echo "expected 6 prebuilds, got $count"; exit 1; }
+
+      - name: The tag must match the version being published
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          [ "$tag" = "$pkg" ] || { echo "tag v$tag != package.json $pkg"; exit 1; }
+
+      - name: What would ship
+        run: npm pack --dry-run
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -40,6 +40,7 @@
     "./package.json": "./package.json"
   },
   "files": [
+    "prebuilds/",
     "index.js",
     "index.mjs",
     "index.d.ts",
@@ -63,13 +64,18 @@
   },
   "gypfile": true,
   "scripts": {
-    "install": "node-gyp rebuild",
+    "install": "node-gyp-build",
     "build": "node-gyp rebuild",
     "test": "node test/run.js",
-    "test:types": "tsc -p test/types/tsconfig.json"
+    "test:types": "tsc -p test/types/tsconfig.json",
+    "prebuild": "prebuildify --napi --strip"
   },
   "devDependencies": {
     "node-gyp": "^10.0.0",
+    "prebuildify": "^6.0.1",
     "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "node-gyp-build": "^4.8.4"
   }
 }

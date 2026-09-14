@@ -6,3 +6,4 @@ node_modules/
 test/tsan/seqlock_*
 !test/tsan/seqlock_tsan.cc
 *.tgz
+prebuilds/
