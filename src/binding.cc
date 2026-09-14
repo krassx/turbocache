@@ -1,4 +1,16 @@
-#define NAPI_VERSION 10
+// The Node-API level this addon REQUIRES, and therefore the floor on which
+// Node versions can load it at all. 8 is Node 18.0's level, matching the
+// engines range; nothing here uses anything above NAPI 6 (napi_create_bigint_words
+// and napi_get_value_bigint_words are the newest calls, both NAPI 6).
+//
+// This was 10 from the first prototype commit, with no comment and nothing
+// depending on it. Node 18 and 20 cap at NAPI 9, so they REFUSED the module --
+// and Node's refusal path is a null-pointer dereference, not a thrown error, so
+// the symptom was a bare SIGSEGV during require() with no diagnostic. Reproduced
+// with a ten-line addon that does nothing but declare NAPI 99: segfaults on Node
+// 20, 22 AND 24 (x0 = 0 at the fault). So the declared version is ours to get
+// right, and the silence when it is wrong is Node's.
+#define NAPI_VERSION 8
 #include <node_api.h>
 // Compression is an optional build feature; see binding.gyp. Without it the
 // addon has no external dependencies.

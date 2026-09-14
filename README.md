@@ -53,6 +53,8 @@ supported arrangement.
 
 ## Runtime support
 
+Requires Node 18 or newer (Node-API level 8).
+
 | | Node | Bun | Deno |
 |---|---|---|---|
 | addon, cluster, both transports | yes | yes | yes |

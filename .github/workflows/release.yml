@@ -38,10 +38,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        # 22, not 20: the addon currently segfaults on load under Node 18 and 20
-        # (pre-existing, reproduced on a plain source build, see open item 19),
-        # so the verification step below would fail the whole release on 20.
-        # The prebuild itself is Node-API and version-independent either way.
+        # Any supported Node produces the same prebuild -- Node-API, one binary
+        # per platform. Pinned so the build is reproducible, not because the
+        # version matters.
         with: { node-version: '22' }
 
       # ubuntu-22.04 rather than -latest deliberately: a prebuild links the
