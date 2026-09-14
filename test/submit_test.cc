@@ -227,6 +227,33 @@ int main() {
     ok(steps == 0, "oversized head is refused, not walked");
   }
 
+  // 9. The consumer must use the fields it VALIDATED, not fresh loads of the
+  //    same worker-writable words. Validating through the pointer and then
+  //    re-reading is a TOCTOU: a worker that flips valLen after validation
+  //    passed gets its value to storeSet, where the size arithmetic truncates
+  //    through 2^32 so the allocation succeeds while the copy uses the full
+  //    length -- a multi-gigabyte memcpy out of the ring and past the arena.
+  {
+    s.ring(1)->head.store(0); s.ring(1)->tail.store(0);
+    const char* v16 = "0123456789abcdef";
+    ok(submitPush(s, 1, SUBMIT_OP_SET, 2, 0, 0, "k", 1, v16, 16), "pushed a record to attack");
+    uint8_t* base = s.ringData(1);
+    SubmitRec* live = (SubmitRec*)base;
+    uint64_t head = s.ring(1)->head.load(std::memory_order_acquire);
+
+    SubmitRec snap;                                  // what the drain must do
+    memcpy(&snap, base, sizeof(SubmitRec));
+    ok(submitValidate(s, &snap, head), "the snapshot validates");
+    live->valLen = 0xFFFFFFD0u;                      // a racing worker flips it
+    ok(snap.valLen == 16, "the snapshot is unaffected by a post-validation write");
+    ok(submitValidate(s, &snap, head), "the snapshot still validates after the flip");
+    // and the hostile value would NOT have validated, which is the whole point
+    SubmitRec after;
+    memcpy(&after, base, sizeof(SubmitRec));
+    ok(!submitValidate(s, &after, head), "the flipped record would have been rejected on its own");
+    live->valLen = 16;
+  }
+
   s.close();
   shmUnlink(NM);
   printf(fails ? "\n%d FAILED\n" : "\nall passed\n", fails);

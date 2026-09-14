@@ -286,9 +286,11 @@ static napi_value SubmitClaim(napi_env env, napi_callback_info info) {
       }
       if (ring->owner.compare_exchange_strong(expect, me,
               std::memory_order_acq_rel, std::memory_order_relaxed)) {
-        if (expect != 0) {          // reclaimed: the dead owner's records are unowned, drop them
-          ring->tail.store(ring->head.load(std::memory_order_acquire), std::memory_order_release);
-        }
+        // A reclaimed slot's queued records are kept for the same reason: a
+        // partially written record is never published, so everything between
+        // tail and head is complete. Resetting tail here also raced the
+        // primary's in-flight drain, which would then store a stale, smaller
+        // tail back over it and leave the ring pointing mid-record.
         g_ringIdx = (int32_t)i;
         napi_create_int32(env, (int32_t)i, &r); return r;
       }
@@ -368,30 +370,46 @@ static napi_value SubmitDrain(napi_env env, napi_callback_info info) {
       uint32_t off = (uint32_t)(tail & (cap - 1));
       uint32_t gap = submitGapAt(off, cap);
       if (gap) { tail += gap; continue; }
-      SubmitRec *rec = (SubmitRec *)(base + off);
+      // SNAPSHOT the header, then validate and use ONLY the snapshot.
+      //
+      // Validating through the pointer and then reading the fields again is a
+      // TOCTOU: `rec` points into a segment every worker maps read-write, and
+      // the compiler emits fresh loads for each use (confirmed in the shipped
+      // object code). A worker that flips valLen after validation passed gets
+      // its value through to storeSet, where `align8(sizeof(Entry) + keyLen +
+      // storedLen)` truncates through 2^32 to something small -- so the
+      // allocation succeeds -- while the memcpy copies the full length. ASan
+      // shows a ~4GB copy out of the ring and past the arena.
+      //
+      // This is the same rule the geometry already follows (see submit.h):
+      // snapshot once, never re-read from shared memory. The key and value
+      // BYTES stay where they are; a concurrent mutation of those only garbles
+      // that worker's own value, within bounds already fixed by the snapshot.
+      SubmitRec rec;
+      memcpy(&rec, base + off, sizeof(SubmitRec));
       uint64_t avail = head - tail;
       if (avail > cap - off) avail = cap - off;
       // Ring contents are written by a worker and are therefore untrusted.
       // A rejected record stops this ring rather than the drain: the worker
       // loses its own writes, nothing else is affected.
-      if (!submitValidate(g_submit, rec, avail)) {
+      if (!submitValidate(g_submit, &rec, avail)) {
         ring->corrupt.fetch_add(1, std::memory_order_relaxed);
         break;
       }
-      if (rec->op != SUBMIT_OP_SKIP) {
+      if (rec.op != SUBMIT_OP_SKIP) {
         const uint8_t *k = base + off + sizeof(SubmitRec);
-        const uint8_t *v = k + rec->keyLen;
-        if (rec->op == SUBMIT_OP_SET) {
-          uint32_t ttl = rec->ttlMs > TC_TTL_MAX_MS ? TC_TTL_MAX_MS : rec->ttlMs;
+        const uint8_t *v = k + rec.keyLen;
+        if (rec.op == SUBMIT_OP_SET) {
+          uint32_t ttl = rec.ttlMs > TC_TTL_MAX_MS ? TC_TTL_MAX_MS : rec.ttlMs;
           uint32_t expiresAt = ttl ? nowRelMs(g) + ttl : 0;
-          storeSet(g, k, (uint16_t)rec->keyLen, v, rec->valLen, rec->valLen,
-                   rec->flags, expiresAt, (uint16_t)(i + 1), (uint8_t)rec->ns);
+          storeSet(g, k, (uint16_t)rec.keyLen, v, rec.valLen, rec.valLen,
+                   rec.flags, expiresAt, (uint16_t)(i + 1), (uint8_t)rec.ns);
         } else {
-          storeDelete(g, k, (uint16_t)rec->keyLen, (uint16_t)(i + 1));
+          storeDelete(g, k, (uint16_t)rec.keyLen, (uint16_t)(i + 1));
         }
         applied++;
       }
-      tail += rec->len;
+      tail += rec.len;
     }
     ring->tail.store(tail, std::memory_order_release);
     ring->applied.fetch_add((uint64_t)(applied - before), std::memory_order_relaxed);
@@ -436,9 +454,12 @@ static napi_value SubmitStats(napi_env env, napi_callback_info info) {
 static napi_value SubmitRelease(napi_env env, napi_callback_info info) {
   if (g_submit.base && g_ringIdx >= 0) {
     SubmitRing *ring = g_submit.ring((uint32_t)g_ringIdx);
-    // Drop anything still queued: nothing will ever push it, and leaving it
-    // would make the next owner inherit a stranger's records.
-    ring->tail.store(ring->head.load(std::memory_order_acquire), std::memory_order_release);
+    // Do NOT discard queued records. They were published with a release store,
+    // so each one is complete and valid, and the primary will apply them. The
+    // previous `tail = head` here destroyed every write a worker had made but
+    // the primary had not yet drained -- so close() silently lost data on the
+    // default transport while the IPC path delivered it. The next owner
+    // inheriting them is harmless: they are legitimate writes, applied in order.
     ring->owner.store(0, std::memory_order_release);
   }
   g_ringIdx = -1;
@@ -675,7 +696,12 @@ static napi_value SweepExpired(napi_env env, napi_callback_info info) {
     if (hv == HASH_EMPTY || hv == HASH_TOMB) continue;
     uint64_t pos = g.idx[i].off.load(std::memory_order_relaxed);
     Entry *e = g.entryAt(pos);
-    if (!e->expiresAt || e->expiresAt > now) continue;
+    // tcExpired, not `exp > now`: this is the fifth expiry comparison and it
+    // was the one left behind when the others were made wrap-aware. A plain
+    // compare deletes every entry whose expiry crosses the uint32 wrap while it
+    // is still valid -- once per 49.7 days of primary uptime, a whole TTL
+    // window of live data swept away.
+    if (!tcExpired(e->expiresAt, now)) continue;
     uint32_t bsz = e->blockSize; uint8_t ns = e->ns; uint64_t eh = e->hash;
     indexRemove(g, i);
     h->live--; h->liveBytes -= bsz; h->nsBytes[ns] -= bsz; h->evictions++;

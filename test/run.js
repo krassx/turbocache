@@ -10,10 +10,14 @@ const SUITE = [
     'v8codec_test.js', 'storage_modes_test.js', 'namespace_test.js', 'cluster_api_test.js',
     'review_regression_test.js', 'gaps_test.js', 'typeflow_test.js', 'typematrix_test.js',
     'perf_regression_test.js', 'guard_test.js', 'recovery_test.js',
+    'review2_regression_test.js',
 ];
 // Same file, both transports: the shared-memory path is the default and the IPC
 // path is the fallback, and a regression in either is a regression.
-const MATRIX = [['transport_regression_test.js', { TC_T: 'shm' }], ['transport_regression_test.js', { TC_T: 'ipc' }]];
+const MATRIX = [
+    ['transport_regression_test.js', { TC_T: 'shm' }], ['transport_regression_test.js', { TC_T: 'ipc' }],
+    ['worker_lifecycle_test.js', { TC_T: 'shm' }], ['worker_lifecycle_test.js', { TC_T: 'ipc' }],
+];
 
 let failed = [];
 const run = (file, env) => {

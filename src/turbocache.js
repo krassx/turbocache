@@ -700,9 +700,19 @@ class TurboCache {
 
     _setDead(dead, msg) {
         this.#primaryDead = dead;
+        // Drop the ring index with it. Without this a degraded set() still went
+        // to submitSet, failed, and overwrote lastError with "submission ring
+        // full" -- so the one signal that a worker was serving L1 only vanished
+        // on its very next write, and the shed counter blamed backpressure for
+        // what was actually a dead primary.
+        if (dead) this.#ringIdx = -1;
         if (msg) this.lastError = msg;
     }
+
+    /** Whether this handle has lost its primary and is serving L1 only. */
+    get primaryDead() { return this.#primaryDead; }
     _staleMs() { return this.#staleMs; }
+    _usesRing() { return this.#ringIdx >= 0; }
     _recovered(sameArena) {
         // Everything this worker believed about the arena is now suspect: it
         // missed every invalidation while detached, and an unapplied delete is a
@@ -868,6 +878,26 @@ class TurboCache {
     // The primary is the sole writer, so its own L1 is authoritative and it has
     // nothing to drain. Workers check one hot counter, which is usually
     // unchanged, before paying for a real drain.
+    // Is the primary still alive? Returns true if this call degraded.
+    //
+    // Separate from #drain because WRITES must run it too. It used to live
+    // inside #drain, which only get() and has() call, so a worker that only
+    // ever writes -- a cache warmer, a populate-only job, a perfectly ordinary
+    // shape -- never noticed its primary had died. It kept pushing into an
+    // orphaned segment, set() kept returning true, stats.sent kept climbing,
+    // and because nothing degraded it there was no path by which it could ever
+    // recover. Nothing is cheap enough to do per-write except a clock read, so
+    // the native heartbeat call stays gated at 500ms.
+    #checkPrimary() {
+        if (this.#id === 0 || this.#primaryDead) return false;
+        const t = monoMs();
+        if (t - this.#lastStaleCheck < 500) return false;
+        this.#lastStaleCheck = t;
+        const age = native.heartbeatAgeMs();
+        if (age < 0 || age > this.#staleMs) { TurboCache.#degrade(age); return true; }
+        return false;
+    }
+
     #drain() {
         if (this.#id === 0) return;
         // Degraded means the arena is UNMAPPED (we must let go so a new primary
@@ -883,14 +913,7 @@ class TurboCache {
         // went quiet and came back served stale data on its first read. monoMs()
         // is ~21ns against the native ringHead() call this function already
         // makes, so the check is free at any call rate.
-        if (!this.#primaryDead) {
-            const t = monoMs();
-            if (t - this.#lastStaleCheck >= 500) {
-                this.#lastStaleCheck = t;
-                const age = native.heartbeatAgeMs();
-                if (age < 0 || age > this.#staleMs) { TurboCache.#degrade(age); return; }
-            }
-        }
+        if (this.#checkPrimary()) return;          // just degraded; the arena is unmapped
         if (native.ringHead() === this.#cursor) return;
         const r = native.ringRead(this.#cursor, 512);
         if (!r) return;                            // detached mid-drain
@@ -984,6 +1007,7 @@ class TurboCache {
     // result. Because that makes failure quiet, every rejection also bumps a
     // stats counter and records lastError.
     set(key, value, opts) {
+        this.#checkPrimary();
         this.stats.sets++;
         key = this.#ns + key;
         // uint32 milliseconds from the arena epoch is ~49 days of range; clamp
@@ -1097,6 +1121,11 @@ class TurboCache {
         // Shared-memory submission: a memcpy into this worker's own ring, which
         // the primary already has mapped. The IPC path is kept as a fallback for
         // when the ring segment is unavailable (older primary, claim failed).
+        if (this.#primaryDead) {
+            this.stats.writesShed = (this.stats.writesShed || 0) + 1;
+            this.lastError = 'primary is not available; the write is in L1 only';
+            return true;
+        }
         if (this.#ringIdx >= 0) {
             if (native.submitSet(key, enc, ttlMs, this.#nsId)) { this.stats.sent++; this.#ringDoorbell(); return true; }
             // Ring full. Same contract as a shed IPC write: the value is in this
@@ -1157,6 +1186,7 @@ class TurboCache {
     }
 
     delete(key) {
+        this.#checkPrimary();
         key = this.#ns + key;
         this.stats.deletes++;
         if (this.#id === 0) { const had = native.del(key, 0); this.#l1Drop(key); return had; }
@@ -1209,6 +1239,19 @@ class TurboCache {
     // A missing key counts as zero. Returns false if the key holds a non-numeric
     // value, matching set()'s "accepted" contract.
     incr(key, by = 1, opts) {
+        // incr and cas write a NATIVELY typed number straight into the arena,
+        // bypassing the codec. In a codec mode `get` then hands that number to
+        // codec.decode, which expects the encoded string it wrote -- so the key
+        // becomes permanently unreadable: `direct` threw a TypeError on every
+        // read, and `safe` threw SyntaxError once the value was NaN or Infinity.
+        // Refuse the operation rather than produce a key that throws.
+        if (this.#codec) {
+            this.stats.rejectedType = (this.stats.rejectedType || 0) + 1;
+            this.lastError = 'incr requires storage:"bytes"; a codec mode cannot ' +
+                             'represent a natively-typed counter';
+            return false;
+        }
+        this.#checkPrimary();
         const full = this.#ns + key;
         const ttlMs = Math.max(0, Math.min(opts && opts.ttlMs || 0, 0x7fffffff));
         if (Buffer.byteLength(full) > this.#keyMax) {
@@ -1232,6 +1275,11 @@ class TurboCache {
     // outcome the caller never learns is not a CAS, so a worker gets an error
     // rather than a misleading `true`.
     cas(key, expected, next) {
+        if (this.#codec) {
+            this.stats.rejectedType = (this.stats.rejectedType || 0) + 1;
+            this.lastError = 'cas requires storage:"bytes"; see incr';
+            return false;
+        }
         if (this.#id !== 0)
             throw new Error('cas() is primary-only: a worker cannot learn the outcome ' +
                             'of a write applied a tick later');
@@ -1318,10 +1366,23 @@ class TurboCache {
         this.stopGuard();
         if (this.#timer) { clearInterval(this.#timer); this.#timer = null; }
         instances.delete(this);
-        // Release this process's ring slot, or it stays owned by a dead pid
-        // forever: after enough worker churn every slot is taken, submitClaim
-        // returns -1, and every new worker silently falls back to IPC.
-        try { native.submitRelease(); } catch { /* transport not in use */ }
+        if (instances.size === 0 && TurboCache.#recoverTimer) {
+            clearInterval(TurboCache.#recoverTimer); TurboCache.#recoverTimer = null;
+            TurboCache.#degraded = false;      // a timer left running re-attached with no instances
+        }
+        this.#ringIdx = -1;
+        // The ring slot is PROCESS-wide, so release it only once no live
+        // instance in this process is still using it. Releasing on the first
+        // close() left every sibling holding a #ringIdx for a slot it no longer
+        // owned: their pushes failed, were counted as shed, and set() still
+        // returned true -- silent, permanent write loss for the rest of the
+        // process's life.
+        let stillUsingRing = false;
+        for (const c of instances) if (c._usesRing()) { stillUsingRing = true; break; }
+        if (!stillUsingRing) {
+            try { native.submitRelease(); } catch { /* transport not in use */ }
+            submitReady = null;
+        }
         if (this.#id === 0 && storeReady) {
             try { native.submitDestroy(); } catch { /* not created */ }
             submitName = null; isPrimaryProcess = false;

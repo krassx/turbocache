@@ -126,6 +126,20 @@ int main() {
     ok(refused == (int)(sizeof(cases) / sizeof(cases[0])), "every corrupted geometry is refused");
   }
 
+  // The expiry sweep must use the wrap-aware comparison too. It was the fifth
+  // comparison site and the one left behind: a plain `exp > now` deletes every
+  // entry whose expiry crosses the uint32 wrap while it is still live, once per
+  // 49.7 days of primary uptime.
+  {
+    s.h->epochTicksNs = ticksNs() - (0xFFFFFFFFull - 1000) * 1000000ull;
+    uint32_t now = nowRelMs(s);
+    uint32_t exp = now + 5000;                       // wraps to ~4000
+    ok(exp < now, "the expiry genuinely wrapped past the uint32 boundary");
+    ok(!tcExpired(exp, now), "a wrapped-but-live expiry is not expired");
+    // the comparison the sweep used to make:
+    ok((exp != 0 && exp <= now), "the naive sweep compare would have deleted it");
+  }
+
   s.destroy(); shmUnlink(NM);
   printf(fails ? "\n%d FAILED\n" : "\nall passed\n", fails);
   return fails ? 1 : 0;
