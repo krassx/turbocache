@@ -2,6 +2,7 @@
 // Single-process comparison. Neither cache has an IPC peer here, so nothing is
 // waiting on a later tick and the workload does not yield the event loop.
 const { run, buildPlan, BUGSEE } = require('./workload');
+const __native = require('../src/native');
 const { TurboCache } = require('../src/turbocache');
 const bugsee = require(BUGSEE);
 
@@ -50,20 +51,20 @@ const fresh = (opts) => TurboCache.createPrimary('/tc-sng-' + process.pid + '-' 
         let tc = fresh();
         report('turbocache (sync)', await run(tcObj(tc), plan, 256, NOYIELD),
                `L1hit=${tc.stats.l1Hits} L2hit=${tc.stats.l2Hits}`);
-        TurboCache.native().destroy();
+        __native.destroy();
         tc = fresh();
         const a = tcObj(tc);
         report('turbocache (awaited)', await run({ sync: false, get: async k => a.get(k), set: async (k, v) => a.set(k, v) }, plan, 256, NOYIELD));
-        TurboCache.native().destroy();
+        __native.destroy();
 
         tc = fresh({ codec: JSONC, l1MaxBytes: L1 });
         report('turbocache (codec)', await run(tcStr(tc), plan, 256, NOYIELD),
                `L1hit=${tc.stats.l1Hits} L2hit=${tc.stats.l2Hits}`);
-        TurboCache.native().destroy();
+        __native.destroy();
 
         tc = fresh({ codec: JSONC, l1MaxBytes: L1, freeze: true });
         report('turbocache (codec, frozen)', await run(tcStr(tc), plan, 256, NOYIELD));
-        TurboCache.native().destroy();
+        __native.destroy();
 
         report('bugsee (L1 only)', await run(bs(new bugsee.Cache({ l1MaxBytes: L1, enableIpc: false })), plan, 256, NOYIELD));
     }
@@ -77,11 +78,11 @@ const fresh = (opts) => TurboCache.createPrimary('/tc-sng-' + process.pid + '-' 
     report('(harness floor, no cache)', await run(noop, planC, 256, NOYIELD));
     let tcC = fresh();
     report('turbocache (raw bytes)', await run(tcStr(tcC), planC, 256, NOYIELD));
-    TurboCache.native().destroy();
+    __native.destroy();
     tcC = fresh({ values: 'bytes', l1MaxBytes: L1 });
     report('turbocache (primitives)', await run(tcStr(tcC), planC, 256, NOYIELD),
            'exact accounting + flatten');
-    TurboCache.native().destroy();
+    __native.destroy();
     report('bugsee (L1 only)', await run(bs(new bugsee.Cache({ l1MaxBytes: L1, enableIpc: false })), planC, 256, NOYIELD));
 
     console.log(`\n  latency ns/op, sampled 1 in 256, includes ~30ns hrtime overhead.`);

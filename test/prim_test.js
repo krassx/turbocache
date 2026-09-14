@@ -1,4 +1,5 @@
 const { TurboCache } = require('../src/turbocache');
+const __native = require('../src/native');
 let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
 const c = TurboCache.createPrimary('/tcprim' + process.pid, 32 << 20, 1 << 16,
                                    { values: 'bytes', l1MaxBytes: 1 << 20 });
@@ -11,6 +12,6 @@ ok(c.stats.rejectedType === 1 && /bytes mode/.test(c.lastError), 'rejection is r
 const big = new Array(200000).fill('abcdefgh').join('');
 c.set('slice', big.substring(0, 1000));
 ok(c.get('slice').length === 1000, 'substring cached and flattened');
-TurboCache.native().destroy();
+__native.destroy();
 console.log(fail ? `  ${fail} FAILURES` : '  all passed');
 process.exit(fail ? 1 : 0);

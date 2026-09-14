@@ -3,6 +3,7 @@
 // every worker's write invalidates the other workers' L1 copies, and misses
 // must cross the process boundary (IPC for bugsee, shared memory for turbocache).
 const cluster = require('cluster');
+const __native = require('../src/native');
 const os = require('os');
 const { run, buildPlan, BUGSEE } = require('./workload');
 
@@ -78,7 +79,7 @@ if (cluster.isPrimary) {
         console.log(`  writes               : ${tot.writes}`);
         console.log(`  latency ns (avg of workers): p50=${p50}  p99=${p99}  p99.9=${p999}`);
         if (IMPL === 'turbo') {
-            const st = require('../src/turbocache').TurboCache.native().stats();
+            const st = require('../src/turbocache').__native.stats();
             console.log(`  primary applied ${applied} IPC batches; L2 holds ${st.live} entries`);
         } else {
             console.log(`  primary L2 holds ${srv.l2.itemCount} entries, ${(srv.l2.length/1048576).toFixed(1)}MB of ${L2/1048576}MB`);

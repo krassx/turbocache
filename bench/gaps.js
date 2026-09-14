@@ -17,7 +17,7 @@ const sizeFor = i => [256, 512, 1024, 2048, 4096][((i * 2654435761) >>> 0) % 5];
 function hitRate(mode, suppress) {
   l2.create(`/tc-g1-${mode}-${suppress}-${process.pid}`, 24 << 20, 1 << 18, mode);
   l2.setCompressMin(1 << 30);
-  l2.suppressRefBit(suppress);
+  l2.__unsafeSuppressRefBit(suppress);
   const rnd = mkRng(777), pick = mkZipf(NKEYS, rnd), src = new Map();
   let h = 0, m = 0;
   for (let n = 0; n < OPS; n++) {
@@ -27,7 +27,7 @@ function hitRate(mode, suppress) {
     let v = src.get(k); if (v === undefined) { v = makePayload(sizeFor(i)); src.set(k, v); }
     l2.set(k, v);
   }
-  const r = h / (h + m); l2.suppressRefBit(false); l2.destroy(); return r;
+  const r = h / (h + m); l2.__unsafeSuppressRefBit(false); l2.destroy(); return r;
 }
 const logPlain   = hitRate(1, false);
 const log2Bits   = hitRate(2, false);

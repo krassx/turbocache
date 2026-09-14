@@ -2,6 +2,7 @@
 // What should the second-chance budget and the ring capacity actually be?
 const { TurboCache } = require('../src/turbocache');
 const native = require('../src/native');
+const __native = native;
 const { buildPlan, run } = require('./workload');
 
 let seq = 0;
@@ -16,15 +17,15 @@ const mk = o => TurboCache.createPrimary('/tctune' + process.pid + '_' + (seq++)
     const strs = { ...plan, vals: plan.vals.map(v => JSON.stringify(v)) };
     for (const budget of [0, 1, 8, 32, 64, 256, 1024, 8192]) {
         const c = mk({});
-        native.secondChanceBudget(budget);
+        native.__unsafeSecondChanceBudget(budget);
         const r = await run({ sync: true, get: k => c.get(k), set: (k, v) => c.set(k, v) }, strs, 256, 0);
         const st = native.stats();
         console.log(`  ${String(budget).padStart(6)} ${(r.hitRate * 100).toFixed(1).padStart(9)}%` +
             ` ${(r.opsPerSec / 1000).toFixed(0).padStart(7)}k ${String(r.p50).padStart(9)}ns` +
             ` ${String(st.evictions).padStart(16)}`);
-        TurboCache.native().destroy();
+        __native.destroy();
     }
-    native.secondChanceBudget(64);
+    native.__unsafeSecondChanceBudget(64);
 
     console.log('\n=== ring capacity: the ring is appended ONLY by the primary ===');
     console.log('  So its rate is bounded by the primary apply throughput, not by worker count.');
@@ -36,7 +37,7 @@ const mk = o => TurboCache.createPrimary('/tctune' + process.pid + '_' + (seq++)
         const t0 = process.hrtime.bigint();
         for (let i = 0; i < N; i++) c.set('k' + (i % 20000), 'v' + i);
         const rate = N / (Number(process.hrtime.bigint() - t0) / 1e9);
-        TurboCache.native().destroy();
+        __native.destroy();
         console.log(`  primary apply rate: ${(rate / 1000).toFixed(0)}k records/s\n`);
         console.log('  ring size   bytes    survives a worker pause of');
         for (const cap of [8192, 65536, 262144, 1048576]) {

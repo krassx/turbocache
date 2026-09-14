@@ -1,5 +1,6 @@
 // Does a post-GC guard bound LIVE heap when the byte estimate is wrong?
 const { TurboCache } = require('../src/turbocache');
+const __native = require('../src/native');
 const { makeValue, mkRng } = require('../bench/workload');
 const v8 = require('v8');
 const { PerformanceObserver } = require('perf_hooks');
@@ -31,7 +32,7 @@ async function fill(opts, label) {
         ` (${(100 * retained / lim).toFixed(0).padStart(3)}% of limit)   shed: ${String(c.stats.heapShed || 0).padStart(2)}` +
         `   L1 entries: ${String(c.l1Size).padStart(6)}`);
     c.stopGuard();
-    TurboCache.native().destroy();
+    __native.destroy();
 }
 console.log(`  heap limit ${(lim / 2 ** 20).toFixed(0)}MB; L1 byte budget 1GB (deliberately wrong)\n`);
 (async () => {

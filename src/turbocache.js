@@ -1555,7 +1555,13 @@ class TurboCache {
     static #localDrop(fullKey) { for (const c of instances) c._dropExact(fullKey); }
     _dropExact(fullKey) { this.#l1Drop(fullKey); }
     static isCacheMessage(m) { return m && m.t === MSG; }
-    static native() { return native; }
+    // `native()` used to hand the raw addon to any caller of the public class,
+    // which put poke(), suppressRefBit(), backwardShift(), clearHints() and
+    // secondChanceBudget() on the same surface as get() and set(). Those mutate
+    // global algorithm state or write straight into the data region; poke()
+    // exists purely to prove the read-only mapping faults. Tests reach the addon
+    // through `require('../src/native')` instead, which is internal to the
+    // package and not reachable through `exports`.
 }
 
 module.exports = { TurboCache, Cache: TurboCache, MSG };

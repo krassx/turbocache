@@ -2,6 +2,7 @@
 // json-fastpath-lint: allow
 // Scorecard for the three storage modes: validity, safety, consistency, performance.
 const { TurboCache } = require('../src/turbocache');
+const __native = require('../src/native');
 const MODES = ['bytes', 'direct', 'safe'];
 let seq = 0;
 const mk = (storage, opts = {}) => TurboCache.createPrimary(
@@ -52,12 +53,12 @@ function validity() {
             const prim = mode === 'bytes';
             let verdict;
             try {
-                if (c.set('t', val) === false) { TurboCache.native().destroy(); res[mode][name] = 'rejected'; continue; }
+                if (c.set('t', val) === false) { __native.destroy(); res[mode][name] = 'rejected'; continue; }
                 evictL1(c, prim);
                 const got = c.get('t');
                 verdict = got === undefined ? 'LOST' : (deepEq(val, got) ? 'exact' : 'CONVERTED');
             } catch (e) { verdict = 'rejected'; }
-            TurboCache.native().destroy();
+            __native.destroy();
             res[mode][name] = verdict;
         }
     }
@@ -120,7 +121,7 @@ function safety() {
     for (const [name, fn] of Object.entries(vectors)) {
         const row = MODES.map(m => { const c = mk(m); let r;
             try { r = fn(c, m === 'bytes'); } catch (e) { r = 'ERR ' + e.constructor.name; }
-            TurboCache.native().destroy(); return r.padEnd(18); });
+            __native.destroy(); return r.padEnd(18); });
         console.log('  ' + name.padEnd(38) + row.join(''));
     }
 }
@@ -157,7 +158,7 @@ function consistency() {
         console.log(`  ${mode.padEnd(12)} ${expect.size} live keys | served-now mismatches ${mism1}` +
             ` | from-arena mismatches ${mism2} | evicted-from-arena ${lost}` +
             ` | L1 hits ${st.l1Hits} L2 hits ${st.l2Hits}`);
-        TurboCache.native().destroy();
+        __native.destroy();
     }
     console.log('  (evicted-from-arena counts keys the arena legitimately dropped, not errors)');
 }
@@ -186,7 +187,7 @@ if (process.argv[2] === 'child') {
         const { execFileSync } = require('child_process');
         const r = execFileSync(process.execPath, [__filename, 'child', arena, mode],
                                { encoding: 'utf8', env: { ...process.env, TC_CHILD: '1' } });
-        TurboCache.native().destroy();
+        __native.destroy();
         process.stdout.write(r);
     } else {
         const c = TurboCache.attachWorker(arena, 1, { storage: mode, l1MaxBytes: 64 * 1024 });
@@ -227,7 +228,7 @@ async function performance() {
                 : { sync: true, get: k => c.get(k), set: (k, v) => c.set(k, v) };
             const r = await run(ad, p, 256, 0);
             cells.push(`${(r.opsPerSec/1000).toFixed(0)}k/${r.p50}ns`.padEnd(20));
-            TurboCache.native().destroy();
+            __native.destroy();
         }
         console.log('  ' + label.padEnd(27) + cells.join(''));
     }

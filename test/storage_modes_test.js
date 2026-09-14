@@ -1,5 +1,6 @@
 'use strict';
 const { TurboCache } = require('../src/turbocache');
+const __native = require('../src/native');
 let fail = 0, n = 0;
 const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
 const mk = storage => TurboCache.createPrimary('/tcsm' + process.pid + '_' + (n++), 32 << 20, 1 << 16,
@@ -31,7 +32,7 @@ const mk = storage => TurboCache.createPrimary('/tcsm' + process.pid + '_' + (n+
     ok(c.get('v').bytes[0] === 99, 'direct: writing into a typed array DOES corrupt L1 - known hole');
     val.tags.add('mutated');
     ok(c.get('v').tags.size === 1, 'direct: caller mutating its own object cannot corrupt the cache');
-    TurboCache.native().destroy();
+    __native.destroy();
 }
 
 // --- safe: fresh mutable object per read, JSON conversions apply
@@ -45,7 +46,7 @@ const mk = storage => TurboCache.createPrimary('/tcsm' + process.pid + '_' + (n+
     ok(c.get('v').n === 1, 'safe: mutating a result cannot corrupt the cache');
     ok(typeof a.when === 'string', 'safe: Date silently became a string (documented JSON conversion)');
     ok(JSON.stringify(a.tags) === '{}', 'safe: Set silently became {} (documented JSON conversion)');
-    TurboCache.native().destroy();
+    __native.destroy();
 }
 
 // --- both survive an L1 eviction and come back through the shared arena
@@ -55,7 +56,7 @@ for (const storage of ['direct', 'safe']) {
     for (let i = 0; i < 400; i++) c.set('p' + i, { pad: 'y'.repeat(300) });
     const g = c.get('keep');
     ok(g && g.n === 7, `${storage}: survives L1 eviction via the arena`);
-    TurboCache.native().destroy();
+    __native.destroy();
 }
 
 // --- bytes mode rejects anything needing a codec; 'primitives' is a legacy alias
@@ -66,7 +67,7 @@ for (const storage of ['direct', 'safe']) {
     ok(c.set('bin', Buffer.from([1,2])) === true, 'bytes: accepts binary, which needs no codec');
     c.set('b', 2n ** 70n);
     ok(c.get('b') === 2n ** 70n, 'bytes: BigInt round-trips');
-    TurboCache.native().destroy();
+    __native.destroy();
 }
 console.log(fail ? `  ${fail} FAILURES` : '  all passed');
 process.exit(fail ? 1 : 0);

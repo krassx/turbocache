@@ -45,7 +45,7 @@ if (process.argv[2] === 'child') {
 }
 
 if (!l2.create(NAME, ARENA, 1 << 16, 2)) { console.error('create failed'); process.exit(1); }
-l2.backwardShift(process.env.SHIFT !== '0');
+l2.__unsafeBackwardShift(process.env.SHIFT !== '0');
 l2.setCompressMin(1 << 30);
 for (let i = 0; i < NKEYS; i++) l2.set('k:' + i, makeVal('k:' + i, 0));
 

@@ -2,6 +2,7 @@
 // Date/Map/Set/TypedArray/RegExp/undefined/NaN/Infinity and cycles, which JSON
 // silently degrades. Costs roughly 2-3x JSON; use only when you need it.
 const v8 = require('v8');
+const __native = require('../src/native');
 const { TurboCache } = require('../src/turbocache');
 const V8C = {
     encode: v => v8.serialize(v).toString('latin1'),
@@ -31,6 +32,6 @@ let threw = false;
 try { TurboCache.assertFastCodec(V8C); } catch { threw = true; }
 ok(!threw, 'fast-path check leaves non-JSON codecs alone');
 
-TurboCache.native().destroy();
+__native.destroy();
 console.log(fail ? `  ${fail} FAILURES` : '  all passed - full type fidelity through L1 and L2');
 process.exit(fail ? 1 : 0);

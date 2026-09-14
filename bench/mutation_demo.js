@@ -1,5 +1,6 @@
 'use strict';
 const { TurboCache } = require('../src/turbocache');
+const __native = require('../src/native');
 const JSONC = { encode: JSON.stringify, decode: JSON.parse };
 const L = s => console.log('    ' + s);
 let n = 0;
@@ -28,7 +29,7 @@ function scenario(title, opts, prim) {
     // (c) does it survive an L1 eviction, i.e. does L1 agree with L2?
     evict(c, prim);
     L(`after L1 eviction (reads from L2)   : role = '${got().role}'`);
-    TurboCache.native().destroy();
+    __native.destroy();
 }
 
 scenario('codec, isolate:false  (adopts the caller object)', { codec: JSONC, isolate: false });

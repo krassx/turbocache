@@ -2,6 +2,7 @@
 // Node 26 made ASCII JSON.stringify ~34% faster but did NOT speed up the slow
 // paths, so falling off one now costs relatively more than it used to.
 const native = require('../src/native');
+const __native = native;
 const { TurboCache } = require('../src/turbocache');
 const fs = require('fs');
 let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
@@ -83,7 +84,7 @@ const cache = TurboCache.createPrimary('/tcfp2' + process.pid, 16 << 20, 1 << 16
 const parent = new Array(50000).fill('abcdefgh').join('');
 cache.set('slice', parent.substring(0, 500));
 ok(cache.get('slice').length === 500, 'substring cached correctly');
-TurboCache.native().destroy();
+__native.destroy();
 
 console.log(fail ? `  ${fail} FAILURES` : '  all passed');
 process.exit(fail ? 1 : 0);

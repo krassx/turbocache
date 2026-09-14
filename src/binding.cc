@@ -1315,6 +1315,12 @@ static napi_value Destroy(napi_env env, napi_callback_info) {
 #define FN(name, fn) { napi_value f; napi_create_function(env, name, NAPI_AUTO_LENGTH, fn, nullptr, &f); \
                        napi_set_named_property(env, exports, name, f); }
 static napi_value Init(napi_env env, napi_value exports) {
+  // Hooks prefixed __unsafe MUTATE global algorithm state or write directly into
+  // the arena, and exist only so the tests can force conditions that cannot be
+  // reached through the public API (a read-only mapping faulting, eviction with
+  // reference bits suppressed, a chosen second-chance budget). They are not
+  // reachable from the package's `exports`: the public class no longer hands out
+  // the addon, so a consumer would have to reach into src/ deliberately.
   FN("create", Create) FN("attach", Attach) FN("set", Set) FN("get", Get)
   FN("submitCreate", SubmitCreate) FN("submitOpen", SubmitOpen)
   FN("submitClaim", SubmitClaim) FN("submitSet", SubmitSet)
@@ -1324,8 +1330,8 @@ static napi_value Init(napi_env env, napi_value exports) {
   FN("submitMaxValue", SubmitMaxValue)
   FN("getLen", GetLen) FN("has", Has) FN("del", Del) FN("clearAll", ClearAll) FN("nsResolve", NsResolve) FN("clearNamespace", ClearNamespace) FN("nsStats", NsStats) FN("scanKeys", ScanKeys) FN("sweepExpired", SweepExpired) FN("incr", Incr) FN("cas", Cas) FN("heartbeat", Heartbeat) FN("heartbeatAgeMs", HeartbeatAgeMs) FN("probe", Probe) FN("stats", Stats) FN("maxValueBytes", MaxValueBytes) FN("lastTtlRemainingMs", LastTtlRemainingMs) FN("epochMs", EpochMs) FN("heartbeatRaw", HeartbeatRaw)
   FN("arenaId", ArenaId) FN("detach", Detach) FN("keyMaxBytes", KeyMaxBytes)
-  FN("destroy", Destroy) FN("poke", Poke)
-  FN("suppressRefBit", SetSuppressRefBit) FN("secondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("backwardShift", SetBackwardShift) FN("clearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin) FN("hasLz4", HasLz4)
+  FN("destroy", Destroy) FN("__unsafePokeArena", Poke)
+  FN("__unsafeSuppressRefBit", SetSuppressRefBit) FN("__unsafeSecondChanceBudget", SetSecondChanceBudget) FN("ringStats", RingStats) FN("__unsafeBackwardShift", SetBackwardShift) FN("__unsafeClearHints", ClearHints) FN("hashKey", HashKey) FN("flatten", Flatten) FN("primBytes", PrimBytes) FN("estimateSize", EstimateSize) FN("ringRead", RingRead) FN("ringHead", RingHead) FN("hintsSet", HintsSet) FN("compactAsync", CompactAsync) FN("compactStats", CompactStats) FN("setCompressMin", SetCompressMin) FN("hasLz4", HasLz4)
   return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)

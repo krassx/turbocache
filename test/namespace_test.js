@@ -1,6 +1,7 @@
 // Does a quota actually stop a hot namespace from evicting a cold one?
 const { TurboCache } = require('../src/turbocache');
 const native = require('../src/native');
+const __native = native;
 let seq = 0;
 let fails = 0;
 const ok = (c, m) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  ${m}`); if (!c) fails++; };
@@ -30,7 +31,7 @@ function scenario(label, quotas) {
     console.log(`  ${label.padEnd(34)} cold survivors ${String(survived).padStart(5)}/${COLD_KEYS}` +
         `   cold bytes ${((row('cold').bytes || 0) / 1024).toFixed(0).padStart(5)}KB` +
         `   hot bytes ${((row('hot').bytes || 0) / 1024).toFixed(0).padStart(5)}KB`);
-    TurboCache.native().destroy();
+    __native.destroy();
     return survived;
 }
 

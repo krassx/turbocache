@@ -2,6 +2,7 @@
 // sweeping, primary heartbeat, and atomic RMW.
 const { TurboCache } = require('../src/turbocache');
 const native = require('../src/native');
+const __native = native;
 let fail = 0, n = 0;
 const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
 const mk = o => TurboCache.createPrimary('/tcgap' + process.pid + '_' + (n++), 32 << 20, 1 << 16,
@@ -27,7 +28,7 @@ const mk = o => TurboCache.createPrimary('/tcgap' + process.pid + '_' + (n++), 3
     c.clearLocal();
     const b2 = c.get('mut'); b2[0] = 88;
     ok(c.get('mut')[0] === 1, 'the same holds on the L2 refill path');
-    TurboCache.native().destroy();
+    __native.destroy();
 }
 
 // --- TTL sweeping reclaims eagerly instead of waiting for the tail
@@ -40,7 +41,7 @@ const mk = o => TurboCache.createPrimary('/tcgap' + process.pid + '_' + (n++), 3
         const after = native.stats().live;
         ok(before >= 500 && after <= 2, `expired entries reclaimed (${before} -> ${after})`);
         ok(c.get('keep') === 'forever', 'sweep leaves non-expiring entries alone');
-        TurboCache.native().destroy();
+        __native.destroy();
         stage2();
     }, 800);
 }
@@ -49,7 +50,7 @@ function stage2() {
     // --- heartbeat
     const c = mk({ maintenance: true, maintenanceMs: 40 });
     ok(TurboCache.primaryAgeMs() >= 0 && TurboCache.primaryAgeMs() < 1000, 'primary stamps a heartbeat');
-    TurboCache.native().destroy();
+    __native.destroy();
 
     // --- atomic RMW on the primary
     const d = mk({});
@@ -64,7 +65,7 @@ function stage2() {
     d.incr('t', 1, { ttlMs: 30 });
     const u = Date.now() + 90; while (Date.now() < u);
     ok(d.get('t') === undefined, 'incr honours ttl');
-    TurboCache.native().destroy();
+    __native.destroy();
 
     console.log(fail ? `  ${fail} FAILURES` : '  all passed');
     process.exit(fail ? 1 : 0);

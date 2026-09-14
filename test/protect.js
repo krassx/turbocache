@@ -5,7 +5,7 @@ if (process.argv[2] === 'child') {
   if (!l2.attach(process.argv[3])) { console.error('attach failed'); process.exit(2); }
   console.log('  child: attached read-only, read ok =', l2.get('hello') === 'world');
   console.log('  child: attempting write through the mapping...');
-  l2.poke();
+  l2.__unsafePokeArena();
   console.log('  child: WRITE SUCCEEDED - mapping is NOT protected');
   process.exit(3);
 }

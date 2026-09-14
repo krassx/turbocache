@@ -1,6 +1,7 @@
 // json-fastpath-lint: allow - the counting codec wraps JSON deliberately.
 // Where does JSON actually get called? Count it, do not assume.
 const { TurboCache } = require('../src/turbocache');
+const __native = require('../src/native');
 let enc = 0, dec = 0;
 const COUNTING = { encode: v => { enc++; return JSON.stringify(v); },
                    decode: s => { dec++; return JSON.parse(s); } };
@@ -18,7 +19,7 @@ function run(label, opts, ops) {
     console.log(`    stringify: ${encAfterSets} during sets, ${enc - encAfterSets} during gets`);
     console.log(`    parse    : ${decAfterSets} during sets, ${dec - decAfterSets} during gets` +
                 `  (${((dec - decAfterSets) / ops).toFixed(3)} per get)\n`);
-    TurboCache.native().destroy();
+    __native.destroy();
 }
 
 run('codec mode, working set fits in L1', { codec: COUNTING, l1MaxBytes: 4 << 20 }, 5000);

@@ -13,7 +13,7 @@ if (process.argv[2] === 'child') {
 l2.create(NAME, 16 << 20, 1 << 16, 2);
 l2.setCompressMin(1 << 30);
 for (let i = 0; i < 5000; i++) l2.set('k:' + i, 'v'.repeat(200));
-l2.clearHints();
+l2.__unsafeClearHints();
 console.log('  primary: wrote 5000 keys, then cleared all reference bits ->', l2.hintsSet(), 'set');
 spawnSync(process.execPath, [__filename, 'child', NAME], { stdio: 'inherit' });
 const after = l2.hintsSet();

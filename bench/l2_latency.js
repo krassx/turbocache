@@ -4,6 +4,7 @@
 // case, not what a real keyspace does.
 const { TurboCache } = require('../src/turbocache');
 const native = require('../src/native');
+const __native = native;
 let seq = 0;
 console.log('  values  keyspace   order        L2 hit (getLen, no JS string)   full get()');
 for (const bytes of [64, 1024]) {
@@ -28,6 +29,6 @@ for (const bytes of [64, 1024]) {
             console.log(`  ${String(bytes).padStart(6)}B ${String(nkeys).padStart(9)} ${label.padEnd(12)}` +
                 `${l2.toFixed(0).padStart(20)}ns ${full.toFixed(0).padStart(16)}ns`);
         }
-        TurboCache.native().destroy();
+        __native.destroy();
     }
 }

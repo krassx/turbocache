@@ -1,4 +1,5 @@
 const { TurboCache } = require('../src/turbocache');
+const __native = require('../src/native');
 const JSONC = { encode: JSON.stringify, decode: JSON.parse };
 let fail = 0;
 const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
@@ -25,14 +26,14 @@ ok(g2 !== undefined, 'still resident in L2 after L1 eviction');
 ok(g2 !== obj, 'L2 path returns a freshly decoded object, not the original reference');
 ok(JSON.stringify(g2) === JSON.stringify(obj), 'L2-decoded value matches');
 ok(cache.get('nope') === undefined, 'miss returns undefined');
-TurboCache.native().destroy();
+__native.destroy();
 
 const cf = TurboCache.createPrimary('/tc-codec2-' + process.pid, 8 << 20, 1 << 16,
                                     { codec: JSONC, freeze: true });
 cf.set('fz', { a: { b: 1 } });
 const fz = cf.get('fz');
 ok(Object.isFrozen(fz) && Object.isFrozen(fz.a), 'freeze:true deep-freezes cached objects');
-TurboCache.native().destroy();
+__native.destroy();
 
 console.log(fail ? `${fail} FAILURES` : '  all passed');
 process.exit(fail ? 1 : 0);
