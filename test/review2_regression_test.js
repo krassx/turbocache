@@ -57,5 +57,32 @@ for (const mode of ['direct', 'safe']) {
     c.close();
 }
 
+// The API promises set() never throws and returns a boolean. It threw for a
+// Symbol key (`this.#ns + key`), for an object whose toString throws, and for an
+// options object whose ttlMs getter throws -- all caller-supplied code running
+// inside a method documented not to throw. Non-string keys were also coerced
+// silently, so set(undefined, v) stored under 'undefined' and every plain object
+// aliased to '[object Object]'.
+{
+    const c = mk({});
+    const noThrow = (fn) => { try { return { v: fn() }; } catch (e) { return { threw: e.constructor.name }; } };
+    for (const [label, fn] of [
+        ['Symbol key', () => c.set(Symbol('s'), 'v')],
+        ['key whose toString throws', () => c.set({ toString() { throw new Error('x'); } }, 'v')],
+        ['options whose ttlMs getter throws', () => c.set('k', 'v', { get ttlMs() { throw new Error('x'); } })],
+        ['undefined key', () => c.set(undefined, 'v')],
+        ['plain object key', () => c.set({}, 'v')],
+    ]) {
+        const r = noThrow(fn);
+        ok(r.threw === undefined && r.v === false, `set: ${label} -> false, not a throw (${JSON.stringify(r)})`);
+    }
+    ok(noThrow(() => c.get(Symbol('s'))).v === undefined, 'get: a Symbol key is a miss, not a throw');
+    ok(noThrow(() => c.has(Symbol('s'))).v === false, 'has: a Symbol key is false, not a throw');
+    ok(noThrow(() => c.delete(Symbol('s'))).v === false, 'delete: a Symbol key is false, not a throw');
+    c.set('real', 'v');
+    ok(c.get('real') === 'v', 'a normal string key still works');
+    c.close();
+}
+
 console.log(fails ? `\n  ${fails} FAILED` : '\n  all passed');
 process.exit(fails ? 1 : 0);

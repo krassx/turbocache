@@ -180,6 +180,14 @@ function gcPace() { return { evaluations: gcEvals, debounced: gcDebounced, minIn
 const { performance } = require('perf_hooks');
 const monoMs = () => performance.now();
 
+// Keys are strings. Anything else is a caller error, and the API promises to
+// report those rather than throw -- but `this.#ns + key` throws outright for a
+// Symbol, and runs arbitrary caller code for an object with a toString. It also
+// silently coerced: set(undefined, v) stored under 'undefined', and every plain
+// object aliased to '[object Object]', so two different objects were one key.
+// Reject anything that is not already a string.
+function isStringKey(k) { return typeof k === 'string'; }
+
 const MSG = 'tc';
 const RING_MSG = 'tcr';   // doorbell only: 'your submission rings are non-empty'
 // Max second-chance reprieves per L1 insert. Matches the arena's budget in
@@ -995,6 +1003,7 @@ class TurboCache {
 
     // --- public API (synchronous) ---------------------------------------
     get(key) {
+        if (!isStringKey(key)) return undefined;
         this.#drain();
         key = this.#ns + key;
         // Our own delete has not reached the arena yet; serving L2 here would
@@ -1042,11 +1051,20 @@ class TurboCache {
     set(key, value, opts) {
         this.#checkPrimary();
         this.stats.sets++;
+        if (!isStringKey(key)) {
+            this.stats.rejectedKey = (this.stats.rejectedKey || 0) + 1;
+            this.lastError = `key must be a string, got ${typeof key}`;
+            return false;
+        }
+        // The options object is the caller's, so reading it can throw.
+        let ttlOpt = 0;
+        try { ttlOpt = (opts && opts.ttlMs) || 0; }
+        catch (e) { this.lastError = `reading options failed: ${e.message}`; return false; }
         key = this.#ns + key;
         // uint32 milliseconds from the arena epoch is ~49 days of range; clamp
         // rather than overflow (ttlMs near INT32_MAX used to overflow the
         // seconds conversion and expire immediately).
-        const ttlMs = Math.max(0, Math.min(opts && opts.ttlMs || 0, 0x7fffffff));
+        const ttlMs = Math.max(0, Math.min(ttlOpt, 0x7fffffff));
         // Keys used to be silently truncated at 512 bytes, so distinct keys
         // collided and returned each other's values. Reject instead.
         if (Buffer.byteLength(key) > this.#keyMax) {
@@ -1206,6 +1224,7 @@ class TurboCache {
     // Existence check only: no decode, no promotion into L1, not counted as a
     // hit, and it deliberately leaves the CLOCK reference bit alone.
     has(key) {
+        if (!isStringKey(key)) return false;
         this.#drain();
         key = this.#ns + key;
         // Degraded means the arena is unmapped, so native.has returns undefined.
@@ -1223,6 +1242,7 @@ class TurboCache {
 
     delete(key) {
         this.#checkPrimary();
+        if (!isStringKey(key)) { this.lastError = `key must be a string, got ${typeof key}`; return false; }
         key = this.#ns + key;
         this.stats.deletes++;
         if (this.#id === 0) { const had = native.del(key, 0); this.#l1Drop(key); return had; }
@@ -1288,8 +1308,11 @@ class TurboCache {
             return false;
         }
         this.#checkPrimary();
+        if (!isStringKey(key)) { this.lastError = `key must be a string, got ${typeof key}`; return false; }
+        let ttlIn = 0;
+        try { ttlIn = (opts && opts.ttlMs) || 0; } catch { return false; }
         const full = this.#ns + key;
-        const ttlMs = Math.max(0, Math.min(opts && opts.ttlMs || 0, 0x7fffffff));
+        const ttlMs = Math.max(0, Math.min(ttlIn, 0x7fffffff));
         if (Buffer.byteLength(full) > this.#keyMax) {
             this.stats.rejectedKey = (this.stats.rejectedKey || 0) + 1;
             this.lastError = 'key too long';

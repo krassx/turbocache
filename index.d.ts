@@ -150,8 +150,11 @@ export interface CacheStats {
 }
 
 export interface ArenaStats {
-    live: number; liveBytes: number; evictions: number;
-    inserts: number; allocBytes: number;
+    mode: number; live: number; inserts: number; evictions: number;
+    reappends: number; reappendSkippedNoRoom: number; dropped: number;
+    tailAdvances: number; tailLive: number;
+    liveBytes: number; dataBytes: number; bumpPtr: number;
+    logHead: number; logTail: number; indexSlots: number; ringHead: number;
     [k: string]: number;
 }
 
@@ -202,8 +205,9 @@ export declare class TurboCache<T = unknown> {
     /** Wire the primary to apply worker batches. Idempotent. */
     static install(cluster: unknown): void;
 
-    static arenaStats(): ArenaStats;
-    static namespaceStats(): NamespaceStat[];
+    /** Undefined when no arena is attached (before open, or after close). */
+    static arenaStats(): ArenaStats | undefined;
+    static namespaceStats(): NamespaceStat[] | undefined;
     static submitStats(): SubmitStats | null;
     /** Milliseconds since the primary last stamped its heartbeat; -1 if never. */
     static primaryAgeMs(): number;
@@ -211,6 +215,14 @@ export declare class TurboCache<T = unknown> {
     static defaultName(): string;
     /** Whether the loaded addon was built with LZ4. */
     static hasCompression(): boolean;
+    /** Freeze deeply, neutralising Date/Map/Set mutators that Object.freeze
+     *  cannot reach. Exposed because the codec modes use it. */
+    static deepFreeze<V>(value: V): V;
+    /** Throws if a codec takes a replacer/reviver or indentation. */
+    static assertFastCodec(codec: Codec<unknown>): void;
+    /** Built-in codecs, for callers who want one explicitly. */
+    static readonly JSON_CODEC: Codec<unknown>;
+    static readonly V8_CODEC: Codec<unknown>;
     /** Apply pending worker submissions on the primary. Returns records applied. */
     static drainSubmissions(budget?: number): number;
     /** Heap-guard cadence: evaluations performed, finalizer signals dropped by
@@ -224,9 +236,14 @@ export declare class TurboCache<T = unknown> {
     delete(key: string): boolean;
     /** Numeric counter. On the primary returns the new value; from a worker the
      *  update is applied a tick later and this returns `undefined`. */
-    incr(key: string, by?: number, options?: SetOptions): number | undefined;
-    /** Compare and swap. Primary only. */
-    cas(key: string, expected: T, next: T, options?: SetOptions): boolean;
+    /** Numeric counter. Requires `storage: 'bytes'` — a codec mode cannot
+     *  represent a natively-typed counter, and returns `false` there. On the
+     *  primary returns the new value; from a worker the update is applied a tick
+     *  later and this returns `undefined`. `false` also means a rejected key. */
+    incr(key: string, by?: number, options?: SetOptions): number | undefined | false;
+    /** Compare and swap on a NUMERIC value. Primary only (throws in a worker),
+     *  and requires `storage: 'bytes'` for the same reason as `incr`. */
+    cas(key: string, expected: number, next: number): boolean;
 
     /** Drop this process's L1. The arena is untouched. */
     clearLocal(): void;
@@ -249,11 +266,19 @@ export declare class TurboCache<T = unknown> {
     close(): void;
 
     readonly stats: CacheStats;
-    /** Why the last operation failed, or null. */
+    /** Why the last operation failed, or null. Mutable: the library overwrites
+     *  it, and a caller may clear it. */
     lastError: string | null;
     /** Live heap fraction sampled after the last collection. 0 until the guard
      *  has taken its first reading. */
     readonly liveHeapFraction: number;
+    /** True when this handle has lost its primary and is serving L1 only. */
+    readonly primaryDead: boolean;
+    /** The storage mode in force. */
+    readonly storage: StorageMode;
+
+    /** Stop this cache's heap-guard subscription without closing it. */
+    stopGuard(): void;
 }
 
 export { TurboCache as Cache };

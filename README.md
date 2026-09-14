@@ -59,6 +59,12 @@ supported arrangement.
 | CJS + ESM entry points | yes | yes | yes |
 | post-collection heap guard | yes | yes | yes |
 
+> **Installing under Bun:** Bun blocks postinstall scripts by default, so the
+> addon is never compiled and `require('turbocache')` fails. Add
+> `"trustedDependencies": ["turbocache"]` to your `package.json`, or install
+> with npm. Verified: without it, `bun add` reports "Blocked 1 postinstall" and
+> produces no binary.
+
 Bun runs the entire suite green — every unit test, both transports, and the full
 primary-death recovery sequence — at roughly 15% below Node's throughput. The
 heap guard works on all three: it is driven by a `FinalizationRegistry` rather
