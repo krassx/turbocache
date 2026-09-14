@@ -84,5 +84,38 @@ for (const mode of ['direct', 'safe']) {
     c.close();
 }
 
+// Arena capacity must not be quantised to powers of two. The log used to mask
+// offsets with (dataBytes-1), so the data region was rounded DOWN to a power of
+// two and a 24MB, 26MB, 28MB or 32MB request all yielded exactly 16MB of data -
+// capacity could be doubled but never tuned, and DESIGN 7's formulas named
+// numbers nobody actually got.
+{
+    const seen = [];
+    for (const mb of [24, 26, 28, 32]) {
+        const c = TurboCache.createPrimary('/tcquant' + process.pid + '_' + mb, mb << 20, 1 << 14, { storage: 'bytes' });
+        const data = native.stats().dataBytes;
+        seen.push({ mb, data, frac: data / (mb << 20) });
+        c.close();
+    }
+    for (const r of seen) {
+        ok(r.frac > 0.9, `a ${r.mb}MB arena yields ${(r.data / 1048576).toFixed(1)}MB of data (${(100 * r.frac).toFixed(0)}% of it)`);
+    }
+    const distinct = new Set(seen.map(r => r.data)).size;
+    ok(distinct === seen.length, `each requested size gives a distinct capacity (${distinct}/${seen.length} distinct)`);
+}
+
+// And the log must still be correct when dataBytes is not a power of two.
+{
+    const c = TurboCache.createPrimary('/tcquant2' + process.pid, 26 << 20, 1 << 15, { storage: 'bytes' });
+    const N = 40000, val = (i) => 'v'.repeat(180) + i;
+    for (let i = 0; i < N; i++) c.set('k' + i, val(i));
+    c.clearLocal();
+    let wrong = 0, found = 0;
+    for (let i = 0; i < N; i++) { const v = c.get('k' + i); if (v === undefined) continue; found++; if (v !== val(i)) wrong++; }
+    ok(wrong === 0, `no wrong values across a non-power-of-two log with wrapping (${found} readable, ${wrong} wrong)`);
+    ok(native.stats().evictions > 0, 'the run actually wrapped the log');
+    c.close();
+}
+
 console.log(fails ? `\n  ${fails} FAILED` : '\n  all passed');
 process.exit(fails ? 1 : 0);

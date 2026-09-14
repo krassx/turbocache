@@ -15,7 +15,7 @@
 #include "vendor/rapidhash.h"
 
 static const uint32_t TC_MAGIC = 0x54430001;
-static const uint32_t TC_LAYOUT = 3;   // 2: BigInt words at offset 8; 3: tick-clock epoch + arenaId
+static const uint32_t TC_LAYOUT = 4;   // 2: BigInt words at 8; 3: tick epoch + arenaId; 4: data region no longer power-of-two
 static const uint32_t FEATURE_LZ4 = 1;
 static const uint64_t HASH_EMPTY = 0;
 static const uint64_t HASH_TOMB  = 1;
@@ -153,7 +153,7 @@ struct Store {
   int      attachError = 0;   // 1 = arena needs LZ4 and this build lacks it
   ShmHandle baseHandle, hintsHandle;
 
-  inline Entry *entryAt(uint64_t pos) const { return (Entry *)(data + (pos & (h->dataBytes - 1))); }
+  inline Entry *entryAt(uint64_t pos) const { return (Entry *)(data + (pos % h->dataBytes)); }
   inline uint8_t *keyOf(Entry *e) const { return (uint8_t *)e + sizeof(Entry); }
   inline uint8_t *valOf(Entry *e) const { return (uint8_t *)e + sizeof(Entry) + e->keyLen; }
 
@@ -198,10 +198,18 @@ struct Store {
     if (h->dataOff + MIN_DATA_BYTES > totalBytes) {
       shmClose(base, totalBytes, &baseHandle); base = nullptr; shmUnlink(nm); return false;
     }
-    // MODE_LOG masks with (dataBytes-1), so the data region must be a power of two.
-    // Both modes are rounded identically so the two allocators compete at equal capacity.
-    uint64_t avail = totalBytes - h->dataOff;
-    { uint64_t p = 1; while (p * 2 <= avail) p *= 2; avail = p; }
+    // The data region takes everything that is left, 8-byte aligned.
+    //
+    // It used to be rounded DOWN to a power of two so the log could mask with
+    // (dataBytes-1). That silently discarded up to half the arena: a 24MB, 26MB,
+    // 28MB or 32MB request all yielded exactly 16MB of data, so capacity could
+    // only be doubled, never tuned, and the sizing formulas in DESIGN 7 named
+    // numbers nobody actually got. The log uses a modulo now. Measured on a
+    // dependent chain that is +2.96ns per computation and roughly +9ns on an L2
+    // read (1.8-3.4%); L1 hits do not touch it at all. The index and the
+    // invalidation ring are still powers of two, because open addressing probes
+    // with a mask and that one is on every lookup.
+    uint64_t avail = (totalBytes - h->dataOff) & ~7ull;
     h->dataBytes = avail;
 
     // size classes, growth factor 1.25 (memcached-style) to bound internal waste
@@ -285,7 +293,9 @@ struct Store {
     if (T < sizeof(Header) || T > mapBytes) return false;
     if (!pow2(hh->indexSlots) || hh->indexSlots < 16 || hh->indexSlots > (1ull << 32)) return false;
     if (!pow2(hh->ringCap) || hh->ringCap == 0 || hh->ringCap > (1ull << 24)) return false;
-    if (!pow2(hh->dataBytes) || hh->dataBytes < 4096) return false;
+    // dataBytes is no longer a power of two (see create), so validate the shape
+    // that actually matters: 8-byte aligned, non-trivial, and inside the mapping.
+    if (hh->dataBytes < 4096 || (hh->dataBytes & 7)) return false;
     const uint64_t ib = hh->indexSlots * sizeof(IndexSlot);   // both bounded above, cannot overflow
     const uint64_t rb = hh->ringCap * sizeof(RingRec);
     if ((hh->indexOff & 63) || hh->indexOff < sizeof(Header) || hh->indexOff > T || ib > T - hh->indexOff) return false;

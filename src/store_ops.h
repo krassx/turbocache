@@ -199,7 +199,7 @@ static inline void logDropTail(Store &s, int *budget) {
   Header *h = s.h;
   h->tailAdvances++;
   uint64_t tailPos = h->logTail;
-  uint64_t phys = tailPos & (h->dataBytes - 1);
+  uint64_t phys = tailPos % h->dataBytes;
   uint32_t gap = logGapAt(phys, h->dataBytes);
   if (gap) {                                  // implicit wrap gap: no header here
     h->logTail += gap;
@@ -229,7 +229,7 @@ static inline void logDropTail(Store &s, int *budget) {
     }
     if (liveHere && h->mode == MODE_LOG2 && protect && budget && *budget > 0) {
       uint64_t newPos = h->logHead;
-      uint64_t hp = newPos & (h->dataBytes - 1);
+      uint64_t hp = newPos % h->dataBytes;
       uint64_t freeBytes = h->dataBytes - (h->logHead - h->logTail);
       // Room must be verified BEFORE writing. This branch only runs while the
       // log is under allocation pressure - precisely when free space is scarce -
@@ -292,13 +292,13 @@ static inline int64_t logAlloc(Store &s, uint32_t need) {
   need = (uint32_t)align8(need);
   if (need > h->dataBytes / 2) return -1;
   int budget = g_secondChanceBudget;   // bounded second-chance re-appends per allocation
-  uint64_t mask = h->dataBytes - 1;
+  const uint64_t D = h->dataBytes;
 
   // The head position must be recomputed on every iteration: in MODE_LOG2 a
   // second-chance re-append advances logHead, invalidating any position we
   // captured before the eviction loop ran.
   for (uint64_t guard = 0; guard < 1u << 22; guard++) {
-    uint64_t phys = h->logHead & mask;
+    uint64_t phys = h->logHead % D;
     uint64_t freeBytes = h->dataBytes - (h->logHead - h->logTail);
 
     uint32_t gap = logGapAt(phys, h->dataBytes);

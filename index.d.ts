@@ -124,7 +124,10 @@ export interface OpenOptions<T = unknown> extends PrimaryOptions<T> {
     /** Segment name. Defaults to one derived from the application's identity so
      *  a restart reclaims its own segment. */
     name?: string;
+    /** Total segment size. The data region takes whatever the metadata leaves,
+     *  about 95-97% of this — it is no longer rounded down to a power of two. */
     arenaBytes?: number;
+    /** Index slots. Rounded to a power of two: open addressing probes with a mask. */
     indexSlots?: number;
 }
 
