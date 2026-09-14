@@ -242,6 +242,9 @@ struct Store {
 
   bool attachReadOnly(const char *nm) {
     uint64_t sz = 0;
+    // Same leak as Submit::open: re-attaching without releasing the previous
+    // mapping strands it for the life of the process.
+    if (base) { shmClose(base, mapBytes, &baseHandle); base = nullptr; h = nullptr; }
     base = (uint8_t *)shmOpenRead(nm, &baseHandle, &sz);
     if (!base) return false;
     mapBytes = (size_t)sz; writable = false;

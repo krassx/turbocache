@@ -145,7 +145,14 @@ function gcSubscribe(inst, minIntervalMs) {
         // the floor only takes over once finalizers go quiet.
         if (gcRegistry && monoMs() - gcLastSignal < GC_QUIET_MS) return;
         if (!gcWindow.length) return;
-        gcLastEval = monoMs(); gcEvals++;
+        // The debounce applies here too. gcLastSignal only advances on a
+        // NON-debounced callback, so with minIntervalMs > GC_QUIET_MS every
+        // finalizer after the first was debounced, gcLastSignal froze, this
+        // branch decided the registry had gone quiet, and evaluated once a
+        // second -- ignoring the very setting that was raised to slow it down.
+        const now = monoMs();
+        if (now - gcLastEval < gcMinInterval) { gcDebounced++; return; }
+        gcLastEval = now; gcEvals++;
         gcNotify(Math.min(...gcWindow), h.heap_size_limit);
     }, GC_POLL_MS);
     if (gcTimer.unref) gcTimer.unref();
@@ -215,6 +222,7 @@ class TurboCache {
     #sweepCursor = 0;
     #drainTicks = 0;
     #lastStaleCheck = 0;
+    #noHeartbeatWarned = false;
     #staleMs = 5000;
     #primaryDead = false;
     #keyMax = 1024;
@@ -245,7 +253,13 @@ class TurboCache {
             this.#ns = nsOpt.name + ':';
             // #id is assigned further down, so read the option directly: only the
             // primary may register a namespace; a worker must find it already there.
-            this.#nsId = native.nsResolve(nsOpt.name, nsOpt.quotaBytes || 0, (opts.workerId || 0) === 0);
+            // Only a process that actually created the arena may register a
+            // namespace. `(opts.workerId||0) === 0` is not that test: a worker
+            // constructing a cache directly passes it and then asks the native
+            // layer to write the header through a read-only mapping, which is a
+            // SIGBUS rather than an error.
+            const mayCreate = (opts.workerId || 0) === 0 && isPrimaryProcess;
+            this.#nsId = native.nsResolve(nsOpt.name, nsOpt.quotaBytes || 0, mayCreate);
             if (this.#nsId === -2)
                 throw new Error(`namespace name must be under 24 bytes, got ${Buffer.byteLength(nsOpt.name)}`);
             if (this.#nsId < 0)
@@ -648,7 +662,7 @@ class TurboCache {
         if (TurboCache.#degraded || isPrimaryProcess) return;
         TurboCache.#degraded = true;
         for (const c of instances) {
-            c._setDead(true, `primary heartbeat is ${age < 0 ? 'in the future' : age + 'ms old'}; serving L1 only`);
+            c._setDead(true, `primary heartbeat is ${age === -2 ? 'dated in the future' : age + 'ms old'}; serving L1 only`);
         }
         // Give the ring slot back before unmapping, or it stays owned by this pid
         // in a segment nobody will reclaim.
@@ -894,7 +908,19 @@ class TurboCache {
         if (t - this.#lastStaleCheck < 500) return false;
         this.#lastStaleCheck = t;
         const age = native.heartbeatAgeMs();
-        if (age < 0 || age > this.#staleMs) { TurboCache.#degrade(age); return true; }
+        // -1 is "never stamped", not "dead". A primary running with
+        // maintenance:false never stamps, and treating that as death degraded
+        // every worker permanently on its second read. Say so once, then stop
+        // asking -- without a heartbeat there is no liveness signal to act on.
+        if (age === -1) {
+            if (!this.#noHeartbeatWarned) {
+                this.#noHeartbeatWarned = true;
+                this.lastError = 'the primary has never stamped a heartbeat ' +
+                                 '(maintenance:false?); primary-death detection is off';
+            }
+            return false;
+        }
+        if (age === -2 || age > this.#staleMs) { TurboCache.#degrade(age); return true; }
         return false;
     }
 
@@ -954,6 +980,13 @@ class TurboCache {
             this.#ringIdx = idx;
             this.#ringMaxValue = native.submitMaxValue();
             submitReady = segName;
+            // Seed the arena identity at ATTACH. Without this the first
+            // recovery always reported sameArena:false -- including for a plain
+            // stall of the very same primary, which is the most common outage
+            // and precisely the case the field exists to make readable.
+            if (TurboCache.#arenaId === null) {
+                try { TurboCache.#arenaId = native.arenaId(); } catch { /* not attached */ }
+            }
             return true;
         } catch { return false; }
     }
@@ -1175,6 +1208,9 @@ class TurboCache {
     has(key) {
         this.#drain();
         key = this.#ns + key;
+        // Degraded means the arena is unmapped, so native.has returns undefined.
+        // The declared return type is boolean; L1 is all we can answer from.
+        if (this.#primaryDead) return this.#l1.has(key);
         if (hasLoneSurrogate(key)) return false;
         if (this.#pendingDel.size && this.#pendingDel.has(key)) return false;
         const e = this.#l1.get(key);

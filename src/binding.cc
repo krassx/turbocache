@@ -336,6 +336,7 @@ static napi_value SubmitDel(napi_env env, napi_callback_info info) {
 // so an unbounded drain would trade the worker's stall for a primary stall.
 static napi_value SubmitDrain(napi_env env, napi_callback_info info) {
   ARG(1)
+  NEED_WRITABLE(nullptr)
   napi_value r;
   if (!g_submit.base || !g.base) { napi_create_int32(env, 0, &r); return r; }
   int32_t budget = 4096;
@@ -622,6 +623,10 @@ static napi_value NsResolve(napi_env env, napi_callback_info info) {
   napi_get_value_string_utf8(env, argv[0], nm, sizeof(nm), &n);
   double quota = 0; napi_get_value_double(env, argv[1], &quota);
   bool create = false; napi_get_value_bool(env, argv[2], &create);
+  // Registering a namespace WRITES the header (nsName/nsQuota), so a worker
+  // asking to create one took a SIGBUS on the read-only mapping rather than an
+  // exception it could handle. Looking one up is a pure read and stays allowed.
+  if (create) { NEED_WRITABLE(nullptr) }
   // Names were compared on NS_NAMELEN-1 chars, so two longer names sharing a
   // prefix silently shared one id and one quota. Reject instead of aliasing.
   if (n >= NS_NAMELEN) { napi_value r; napi_create_int32(env, -2, &r); return r; }
@@ -729,12 +734,17 @@ static napi_value HeartbeatAgeMs(napi_env env, napi_callback_info) {
   NEED_STORE(nullptr)
   uint64_t hb = g.h->heartbeatNs.load(std::memory_order_acquire);
   napi_value r;
-  if (!hb) { napi_create_double(env, -1, &r); return r; }   // never stamped
-  // Clamping a past-dated stamp to 0 made a DEAD primary look alive whenever the
-  // clock had moved backwards. Ticks never move backwards, so a stamp in the
-  // future now means a corrupt or foreign header, which is not "healthy".
+  // -1 and -2 mean DIFFERENT things and the caller must be able to tell them
+  // apart. Both used to be -1, and the JS side treated -1 as "dead" -- so
+  // `maintenance: false`, a public documented option, permanently degraded every
+  // worker on its second read, with the message "heartbeat is in the future".
+  //   -1  never stamped: there is no liveness signal at all, which is not the
+  //       same as evidence of death.
+  //   -2  stamped in the future: ticks never run backwards, so this is a corrupt
+  //       or foreign header and is genuinely not healthy.
+  if (!hb) { napi_create_double(env, -1, &r); return r; }
   uint64_t now = ticksNs();
-  napi_create_double(env, now >= hb ? (double)((now - hb) / 1000000ull) : -1, &r);
+  napi_create_double(env, now >= hb ? (double)((now - hb) / 1000000ull) : -2, &r);
   return r;
 }
 
@@ -925,6 +935,8 @@ static void CompactComplete(napi_env env, napi_status, void *data) {
 // compactAsync(maxItems, minBytes, delayUs, coldOnly, cb)
 static napi_value CompactAsync(napi_env env, napi_callback_info info) {
   ARG(5)
+  NEED_STORE(nullptr)
+  NEED_WRITABLE(nullptr)
   int32_t maxItems, minBytes, delayUs; bool coldOnly = false;
   napi_get_value_int32(env, argv[0], &maxItems);
   napi_get_value_int32(env, argv[1], &minBytes);

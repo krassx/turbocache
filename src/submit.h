@@ -152,6 +152,11 @@ struct Submit {
     // or stale segment must fail here rather than produce a bad mask later.
     if (probeHdr.ringCount == 0 || probeHdr.ringCount > 4096) return false;
     if (probeHdr.ringBytes < 4096 || (probeHdr.ringBytes & (probeHdr.ringBytes - 1))) return false;
+    // Close any mapping we already hold. Overwriting `base` leaked the previous
+    // one, and open() is called again on every recovery and on every second
+    // cache in a worker -- measured six full copies (8MB -> 48MB) after five
+    // re-opens, unbounded for an app that opens namespaces dynamically.
+    if (base) { shmClose(base, bytes, &h); base = nullptr; }
     bytes = sizeFor(probeHdr.ringCount, probeHdr.ringBytes);
     base = shmOpenRW(name, bytes, false, &h);
     if (!base) return false;
