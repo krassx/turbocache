@@ -103,13 +103,23 @@ for (const storage of ['direct', 'safe']) {
     throws({ storage: 42 },       ['storage']);
     // `values` is a documented alias, so it gets the same treatment
     throws({ values: 'diret' },   ['values', 'diret']);
+    // The declaration calls codec "mutually exclusive with a storage mode that
+    // implies one"; that was never enforced, and the codec was silently dropped.
+    throws({ storage: 'bytes', codec: TurboCache.JSON_CODEC }, ['without a codec']);
+    throws({ values: 'primitives', codec: TurboCache.JSON_CODEC }, ['without a codec']);
     // a codec that is not one
     throws({ codec: {} },                          ['encode()', 'decode()']);
     throws({ codec: { encode: JSON.stringify } },  ['decode()']);
     throws({ codec: { decode: JSON.parse } },      ['encode()']);
     throws({ codec: 7 },                           ['codec']);
 
-    // ...while everything legitimate still constructs
+    // ...while everything legitimate still constructs.
+    //
+    // destroy() between each: create() on an already-created Store neither
+    // closes the old mapping nor unlinks its name, so without this the run
+    // leaves one arena, one hints segment and one 32MB submission ring behind
+    // per iteration -- they outlive the process, and /dev/shm is commonly
+    // capped at 64MB in a container.
     let built = 0;
     for (const opts of [{}, { storage: 'bytes' }, { storage: 'direct' }, { storage: 'safe' },
                         { storage: 'primitives' }, { codec: null },
@@ -119,9 +129,11 @@ for (const storage of ['direct', 'safe']) {
             TurboCache.createPrimary('/tcsmok' + process.pid + '_' + (n++), 8 << 20, 1 << 13, opts);
             built++;
         } catch (e) { ok(false, `valid options rejected: ${label(opts)} -> ${e.message}`); }
+        __native.destroy();
     }
     ok(built === 8, `all 8 valid configurations still construct (got ${built})`);
-    ok(n - n0 === 18, 'every configuration above was actually attempted');
+    ok(n - n0 === 20, 'every configuration above was actually attempted');
+    // The rejected ones never reach native.create now, so they leak nothing.
 
     // `values` was declared "legacy alias for storage" but was not one: only
     // 'bytes'/'primitives' did anything, because they coincide with the
@@ -135,6 +147,7 @@ for (const storage of ['direct', 'safe']) {
         c.set('o', { a: 1 });
         const got = c.get('o');
         ok(got != null && got.a === 1, `values: '${mode}' round-trips an object`);
+        __native.destroy();                       // as above: create() does not unlink the old arena
     }
     __native.destroy();
 }

@@ -169,7 +169,12 @@ int main() {
     C cases[] = {
       {"indexSlots = 0",          [](Header *h){ h->indexSlots = 0; }},
       {"indexSlots not pow2",     [](Header *h){ h->indexSlots = 4095; }},
-      {"dataBytes not pow2",      [](Header *h){ h->dataBytes = 12345; }},
+      // NOT "not a power of two" -- decision 44 made any size legal. 12345 is
+      // refused for being misaligned (12345 & 7), which is what is asserted.
+      {"dataBytes misaligned",    [](Header *h){ h->dataBytes = 12345; }},
+      {"dataBytes below the floor", [](Header *h){ h->dataBytes = 4095; }},
+      {"retired mode SLAB",       [](Header *h){ h->mode = 0; }},
+      {"retired mode LOG",        [](Header *h){ h->mode = 1; }},
       {"dataOff + dataBytes > T", [](Header *h){ h->dataBytes = h->totalBytes; }},
       {"indexOff inside header",  [](Header *h){ h->indexOff = 8; }},
       {"ringOff overlaps index",  [](Header *h){ h->ringOff = h->indexOff; }},
@@ -204,49 +209,72 @@ int main() {
     ok((exp != 0 && exp <= now), "the naive sweep compare would have deleted it");
   }
 
-  // A miss must not be paid for with sleep. The index keeps pointing at entries
-  // the log has already evicted, and those bytes are some other record now --
-  // their lengths are arbitrary, so the reader's defensive checks can fail on
-  // every retry. Before the liveness gate the reader treated that as "a writer
-  // is mid-update, wait for it" and spun 4096 times calling platformSleepUs(1),
-  // which is usleep on POSIX but a ~1-15ms Sleep() on Windows: seconds per
-  // poisoned read, and a CI timeout instead of a test result. The tail only
-  // advances, so tail > pos is permanent and the miss is knowable immediately.
+  // A stale index observation must not be paid for with sleep.
   //
-  // The bound here is three orders of magnitude away from both outcomes, so it
-  // is a pathology detector, not a performance assertion.
+  // A reader matches idx[i].hash, then the primary evicts that slot and the log
+  // head laps the record's bytes before the reader loads idx[i].off. The reader
+  // is now pointed at somebody else's payload, so `seq` and the lengths are
+  // arbitrary -- and the retry loop treated that as "a writer is mid-update",
+  // spinning all 4096 iterations with platformSleepUs(1). Measured at 11.7ms for
+  // ONE get on macOS, and Sleep(1) on Windows is 1-15ms, so seconds of blocked
+  // event loop. The tail only advances, so tail > pos settles it immediately.
+  //
+  // This replaces an assertion that could not fail. It read 20k keys from an
+  // arena under heavy eviction and asserted the total stayed under 5s, on the
+  // theory that the index was "full of evicted entries". It is not: eviction
+  // runs unlinkSlot -> indexRemove, which clears the slot before the bytes are
+  // reused, so every one of those misses resolved at HASH_EMPTY without ever
+  // entering the retry loop (instrumented: 0 retries in 20000 reads). The state
+  // only arises from the concurrent interleaving above, which a single-threaded
+  // test cannot produce by running a workload -- so it is constructed here.
   {
-    const char* NM2 = "/tcstaleretrytest";
-    shmUnlink(NM2);
+    const char* NM3 = "/tcstaleobs";
+    shmUnlink(NM3);
     Store t;
-    if (!t.create(NM2, 26u << 20, 1u << 14, MODE_LOG2)) { ok(false, "create failed"); }
+    if (!t.create(NM3, 26u << 20, 1u << 14, MODE_LOG2)) { ok(false, "create failed"); }
     else {
       std::vector<uint8_t> val(400, 'v');
       char key[32];
-      const int N = 20000;                     // ~8MB of payload into ~25MB: evicts hard
-      for (int i = 0; i < N; i++) {
-        int kl = snprintf(key, sizeof key, "key%d", i);
+      const uint16_t VK = 6;
+      storeSet(t, (const uint8_t*)"victim", VK, val.data(), 400, 400, FLAG_STRING, 0, 0, 0);
+      uint64_t hash = rapidhash_withSeed("victim", VK, 0);
+      if (hash <= HASH_TOMB) hash += 2;
+      int64_t slot = t.findSlot(hash, (const uint8_t*)"victim", VK);
+      uint64_t pos = t.idx[slot].off.load(std::memory_order_relaxed);
+
+      for (int i = 0; i < 80000; i++) {            // lap the log well past it
+        int kl = snprintf(key, sizeof key, "k%d", i);
         storeSet(t, (const uint8_t*)key, (uint16_t)kl, val.data(), 400, 400,
                  FLAG_STRING, 0, 0, 0);
       }
+      ok(t.h->logTail > pos, "the victim's position really was lapped");
+
+      // A lapped position lands wherever the new records now lie -- usually the
+      // middle of one, so the "header" there is payload, not an Entry.
+      pos += 24;
+      t.idx[slot].hash.store(hash, std::memory_order_release);
+      t.idx[slot].off.store(pos, std::memory_order_release);
+      Entry *stale = t.entryAt(pos);
+      ok((stale->seq.load(std::memory_order_relaxed) & 1) == 0 &&
+         (uint64_t)sizeof(Entry) + stale->keyLen + stale->storedLen >
+             t.h->dataBytes - (pos % t.h->dataBytes),
+         "the stale bytes look stable but fail the bound check, so they retry");
+
       uint8_t buf[8192]; ReadResult rr;
-      int hits = 0;
+      const int N = 100;
       auto t0 = std::chrono::steady_clock::now();
-      for (int i = 0; i < N; i++) {
-        int kl = snprintf(key, sizeof key, "key%d", i);
-        if (storeGet(t, (const uint8_t*)key, (uint16_t)kl, buf, sizeof buf, &rr, 0)) hits++;
-      }
+      int hits = 0;
+      for (int i = 0; i < N; i++)
+        if (storeGet(t, (const uint8_t*)"victim", VK, buf, sizeof buf, &rr, 0)) hits++;
       double ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count();
       char m[160];
-      snprintf(m, sizeof m,
-               "%d reads over an index full of evicted entries took %.0f ms (< 5000)",
-               N, ms);
-      ok(ms < 5000.0, m);
-      ok(hits > 0 && hits < N, "the read mix really was part hit, part evicted miss");
+      snprintf(m, sizeof m, "%d reads of a stale index observation took %.1f ms (< 50)", N, ms);
+      ok(ms < 50.0, m);
+      ok(hits == 0, "a stale index observation is a miss, not a hit");
       t.destroy();
     }
-    shmUnlink(NM2);
+    shmUnlink(NM3);
   }
 
   s.destroy(); shmUnlink(NM);

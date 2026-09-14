@@ -528,6 +528,7 @@ class TurboCache {
     // create it again. Several namespaces in one process is a normal thing to
     // want and there was previously no way to express it.
     static open(opts = {}) {
+        TurboCache.#assertStorageOptions(opts);   // see createPrimary
         const cluster = require('cluster');
         if (storeReady) {
             // The caller's opts used to be spread AFTER the computed id, so
@@ -615,6 +616,22 @@ class TurboCache {
             throw new TypeError(`turbocache: codec must be an object with encode and decode ` +
                                 `functions; got ${typeof codec}.`);
         }
+        // The declaration says codec is "mutually exclusive with a storage mode
+        // that implies one", and it was not enforced: `storage: 'bytes'` plus a
+        // codec was accepted and the codec silently discarded -- encode() never
+        // called, objects rejected by set(). 'direct' and 'safe' genuinely do
+        // take an override (the preset is `opts.codec || <builtin>`); only the
+        // no-codec modes contradict one.
+        const noCodecMode = ['bytes', 'primitives'];
+        for (const key of ['storage', 'values']) {
+            if (noCodecMode.includes(opts[key])) {
+                throw new TypeError(
+                    `turbocache: ${key}: '${opts[key]}' stores values without a codec, ` +
+                    `so a codec cannot be used with it. Drop the codec, or use ` +
+                    `storage: 'direct' or 'safe' (both accept a codec override).`);
+            }
+        }
+
         const missing = ['encode', 'decode'].filter(k => typeof codec[k] !== 'function');
         if (missing.length) {
             throw new TypeError(
@@ -834,6 +851,11 @@ class TurboCache {
     static submitStats() { try { return native.submitStats(); } catch { return null; } }
 
     static createPrimary(name, arenaBytes, indexSlots, opts = {}) {
+        // BEFORE any native call. The constructor validates too, but by the
+        // time it runs, create()/attach() have already made a shm segment that
+        // nothing in the throw path unlinks -- verified: the arena outlived the
+        // process that threw. Validation must precede the side effect.
+        TurboCache.#assertStorageOptions(opts);
         if (!native.create(name, arenaBytes, indexSlots, 2)) throw new Error(TurboCache.#createError(arenaBytes));
         // Compression is off unless the caller explicitly asks AND the addon was
         // built with LZ4. Measured a bad trade (see DESIGN.md), so it is neither
@@ -864,6 +886,7 @@ class TurboCache {
         return c;
     }
     static attachWorker(name, workerId, opts = {}) {
+        TurboCache.#assertStorageOptions(opts);   // see createPrimary
         // Worker ids must be >= 1. `#id === 0` is how every method recognises the
         // primary, so a worker attached as 0 takes the primary's WRITE path and
         // calls into the native writer against a read-only mapping. That does not

@@ -468,6 +468,22 @@ static inline bool storeGet(Store &s, const uint8_t *key, uint16_t keyLen,
   // yield, since the writer always finishes.
   for (int retry = 0; retry < 4096; retry++) {
     if (retry > 64) platformSleepUs(1);
+      // Retrying is only ever right when a WRITER is mid-update. If the index
+      // observation is stale -- we matched idx[i].hash, then the primary evicted
+      // that slot and the head lapped these bytes before we loaded idx[i].off --
+      // the bytes here are somebody's payload, so `seq` and the lengths are
+      // arbitrary and the checks below fail identically on all 4096 iterations,
+      // 4031 of them sleeping. Measured: 11.7ms for ONE get on macOS, and
+      // platformSleepUs is a 1-15ms Sleep() on Windows, so seconds of a blocked
+      // event loop. Only reachable by racing an eviction, so it is a tail-latency
+      // cliff rather than a steady cost -- but the predicate is permanently
+      // false, and waiting on it cannot help.
+      //
+      // The tail only advances, so tail > pos proves the record is dead NOW.
+      // relaxed is enough: a stale (smaller) tail only declines the shortcut,
+      // and the authoritative seq_cst check after the copy is unchanged. Gated
+      // on `retry` so the first, overwhelmingly common iteration pays nothing.
+      if (retry && h->tailPub.load(std::memory_order_relaxed) > pos) return false;
       uint32_t s1 = e->seq.load(std::memory_order_acquire);
       if (s1 & 1) continue;                                  // writer mid-update
       uint16_t kl = e->keyLen; uint32_t sl = e->storedLen, rl = e->rawLen;
