@@ -23,8 +23,14 @@ let failed = [];
 const run = (file, env) => {
     const label = file + (env && env.TC_T ? ` [${env.TC_T}]` : '');
     process.stdout.write(`--- ${label}\n`);
-    try { execFileSync(process.execPath, [path.join(__dirname, file)], { stdio: 'inherit', env: { ...process.env, ...env } }); }
-    catch { failed.push(label); }
+    try {
+        // A per-test timeout, because without one a hang wedges CI until the
+        // job-level limit kills it with no indication of which test hung.
+        execFileSync(process.execPath, [path.join(__dirname, file)],
+            { stdio: 'inherit', env: { ...process.env, ...env }, timeout: 180000 });
+    } catch (e) {
+        failed.push(label + (e && e.signal === 'SIGTERM' ? ' (TIMED OUT)' : ''));
+    }
 };
 for (const f of SUITE) run(f, null);
 for (const [f, env] of MATRIX) run(f, env);

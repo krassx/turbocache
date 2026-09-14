@@ -50,6 +50,34 @@ const rt = typeof Bun !== 'undefined' ? 'bun' : (typeof Deno !== 'undefined' ? '
     c2.close();
     c.close();
 
+    // The floor poll is the fallback for when finalizers go quiet, and nothing
+    // exercised it: the loop above breaks on the first shed, and GC_QUIET_MS
+    // (5s) is the whole window, so instrumenting both notify sites showed
+    // registry 1 / floor 0 on every run. DESIGN claimed this file covered "the
+    // registry path and the backstop alone". Drive the backstop explicitly by
+    // making the registry unavailable for the duration.
+    {
+        const RealFR = globalThis.FinalizationRegistry;
+        globalThis.FinalizationRegistry = undefined;     // gcSubscribe must fall back
+        let shed = 0, frac = 0;
+        try {
+            const c3 = TurboCache.createPrimary('/tcguard3' + process.pid, 32 << 20, 1 << 16,
+                { storage: 'bytes', l1MaxBytes: 8 << 20, heapGuard: { maxHeapFraction: 0.0001, shedFraction: 0.5 } });
+            for (let i = 0; i < 20000; i++) c3.set('k' + i, 'v'.repeat(200));
+            const deadline = Date.now() + 6000;          // must outlast the 1s poll
+            while (Date.now() < deadline) {
+                const junk = []; for (let i = 0; i < 30000; i++) junk.push({ i, s: 'g'.repeat(60) });
+                if (junk.length < 0) throw new Error('unreachable');
+                await new Promise(r => setTimeout(r, 15));
+                if ((c3.stats.heapShed || 0) > 0 && c3.liveHeapFraction > 0) break;
+            }
+            shed = c3.stats.heapShed || 0; frac = c3.liveHeapFraction;
+            c3.close();
+        } finally { globalThis.FinalizationRegistry = RealFR; }
+        ok(frac > 0 && shed > 0,
+           `[${rt}] the floor-poll backstop alone drives the guard (heapShed=${shed}, fraction=${frac.toExponential(2)})`);
+    }
+
     console.log(fails ? `\n  ${fails} FAILED` : '\n  all passed');
     process.exit(fails ? 1 : 0);
 })();

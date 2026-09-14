@@ -1,3 +1,4 @@
+'use strict';
 const { TurboCache } = require('../src/turbocache');
 let fail = 0, n = 0;
 const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
@@ -16,8 +17,14 @@ const mk = storage => TurboCache.createPrimary('/tcsm' + process.pid + '_' + (n+
     ok(a.bytes instanceof Uint8Array && a.big === 2n ** 100n, 'direct: TypedArray/BigInt preserved');
     ok(a === b, 'direct: repeat reads return the SAME object (no per-read work)');
     ok(Object.isFrozen(a), 'direct: result is frozen');
-    let threw = false; try { 'use strict'; a.when = 1; } catch { threw = true; }
-    ok(threw || a.when instanceof Date, 'direct: mutation cannot corrupt the cache');
+    // A block-level 'use strict' is a no-op expression statement in a sloppy
+    // file, so the assignment silently failed and this passed on the second
+    // disjunct -- "mutation throws" was never actually tested. A frozen object
+    // in strict mode must throw, and the whole file is strict now.
+    let threw = false; try { a.when = 1; } catch { threw = true; }
+    ok(threw, 'direct: assigning to a frozen cached value throws');
+    let mutThrew = false; try { a.when.setTime(0); } catch { mutThrew = true; }
+    ok(mutThrew, 'direct: a Date mutator on a frozen value throws (Object.freeze cannot seal it)');
     // Documented hole: typed-array contents cannot be frozen in JS.
     ok(!Object.isFrozen(a.bytes), 'direct: typed arrays are NOT frozen (JS cannot)');
     a.bytes[0] = 99;

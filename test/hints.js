@@ -18,7 +18,12 @@ console.log('  primary: wrote 5000 keys, then cleared all reference bits ->', l2
 spawnSync(process.execPath, [__filename, 'child', NAME], { stdio: 'inherit' });
 const after = l2.hintsSet();
 console.log('  primary: after the child read 100 keys ->', after, 'set');
-console.log(after >= 90 && after <= 110
+// Printing FAIL and exiting 0 is not a test. CI runs this as a gate, so it
+// reported success no matter what the child did -- verified by forcing the
+// failure branch, which still exited 0.
+const pass = after >= 90 && after <= 110;
+console.log(pass
   ? '  PASS: worker reference bits are visible to the primary, from a read-only arena mapping'
   : `  FAIL: expected ~100, got ${after}`);
 l2.destroy();
+process.exit(pass ? 0 : 1);

@@ -66,7 +66,10 @@ const withQuota = scenario('cold 1MB / hot 2MB quota', { cold: 1 << 20, hot: 2 <
 // `withQuota > noQuota * 5` is vacuous when noQuota is 0, which it is: 0 > 0 is
 // false, so the whole suite hinged on a comparison that could only ever fail by
 // accident. Assert the thing that actually matters instead.
-ok(noQuota === 0 || withQuota > noQuota * 5,
+// `noQuota === 0 ||` short-circuits, so this could only ever pass. The point is
+// that a quota changes the outcome, so assert the outcome directly.
+ok(noQuota < 100, `without a quota the cold set is evicted (${noQuota}/1000 survived)`);
+ok(withQuota > noQuota * 5,
    `quota beats no-quota (${noQuota} -> ${withQuota} survivors)`);
 ok(withQuota > 500, `a quota protects most of the cold set (${withQuota}/1000 survived)`);
 console.log(fails ? `\n  ${fails} FAILED` : '\n  all passed');

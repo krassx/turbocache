@@ -88,11 +88,20 @@ ok(typeof Cache === 'function', 'Cache alias is exported as the docs describe');
 // as 0 takes the primary's write path against a read-only mapping and blocks
 // the event loop forever on its first set() -- no throw, no crash, no log.
 {
-    let threw = 0;
+    // Attach against a segment that EXISTS, so the only thing that can reject is
+    // the id itself. Pointing at a nonexistent segment made this vacuous:
+    // native.attach throws for any id, so `threw === 6` held even with the
+    // validation deleted -- verified by deleting it, and the test still passed.
+    const live = '/tcwid' + process.pid;
+    const primary = TurboCache.createPrimary(live, 8 << 20, 1 << 14, { storage: 'bytes' });
+    let threw = 0, messages = 0;
     for (const bad of [0, -1, 1.5, null, undefined, 'x']) {
-        try { TurboCache.attachWorker('/tcnope' + process.pid, bad); } catch { threw++; }
+        try { TurboCache.attachWorker(live, bad); }
+        catch (e) { threw++; if (/workerId must be/.test(e.message)) messages++; }
     }
     ok(threw === 6, 'attachWorker rejects every non-positive-integer workerId');
+    ok(messages === 6, 'each rejection is the workerId check, not an attach failure');
+    primary.close();
     let coerced = false;
     try { TurboCache.attachWorker('/tcnope' + process.pid, '3'); } catch (e) { coerced = !/workerId must be/.test(e.message); }
     ok(coerced, "numeric string workerId '3' is coerced, not rejected");
