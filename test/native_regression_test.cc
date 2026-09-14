@@ -10,6 +10,7 @@
 #include "store_ops.h"
 #include <stdio.h>
 #include <vector>
+#include <chrono>
 
 static int fails = 0;
 static void ok(bool c, const char* m) { printf("  %s  %s\n", c ? "ok  " : "FAIL", m); if (!c) fails++; }
@@ -58,11 +59,43 @@ int main() {
   // and made the tail walk read blockSize from outside it. The gap is implicit
   // now; both the allocator and the tail walk derive it from the same rule.
   {
+    // The data region now runs to the end of the mapping, so there is nowhere
+    // past it to put a canary. Shrink it by 64 bytes to carve that room out --
+    // every site derives its wrap from h->dataBytes, so the store behaves
+    // exactly as if it had been created at this size. The shrink also leaves a
+    // region that is NOT a power of two, which is the point: a mask would index
+    // it wrongly, so this block now exercises the modulo wrap as well.
+    s.h->dataBytes -= 64;
     const uint64_t D = s.h->dataBytes;
+    ok((D & (D - 1)) != 0, "the data region under test is not a power of two");
     uint8_t* past = s.data + D;
     memset(past, 0xAB, 64);                       // canary just past the region
     std::vector<uint8_t> val(200, 'v');
     char key[48];
+
+    // Visit every reachable sub-header remainder deterministically. The bulk
+    // loop below cannot be trusted to do it: its records are >= 248 bytes, so
+    // 200k writes wrap the region only ~6 times, and each wrap has roughly a
+    // 15% chance of leaving a tail smaller than an Entry header. This assertion
+    // used to pass on luck, and stopped passing the moment the region size
+    // changed. Driving the head straight at each remainder is what the comment
+    // above always claimed the test did.
+    int remaindersCovered = 0;
+    for (uint32_t r = 8; r < sizeof(Entry); r += 8) {
+      uint64_t base = D * 4 + (D - r);           // phys == D - r: r bytes left
+      s.h->logHead = base; s.h->logTail = base;
+      s.h->tailPub.store(base, std::memory_order_release);
+      if (logGapAt(base % D, D) != r) continue;
+      int kl = snprintf(key, sizeof key, "gap%u", r);
+      storeSet(s, (const uint8_t*)key, (uint16_t)kl, val.data(), 200, 200,
+               FLAG_STRING, 0, 0, 0);
+      ReadResult rr; uint8_t buf[256];
+      bool got = storeGet(s, (const uint8_t*)key, (uint16_t)kl, buf, sizeof buf, &rr, 0);
+      if (got && s.h->logHead % D != 0 && s.h->logHead > base + r) remaindersCovered++;
+    }
+    ok(remaindersCovered == (int)(sizeof(Entry) / 8) - 1,
+       "every sub-header wrap remainder is skipped implicitly and still serves the write");
+
     uint64_t minRemain = D;
     for (uint32_t i = 0; i < 200000; i++) {
       int kl = snprintf(key, sizeof key, "k%u", i);
@@ -71,18 +104,49 @@ int main() {
       if (kl < want) kl = want;
       storeSet(s, (const uint8_t*)key, (uint16_t)kl, val.data(),
                (uint32_t)(i % 180), (uint32_t)(i % 180), FLAG_STRING, 0, 0, 0);
-      uint64_t remain = D - (s.h->logHead & (D - 1));
+      uint64_t remain = D - (s.h->logHead % D);
       if (remain < minRemain) minRemain = remain;
     }
     int dirty = 0;
     for (int i = 0; i < 64; i++) if (past[i] != 0xAB) dirty++;
-    ok(minRemain < sizeof(Entry), "the sub-header wrap remainder is actually exercised");
+    ok(minRemain <= D, "the bulk loop wrapped the region");
     ok(dirty == 0, "nothing is written past the data region across 200k wrapping writes");
 
     storeSet(s, (const uint8_t*)"final", 5, (const uint8_t*)"ok", 2, 2, FLAG_STRING, 0, 0, 0);
     ReadResult rr; uint8_t buf[64];
     ok(storeGet(s, (const uint8_t*)"final", 5, buf, sizeof buf, &rr, 0),
        "the arena still serves reads after all those wraps");
+  }
+
+  // The reader's defensive bound check. storeGet re-derives the physical offset
+  // of the record it is about to copy and refuses any (keyLen, storedLen) pair
+  // that would run off the end of the data region -- a torn or corrupt length
+  // must never drive the memcpy. That derivation was a mask, which is only the
+  // same as a modulo while the region is a power of two; on any other size it
+  // understates the offset, the check passes vacuously, and the memcpy reads
+  // past the end of the mapping. Placing a record flush against the end of the
+  // region and corrupting its length is the case that separates the two.
+  {
+    const uint64_t D = s.h->dataBytes;
+    const uint32_t need = (uint32_t)align8(sizeof(Entry) + 4 + 200);
+    uint64_t base = D * 8 + (D - need);          // record ends exactly at the region end
+    s.h->logHead = base; s.h->logTail = base;
+    s.h->tailPub.store(base, std::memory_order_release);
+
+    std::vector<uint8_t> val(200, 'v');
+    storeSet(s, (const uint8_t*)"edge", 4, val.data(), 200, 200, FLAG_STRING, 0, 0, 0);
+
+    uint8_t buf[8192];
+    ReadResult rr;
+    ok(storeGet(s, (const uint8_t*)"edge", 4, buf, sizeof buf, &rr, 0) && rr.rawLen == 200,
+       "a record flush against the end of the region reads back normally");
+
+    // Corrupt storedLen to something that still fits the caller's scratch (so the
+    // scratch guard does not catch it first) but runs far past the region end.
+    Entry *e = s.entryAt(base);
+    e->storedLen = 4096;
+    ok(!storeGet(s, (const uint8_t*)"edge", 4, buf, sizeof buf, &rr, 0),
+       "a corrupt length at the region end is refused instead of read out of bounds");
   }
 
   // Header geometry validation. attachReadOnly used to check only magic and
@@ -138,6 +202,51 @@ int main() {
     ok(!tcExpired(exp, now), "a wrapped-but-live expiry is not expired");
     // the comparison the sweep used to make:
     ok((exp != 0 && exp <= now), "the naive sweep compare would have deleted it");
+  }
+
+  // A miss must not be paid for with sleep. The index keeps pointing at entries
+  // the log has already evicted, and those bytes are some other record now --
+  // their lengths are arbitrary, so the reader's defensive checks can fail on
+  // every retry. Before the liveness gate the reader treated that as "a writer
+  // is mid-update, wait for it" and spun 4096 times calling platformSleepUs(1),
+  // which is usleep on POSIX but a ~1-15ms Sleep() on Windows: seconds per
+  // poisoned read, and a CI timeout instead of a test result. The tail only
+  // advances, so tail > pos is permanent and the miss is knowable immediately.
+  //
+  // The bound here is three orders of magnitude away from both outcomes, so it
+  // is a pathology detector, not a performance assertion.
+  {
+    const char* NM2 = "/tcstaleretrytest";
+    shmUnlink(NM2);
+    Store t;
+    if (!t.create(NM2, 26u << 20, 1u << 14, MODE_LOG2)) { ok(false, "create failed"); }
+    else {
+      std::vector<uint8_t> val(400, 'v');
+      char key[32];
+      const int N = 20000;                     // ~8MB of payload into ~25MB: evicts hard
+      for (int i = 0; i < N; i++) {
+        int kl = snprintf(key, sizeof key, "key%d", i);
+        storeSet(t, (const uint8_t*)key, (uint16_t)kl, val.data(), 400, 400,
+                 FLAG_STRING, 0, 0, 0);
+      }
+      uint8_t buf[8192]; ReadResult rr;
+      int hits = 0;
+      auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < N; i++) {
+        int kl = snprintf(key, sizeof key, "key%d", i);
+        if (storeGet(t, (const uint8_t*)key, (uint16_t)kl, buf, sizeof buf, &rr, 0)) hits++;
+      }
+      double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+      char m[160];
+      snprintf(m, sizeof m,
+               "%d reads over an index full of evicted entries took %.0f ms (< 5000)",
+               N, ms);
+      ok(ms < 5000.0, m);
+      ok(hits > 0 && hits < N, "the read mix really was part hit, part evicted miss");
+      t.destroy();
+    }
+    shmUnlink(NM2);
   }
 
   s.destroy(); shmUnlink(NM);

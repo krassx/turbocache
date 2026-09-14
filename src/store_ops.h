@@ -598,7 +598,10 @@ static inline bool storeGet(Store &s, const uint8_t *key, uint16_t keyLen,
     if (hv == HASH_EMPTY) return false;
     if (hv != hash) continue;
     uint64_t pos = s.idx[i].off.load(std::memory_order_acquire);
-    Entry *e = s.entryAt(pos);
+    // One modulo per read, not one per retry: the position cannot change under
+    // us, so its physical offset cannot either.
+    uint64_t phys = pos % h->dataBytes;
+    Entry *e = (Entry *)(s.data + phys);
 
     // A tight 8-spin is shorter than a single incr, so a concurrent update storm
   // made 0.04% of reads of a permanently-present key report as missing -- which
@@ -611,7 +614,6 @@ static inline bool storeGet(Store &s, const uint8_t *key, uint16_t keyLen,
       uint16_t kl = e->keyLen; uint32_t sl = e->storedLen, rl = e->rawLen;
       uint8_t fl = e->flags; uint32_t exp = e->expiresAt; uint64_t eh = e->hash;
       // Defensive: a torn or corrupt length must never drive a memcpy.
-      uint64_t phys = pos & (h->dataBytes - 1);
       if ((uint64_t)sizeof(Entry) + kl + sl > h->dataBytes - phys) continue;
       if (sl > scratchCap || kl != keyLen) break;
       if (memcmp(s.keyOf(e), key, keyLen) != 0) break;

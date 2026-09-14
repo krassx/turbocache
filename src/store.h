@@ -49,7 +49,7 @@ struct Entry {
 struct IndexSlot {
   std::atomic<uint64_t> hash;  // 0 empty, 1 tombstone, else hash
   // MONOTONIC log position of the entry, not a physical offset. Physical
-  // address is pos & (dataBytes-1). Because the position never wraps, a reader
+  // address is pos % dataBytes. Because the position never wraps, a reader
   // can prove a record has not been evicted by checking logTail <= pos, which a
   // physical offset cannot express (offsets are reused every time the log wraps).
   std::atomic<uint64_t> off;
@@ -107,7 +107,7 @@ struct Header {
   uint64_t clockHand;
 
   // log state
-  uint64_t logHead, logTail;   // monotonic byte counters; & (dataBytes-1) to index
+  uint64_t logHead, logTail;   // monotonic byte counters; % dataBytes to index
 
   // stats
   uint64_t inserts, evictions, live, liveBytes, allocBytes;

@@ -954,7 +954,7 @@ static napi_value CompactAsync(napi_env env, napi_callback_info info) {
   uint64_t cur = h->logTail;
   int scanned = 0;
   while (cur < h->logHead && (int)j->items.size() < maxItems && scanned < maxItems * 8) {
-    uint64_t phys = cur & (h->dataBytes - 1);
+    uint64_t phys = cur % h->dataBytes;
     Entry *e = g.entryAt(phys);
     uint32_t bsz = e->blockSize;
     if (bsz == 0 || bsz > h->dataBytes) break;
