@@ -96,6 +96,30 @@ correctness rested on the runtime deriving an address from a non-zero
 exactly-sized buffer removes the dependency (and stops each cached typed array
 pinning a pool slab on every runtime); see DESIGN.md decision 46.
 
+## Releasing
+
+Tag-driven. `git tag v0.1.0 && git push --tags` runs the release workflow: it
+builds a prebuild on each target, verifies every one of them loads and passes
+the suite, refuses to continue unless all six arrived and the tag matches
+`package.json`, then publishes.
+
+Authentication is **trusted publishing** ([npm OIDC][tp]) — the workflow proves
+its identity to npm directly, so there is no long-lived token in repository
+secrets to leak, steal or forget to rotate, and provenance is attached
+automatically.
+
+One exception: a trusted publisher is configured in an *existing* package's
+settings, so the first version cannot use it. Publish once via
+`workflow_dispatch` with `bootstrap: true` (which uses `NPM_TOKEN`), then:
+
+1. npmjs.com → the package → Settings → Trusted Publisher → GitHub Actions
+2. organization `krassx`, repository `turbokv`, workflow `release.yml`
+3. delete the `NPM_TOKEN` secret and revoke the token
+
+After that the bootstrap path cannot authenticate at all, which is the point.
+
+[tp]: https://docs.npmjs.com/trusted-publishers/
+
 ## Layout
 
 ```
