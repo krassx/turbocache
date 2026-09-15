@@ -50,6 +50,12 @@ jobs:
       # ubuntu-22.04 rather than -latest deliberately: a prebuild links the
       # glibc it was built against, so the OLDEST supported runner gives the
       # widest compatibility. Building on 24.04 would refuse to load on 22.04.
+      # node-gyp-build is a RUNTIME dependency: it resolves the addon, so the
+      # verification and smoke-test steps below cannot require src/native
+      # without it. --ignore-scripts because prebuildify does the build.
+      - name: Runtime dependencies
+        run: npm install --omit=dev --ignore-scripts --no-audit --no-fund
+
       - name: Build prebuild
         run: npx --yes prebuildify@^6 --napi --strip
 
@@ -86,6 +92,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Toolchain
         run: apk add --no-cache python3 make g++
+      # node-gyp-build is a RUNTIME dependency: it resolves the addon, so the
+      # verification and smoke-test steps below cannot require src/native
+      # without it. --ignore-scripts because prebuildify does the build.
+      - name: Runtime dependencies
+        run: npm install --omit=dev --ignore-scripts --no-audit --no-fund
+
       - name: Build prebuild
         run: npx --yes prebuildify@^6 --napi --strip --tag-libc
       - name: It must load, and it must be the prebuild that loaded
