@@ -1,7 +1,7 @@
 'use strict';
 // 1 primary + N workers over a SHARED keyspace, so workers genuinely interfere:
 // each worker's writes invalidate the others' L1 copies, and every L1 miss must
-// cross the process boundary — IPC for bugsee, shared memory for turbocache.
+// cross the process boundary — IPC for bugsee, shared memory for turbokv.
 const cluster = require('cluster');
 const { run, buildPlan, BUGSEE } = require('./workload');
 const { turboOpts, turboAdapter, bugseeAdapter } = require('./adapters');
@@ -18,10 +18,10 @@ const ARENA = '/tccm' + process.pid;
 if (cluster.isPrimary) {
     let srv = null;
     if (IMPL === 'turbo') {
-        const { TurboCache } = require('../src/turbocache');
-        TurboCache.createPrimary(ARENA, L2, 1 << 20, turboOpts(MODE, L1));
+        const { TurboKV } = require('../src/turbokv');
+        TurboKV.createPrimary(ARENA, L2, 1 << 20, turboOpts(MODE, L1));
         process.env.TC_ARENA = ARENA;
-        TurboCache.install(cluster);
+        TurboKV.install(cluster);
     } else {
         srv = new (require(BUGSEE).IpcServer)({ maxBytes: L2 });
         const h = srv.createOnMessage();
@@ -53,8 +53,8 @@ if (cluster.isPrimary) {
         const id = Number(process.env.WORKER_ID);
         let adapter;
         if (IMPL === 'turbo') {
-            const { TurboCache } = require('../src/turbocache');
-            const c = TurboCache.attachWorker(process.env.TC_ARENA, id, turboOpts(MODE, L1));
+            const { TurboKV } = require('../src/turbokv');
+            const c = TurboKV.attachWorker(process.env.TC_ARENA, id, turboOpts(MODE, L1));
             adapter = turboAdapter(MODE, c);
             adapter._flush = () => c.flush();
         } else {

@@ -1,9 +1,9 @@
 'use strict';
 // What can the cluster IPC channel actually carry, with no cache in the way?
 // This bounds ANY pipe-based transport and tells us whether the 60k writes/s
-// ceiling is the channel itself or turbocache's congestion policy sitting on
+// ceiling is the channel itself or turbokv's congestion policy sitting on
 // top of it. Sends fixed-size payloads, respecting process.send()'s backpressure
-// exactly the way turbocache does.
+// exactly the way turbokv does.
 const cluster = require('cluster');
 const SER = process.env.SER === 'advanced' ? 'advanced' : 'json';
 const SECS = Number(process.env.SECS || 5);

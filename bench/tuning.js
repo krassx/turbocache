@@ -1,12 +1,12 @@
 'use strict';
 // What should the second-chance budget and the ring capacity actually be?
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const native = require('../src/native');
 const __native = native;
 const { buildPlan, run } = require('./workload');
 
 let seq = 0;
-const mk = o => TurboCache.createPrimary('/tctune' + process.pid + '_' + (seq++), 64 << 20, 1 << 18,
+const mk = o => TurboKV.createPrimary('/tctune' + process.pid + '_' + (seq++), 64 << 20, 1 << 18,
     { storage: 'bytes', l1MaxBytes: 256 * 1024, ...o });
 
 (async () => {

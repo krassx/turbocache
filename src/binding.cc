@@ -14,7 +14,7 @@
 #include <node_api.h>
 // Compression is an optional build feature; see binding.gyp. Without it the
 // addon has no external dependencies.
-#ifdef TURBOCACHE_LZ4
+#ifdef TURBOKV_LZ4
 #include <lz4.h>
 #endif
 #include <stdlib.h>
@@ -113,7 +113,7 @@ static void put(napi_env env, napi_value o, const char *k, double v);
 // non-LZ4 branch, which increments a counter in the header -- took a SIGBUS on
 // the PROT_READ mapping instead of an exception it could handle.
 #define NEED_WRITABLE(ret) if (!g.writable) { \
-  napi_throw_error(env, nullptr, "turbocache: this process attached the arena read-only; " \
+  napi_throw_error(env, nullptr, "turbokv: this process attached the arena read-only; " \
                                  "only the primary may write"); return ret; }
 
 #define ARG(n) napi_value argv[n]; size_t argc = n; \
@@ -140,8 +140,8 @@ static napi_value Attach(napi_env env, napi_callback_info info) {
   bool ok = g.attachReadOnly(nm);
   if (!ok && g.attachError == 1) {
     napi_throw_error(env, nullptr,
-      "turbocache: this arena contains LZ4-compressed entries but the addon was "
-      "built without LZ4. Rebuild with --turbocache_lz4=1, or recreate the arena "
+      "turbokv: this arena contains LZ4-compressed entries but the addon was "
+      "built without LZ4. Rebuild with --turbokv_lz4=1, or recreate the arena "
       "with compression disabled.");
     return nullptr;
   }
@@ -150,7 +150,7 @@ static napi_value Attach(napi_env env, napi_callback_info info) {
 
 static napi_value HasLz4(napi_env env, napi_callback_info) {
   napi_value r;
-#ifdef TURBOCACHE_LZ4
+#ifdef TURBOKV_LZ4
   napi_get_boolean(env, true, &r);
 #else
   napi_get_boolean(env, false, &r);
@@ -510,7 +510,7 @@ static napi_value Set(napi_env env, napi_callback_info info) {
   const uint8_t *payload = scratch;
   uint32_t storedLen = (uint32_t)vlen, rawLen = (uint32_t)vlen;
   if ((flags & FLAG_STRING) && vlen >= compressMin) {
-#ifdef TURBOCACHE_LZ4
+#ifdef TURBOKV_LZ4
     int c = LZ4_compress_fast((const char *)scratch, (char *)cbuf, (int)vlen, (int)SCRATCH, compressAccel);
     if (c > 0 && (uint32_t)c < rawLen - (rawLen >> 3)) {   // keep only if >12.5% smaller
       payload = cbuf; storedLen = (uint32_t)c; flags |= FLAG_COMPRESSED;
@@ -540,7 +540,7 @@ static napi_value Get(napi_env env, napi_callback_info info) {
   g_lastExpiresAt = rr.expiresAt;
   const char *src = (const char *)rr.buf;
   if (rr.flags & FLAG_COMPRESSED) {
-#ifdef TURBOCACHE_LZ4
+#ifdef TURBOKV_LZ4
     int d = LZ4_decompress_safe((const char *)rr.buf, (char *)cbuf, (int)rr.storedLen, (int)SCRATCH);
     if (d < 0) return nullptr;
     src = (const char *)cbuf;
@@ -594,7 +594,7 @@ static napi_value GetLen(napi_env env, napi_callback_info info) {
   ReadResult rr;
   int32_t n = -1;
   if (storeGet(g, (const uint8_t *)key, (uint16_t)klen, scratch, SCRATCH, &rr, nowRelMs(g))) {
-#ifdef TURBOCACHE_LZ4
+#ifdef TURBOKV_LZ4
     if (rr.flags & FLAG_COMPRESSED)
       LZ4_decompress_safe((const char *)rr.buf, (char *)cbuf, (int)rr.storedLen, (int)SCRATCH);
 #else

@@ -7,7 +7,7 @@
 //      batch, and everything else that worker is doing waits behind it.
 const cluster = require('cluster');
 const { monitorEventLoopDelay } = require('perf_hooks');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const T = process.env.T === 'ipc' ? 'ipc' : 'shm';
 const ARENA = '/tctb_' + T;
 const N = Number(process.env.N || 800000);
@@ -16,8 +16,8 @@ function slotsFor(b) { return 1 << Math.max(12, Math.min(22, Math.ceil(Math.log2
 
 if (cluster.isPrimary) {
     const L2 = 192 * 1024 * 1024;
-    const cache = TurboCache.createPrimary(ARENA, L2, slotsFor(L2), { storage: 'bytes', transport: T });
-    TurboCache.install(cluster);
+    const cache = TurboKV.createPrimary(ARENA, L2, slotsFor(L2), { storage: 'bytes', transport: T });
+    TurboKV.install(cluster);
     const w = cluster.fork({ TC_ARENA: ARENA, T });
     let t0 = 0, tLast = 0, applied0 = 0;
     w.on('message', (m) => {
@@ -25,8 +25,8 @@ if (cluster.isPrimary) {
         if (m.t === 'go') { t0 = process.hrtime.bigint(); return; }
         if (m.t === 'done') {
             setTimeout(() => {
-                TurboCache.drainSubmissions(1 << 22);
-                const st = TurboCache.arenaStats();
+                TurboKV.drainSubmissions(1 << 22);
+                const st = TurboKV.arenaStats();
                 if (!tLast) { console.log('  no delivery observed; cannot measure'); process.exit(1); }
                 const secs = Number(tLast - t0) / 1e9;
                 console.log(`  transport=${T.padEnd(4)}  delivered ${(m.delivered / secs / 1000).toFixed(0)}k writes/s` +
@@ -44,9 +44,9 @@ if (cluster.isPrimary) {
     // regardless of activity put the worker's 400ms wait and the primary's 800ms
     // settle into the denominator -- the same error class already fixed in
     // ipcmodes.js, and it understated both transports.
-    setInterval(() => { if (TurboCache.drainSubmissions(8192) > 0) tLast = process.hrtime.bigint(); }, 1).unref();
+    setInterval(() => { if (TurboKV.drainSubmissions(8192) > 0) tLast = process.hrtime.bigint(); }, 1).unref();
 } else {
-    const cache = TurboCache.attachWorker(ARENA, 1, { storage: 'bytes', l1MaxBytes: 2 << 20, transport: process.env.T });
+    const cache = TurboKV.attachWorker(ARENA, 1, { storage: 'bytes', l1MaxBytes: 2 << 20, transport: process.env.T });
     const h = monitorEventLoopDelay({ resolution: 1 });
     process.send({ t: 'go' });
     h.enable();

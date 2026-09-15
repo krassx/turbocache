@@ -1,11 +1,11 @@
 // Covers the gaps closed after the adversarial review: binary values, TTL
 // sweeping, primary heartbeat, and atomic RMW.
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const native = require('../src/native');
 const __native = native;
 let fail = 0, n = 0;
 const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
-const mk = o => TurboCache.createPrimary('/tcgap' + process.pid + '_' + (n++), 32 << 20, 1 << 16,
+const mk = o => TurboKV.createPrimary('/tcgap' + process.pid + '_' + (n++), 32 << 20, 1 << 16,
     { storage: 'bytes', l1MaxBytes: 32 * 1024, maintenance: false, ...o });
 
 // --- binary values (decision 4)
@@ -49,7 +49,7 @@ const mk = o => TurboCache.createPrimary('/tcgap' + process.pid + '_' + (n++), 3
 function stage2() {
     // --- heartbeat
     const c = mk({ maintenance: true, maintenanceMs: 40 });
-    ok(TurboCache.primaryAgeMs() >= 0 && TurboCache.primaryAgeMs() < 1000, 'primary stamps a heartbeat');
+    ok(TurboKV.primaryAgeMs() >= 0 && TurboKV.primaryAgeMs() < 1000, 'primary stamps a heartbeat');
     __native.destroy();
 
     // --- atomic RMW on the primary

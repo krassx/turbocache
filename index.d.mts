@@ -2,11 +2,11 @@
 //
 // index.d.ts describes a CommonJS module, because the package is
 // "type": "commonjs". Under node16/nodenext TypeScript therefore models it as
-// `module.exports`, and `import TurboCache from 'turbocache'` in an ESM
+// `module.exports`, and `import TurboKV from 'turbokv'` in an ESM
 // consumer binds the whole namespace object rather than the class:
 //
 //   error TS2339: Property 'createPrimary' does not exist on type
-//                 'typeof import(".../turbocache/index")'
+//                 'typeof import(".../turbokv/index")'
 //
 // The runtime was always correct -- index.mjs has a real default export -- so
 // this was types-only, which is the worse kind: correct code failed to compile.
@@ -19,7 +19,7 @@ export type {
     ArenaStats, NamespaceStat, AutoSize, SubmitStats, KeysOptions,
 } from './index.js';
 
-export { TurboCache, Cache, MSG } from './index.js';
+export { TurboKV, Cache, MSG } from './index.js';
 
-import { TurboCache as _TurboCache } from './index.js';
-export default _TurboCache;
+import { TurboKV as _TurboKV } from './index.js';
+export default _TurboKV;

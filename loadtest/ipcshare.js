@@ -1,14 +1,14 @@
 'use strict';
-// process.send() is not turbocache's private pipe -- it is THE cluster channel,
+// process.send() is not turbokv's private pipe -- it is THE cluster channel,
 // shared with the application's own worker<->primary messaging and with any
 // other library using it. This measures the externality directly: an app-level
 // ping/pong round trip on that channel, first with the cache idle, then with the
 // cache under write load on the same channel.
 //
-// Anything the second phase adds is latency turbocache imposes on code that has
+// Anything the second phase adds is latency turbokv imposes on code that has
 // nothing to do with the cache.
 const cluster = require('cluster');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const ARENA = '/tcshare';
 const SECS = Number(process.env.SECS || 8);
 const VAL = 'v'.repeat(180);
@@ -17,8 +17,8 @@ const pct = (a, p) => a.length ? a[Math.min(a.length - 1, Math.floor(a.length * 
 
 if (cluster.isPrimary) {
     const L2 = 192 * 1024 * 1024;
-    const cache = TurboCache.createPrimary(ARENA, L2, slotsFor(L2), { storage: 'bytes', transport: 'ipc' });
-    TurboCache.install(cluster);
+    const cache = TurboKV.createPrimary(ARENA, L2, slotsFor(L2), { storage: 'bytes', transport: 'ipc' });
+    TurboKV.install(cluster);
     const w = cluster.fork({ TC_ARENA: ARENA });
     // The primary answers app pings immediately; the worker times the round trip.
     w.on('message', (m) => { if (m && m.t === 'ping') w.send({ t: 'pong', s: m.s }); });
@@ -45,11 +45,11 @@ if (cluster.isPrimary) {
     // is therefore the CHANNEL cost alone, with the worker's own CPU cost for
     // encoding and L1 held constant. Without that control, a slower app ping just
     // measures the worker being busy.
-    const sending = TurboCache.attachWorker(ARENA, 1, { storage: 'bytes', l1MaxBytes: 2 << 20, transport: 'ipc' });
+    const sending = TurboKV.attachWorker(ARENA, 1, { storage: 'bytes', l1MaxBytes: 2 << 20, transport: 'ipc' });
     // maxInFlightBytes 0 really means 0 now (`??`, not `||`), so this control
     // genuinely never reaches the channel. It previously got the 8MB default,
     // making the control identical to the phase it was controlling.
-    const shedding = TurboCache.attachWorker(ARENA, 1, { storage: 'bytes', l1MaxBytes: 2 << 20, transport: 'ipc', maxInFlightBytes: 0 });
+    const shedding = TurboKV.attachWorker(ARENA, 1, { storage: 'bytes', l1MaxBytes: 2 << 20, transport: 'ipc', maxInFlightBytes: 0 });
     const rows = [];
     let seq = 0, sentAt = new Map(), lat = [], writing = false, wi = 0;
 

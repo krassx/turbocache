@@ -1,13 +1,13 @@
 'use strict';
 const { run, buildPlan, BUGSEE } = require('./workload');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const { TURBO_MODES, turboOpts, turboAdapter, bugseeAdapter } = require('./adapters');
 const bugsee = require(BUGSEE);
 
 const OPS = Number(process.env.OPS || 200000);
 const L1 = 2 << 20, L2 = 256 << 20;
 let seq = 0;
-const fresh = o => TurboCache.createPrimary('/tcsm' + process.pid + '_' + (seq++), L2, 1 << 20, o);
+const fresh = o => TurboKV.createPrimary('/tcsm' + process.pid + '_' + (seq++), L2, 1 << 20, o);
 
 const SHAPES = [
     ['reads dominate, fits L1',   1000,  0.01],

@@ -16,7 +16,7 @@
 const cluster = require('cluster');
 const os = require('os');
 const { monitorEventLoopDelay, PerformanceObserver, constants } = require('perf_hooks');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 
 const WORKERS = Number(process.env.WORKERS || 4);
 const SECONDS = Number(process.env.SECONDS || 60);
@@ -66,15 +66,15 @@ const mergeLat = (rows) => {
 const pct = (sorted, p) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p / 100))] : 0;
 
 if (cluster.isPrimary) {
-    console.log(`turbocache async-flow test — ${WORKERS} workers x ${CONC} in-flight, ${SECONDS}s/phase, storage=${MODE}`);
+    console.log(`turbokv async-flow test — ${WORKERS} workers x ${CONC} in-flight, ${SECONDS}s/phase, storage=${MODE}`);
     console.log(`  node ${process.version} on ${os.platform()}/${os.arch()}, ${os.cpus().length} cpus\n`);
-    const cache = TurboCache.createPrimary(ARENA, L2, slotsFor(L2), { storage: MODE, l1MaxBytes: L1 });
+    const cache = TurboKV.createPrimary(ARENA, L2, slotsFor(L2), { storage: MODE, l1MaxBytes: L1 });
     for (let i = 0; i < COLD; i++) cache.set('cold:' + i, makeVal('cold:' + i, 1));
     for (let i = 0; i < HOT; i++) cache.set('hot:' + i, makeVal('hot:' + i, 1));
     for (let i = 0; i < SHARED; i++) cache.set('shared:' + i, makeVal('shared:' + i, 1));
-    console.log(`  seeded, arena live=${TurboCache.arenaStats().live}\n`);
+    console.log(`  seeded, arena live=${TurboKV.arenaStats().live}\n`);
 
-    TurboCache.install(cluster);          // primary must drain worker write batches
+    TurboKV.install(cluster);          // primary must drain worker write batches
     const got = [];
     for (let i = 0; i < WORKERS; i++) cluster.fork({ WORKER_ID: i + 1, TC_ARENA: ARENA })   // ids are 1-based; 0 means primary;
     cluster.on('message', (w, m) => {
@@ -132,7 +132,7 @@ if (cluster.isPrimary) {
     }
 } else {
     const id = Number(process.env.WORKER_ID);
-    const real = TurboCache.attachWorker(ARENA, id, { storage: MODE, l1MaxBytes: L1 });
+    const real = TurboKV.attachWorker(ARENA, id, { storage: MODE, l1MaxBytes: L1 });
     const noop = { get: () => undefined, set: () => true, flush: () => {} };
 
     let gcMs = 0, gcN = 0, gcMax = 0, gcMajor = 0;

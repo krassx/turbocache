@@ -11,7 +11,7 @@
 // Both configurations run the identical worker loop back to back, so the ratio
 // between them is meaningful even under external CPU load.
 const cluster = require('cluster');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const ARENA = '/tcipc_' + (process.env.SER || 'json');
 const SER = process.env.SER === 'advanced' ? 'advanced' : 'json';
 const N = Number(process.env.N || 600000);
@@ -23,7 +23,7 @@ function slotsFor(bytes) {
 
 if (cluster.isPrimary) {
     const L2 = 192 * 1024 * 1024;
-    const cache = TurboCache.createPrimary(ARENA, L2, slotsFor(L2), { storage: 'bytes', transport: 'ipc' });
+    const cache = TurboKV.createPrimary(ARENA, L2, slotsFor(L2), { storage: 'bytes', transport: 'ipc' });
 
     // Reference: what the arena itself can absorb, no transport involved.
     const t0 = process.hrtime.bigint();
@@ -31,7 +31,7 @@ if (cluster.isPrimary) {
     const applyRate = N / (Number(process.hrtime.bigint() - t0) / 1e9);
 
     cluster.setupPrimary({ serialization: SER, exec: __filename });
-    TurboCache.install(cluster);
+    TurboKV.install(cluster);
     const w = cluster.fork({ TC_ARENA: ARENA });
     let got = 0, t1 = 0, tLast = 0;
     w.on('message', (m) => {
@@ -53,7 +53,7 @@ if (cluster.isPrimary) {
         if (m.b) { got += m.b.length / 5; tLast = process.hrtime.bigint(); }
     });
 } else {
-    const cache = TurboCache.attachWorker(ARENA, 1, { storage: 'bytes', l1MaxBytes: 2 << 20, transport: 'ipc',
+    const cache = TurboKV.attachWorker(ARENA, 1, { storage: 'bytes', l1MaxBytes: 2 << 20, transport: 'ipc',
         maxInFlightBytes: Number(process.env.WINDOW || (8 << 20)) });
     process.send({ t: 'go' });
     let i = 0;

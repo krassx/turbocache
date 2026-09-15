@@ -1,10 +1,10 @@
 // Cache.install(cluster) must be all the wiring a primary needs.
 const cluster = require('cluster');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 
 if (cluster.isPrimary) {
-    const cache = TurboCache.open({ storage: 'bytes' });
-    TurboCache.install(cluster);                       // the entire primary-side setup
+    const cache = TurboKV.open({ storage: 'bytes' });
+    TurboKV.install(cluster);                       // the entire primary-side setup
     cache.set('from-primary', 'hello');
 
     let done = 0, fail = 0;
@@ -25,7 +25,7 @@ if (cluster.isPrimary) {
         });
     }
 } else {
-    const cache = TurboCache.open({ storage: 'bytes' });   // auto-attaches
+    const cache = TurboKV.open({ storage: 'bytes' });   // auto-attaches
     const id = cluster.worker.id;
     const checks = [];
     checks.push([cache.get('from-primary') === 'hello', 'worker reads what the primary wrote']);

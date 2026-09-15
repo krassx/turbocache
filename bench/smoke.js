@@ -1,6 +1,6 @@
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const __native = require('../src/native');
-const c = TurboCache.createPrimary('/tc-smoke-' + process.pid, 16 << 20, 1 << 16);
+const c = TurboKV.createPrimary('/tc-smoke-' + process.pid, 16 << 20, 1 << 16);
 c.set('a', 'hello'); c.set('b', 'world');
 console.log('get a =', c.get('a'), '| get b =', c.get('b'), '| miss =', c.get('zz'));
 for (let i = 0; i < 20000; i++) c.set('k' + i, 'v'.repeat(200));

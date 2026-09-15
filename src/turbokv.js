@@ -38,7 +38,7 @@ const SET_MUTATORS = ['add', 'delete', 'clear'];
 function frozenMutator(name) {
     return function () {
         throw new TypeError(`Cannot call ${name}() on a frozen cached value ` +
-            `(turbocache freeze:true). Copy it before mutating.`);
+            `(turbokv freeze:true). Copy it before mutating.`);
     };
 }
 
@@ -204,7 +204,7 @@ let isPrimaryProcess = false;   // set by createPrimary; guards the id-0 write p
 const installedWorkers = new WeakSet();   // workers already wired by install()      // the native store is a per-process singleton
 const instances = new Set();  // live caches in THIS process, for local invalidation
 
-class TurboCache {
+class TurboKV {
     #l1 = new Map();          // key -> { v, bytes, hits }
     #byHash = new Map();      // hash hex -> key   (ring records carry hashes)
     #l1Bytes = 0;
@@ -292,7 +292,7 @@ class TurboCache {
         // legitimate in the process that actually created the arena.
         this.#id = opts.workerId ?? 0;
         if (this.#id === 0 && opts.attached !== false && !isPrimaryProcess)
-            throw new Error('turbocache: workerId 0 is the primary; a worker must use ' +
+            throw new Error('turbokv: workerId 0 is the primary; a worker must use ' +
                             'attachWorker() or open() so cluster assigns its id');
         this.#attached = opts.attached !== false;
         this.#transportOpt = opts.transport || 'shm';
@@ -320,7 +320,7 @@ class TurboCache {
         //                get a fresh mutable object and cannot corrupt anything.
         //                Cheap writes, and JSON's silent type conversions apply:
         //                Date becomes a string, Map/Set become {}.
-        TurboCache.#assertStorageOptions(opts);
+        TurboKV.#assertStorageOptions(opts);
         // `values` is documented as a legacy alias for `storage`, and until now
         // it was not one: only 'bytes'/'primitives' did anything, because those
         // happen to coincide with the internal no-codec flag this option also
@@ -331,9 +331,9 @@ class TurboCache {
             ? opts.storage : opts.values;
         if (preset === 'direct') {
             opts = { isolate: true, freeze: true, ...opts,
-                     codec: opts.codec || TurboCache.V8_CODEC };
+                     codec: opts.codec || TurboKV.V8_CODEC };
         } else if (preset === 'safe') {
-            opts = { ...opts, codec: opts.codec || TurboCache.JSON_CODEC, l1Decoded: false };
+            opts = { ...opts, codec: opts.codec || TurboKV.JSON_CODEC, l1Decoded: false };
         } else if (preset === 'bytes' || preset === 'primitives') {
             opts = { ...opts, values: 'bytes' };
         }
@@ -344,7 +344,7 @@ class TurboCache {
         this.#l1Decoded = opts.l1Decoded !== false;
         this.#noCodec = opts.values === 'bytes' || opts.values === 'primitives';
         this.#codec = this.#noCodec ? null : (opts.codec || null);
-        if (this.#codec && opts.allowSlowCodec !== true) TurboCache.assertFastCodec(this.#codec);
+        if (this.#codec && opts.allowSlowCodec !== true) TurboKV.assertFastCodec(this.#codec);
         // Safe by default, fast by choice. Without freeze, mutating what get()
         // returned silently corrupts L1 for this worker until eviction, at
         // which point the value reverts to L2's copy - a bug that appears and
@@ -426,7 +426,7 @@ class TurboCache {
             try { src = Function.prototype.toString.call(fn); } catch { continue; }
             if (src.includes('[native code]')) continue;
             const name = which === 'encode' ? 'JSON.stringify' : 'JSON.parse';
-            for (const call of TurboCache.callArgCounts(src, name)) {
+            for (const call of TurboKV.callArgCounts(src, name)) {
                 if (call.args > 1) {
                     throw new Error(
                         `codec.${which} is not on V8's JSON fast path: ${call.text.slice(0, 60)} ` +
@@ -502,7 +502,7 @@ class TurboCache {
             }
         }
         Object.freeze(o);
-        for (const k in o) TurboCache.deepFreeze(o[k]);
+        for (const k in o) TurboKV.deepFreeze(o[k]);
         return o;
     }
 
@@ -528,7 +528,7 @@ class TurboCache {
     // create it again. Several namespaces in one process is a normal thing to
     // want and there was previously no way to express it.
     static open(opts = {}) {
-        TurboCache.#assertStorageOptions(opts);   // see createPrimary
+        TurboKV.#assertStorageOptions(opts);   // see createPrimary
         const cluster = require('cluster');
         if (storeReady) {
             // The caller's opts used to be spread AFTER the computed id, so
@@ -537,36 +537,36 @@ class TurboCache {
             // read-only mapping -- a SIGBUS on the first set(), not a wedge.
             const id = cluster.isWorker ? cluster.worker.id : 0;
             if (cluster.isWorker && opts.workerId !== undefined && opts.workerId !== id)
-                throw new Error(`turbocache: workerId is assigned by cluster in a worker (${id}); ` +
+                throw new Error(`turbokv: workerId is assigned by cluster in a worker (${id}); ` +
                                 `refusing the supplied ${JSON.stringify(opts.workerId)}`);
-            const c = new TurboCache({ ...opts, workerId: id });
+            const c = new TurboKV({ ...opts, workerId: id });
             // A second cache opened in a worker used to skip the ring entirely and
             // silently run on the slower IPC transport.
             if (cluster.isWorker && submitReady && opts.transport !== 'ipc') c.useSubmissionRing(submitReady);
             return c;
         }
-        const auto = TurboCache.autoSize();
+        const auto = TurboKV.autoSize();
         const arenaBytes = opts.arenaBytes || auto.arenaBytes;
         const indexSlots = opts.indexSlots || auto.indexSlots;
         const o = { l1MaxBytes: auto.l1MaxBytes, ...opts };
         if (cluster.isWorker) {
             // A worker forked BEFORE the primary called open() has no
-            // TURBOCACHE_ARENA, and used to fall through to createPrimary -
+            // TURBOKV_ARENA, and used to fall through to createPrimary -
             // silently creating a second writable arena and shm_unlinking the
             // primary's. Fail loudly instead.
-            if (!process.env.TURBOCACHE_ARENA)
-                throw new Error('turbocache: no arena to attach to. The primary must call ' +
+            if (!process.env.TURBOKV_ARENA)
+                throw new Error('turbokv: no arena to attach to. The primary must call ' +
                                 'Cache.open()/new Cache() BEFORE forking workers.');
-            return TurboCache.attachWorker(process.env.TURBOCACHE_ARENA, cluster.worker.id, o);
+            return TurboKV.attachWorker(process.env.TURBOKV_ARENA, cluster.worker.id, o);
         }
         // A pid-based name leaks: create() unlinks any prior segment, but a
         // crashed run's segment has a name nothing will ever reuse, so it
         // survives until reboot. Deriving the name from the application's
         // identity instead means a restart reclaims its own segment, while two
         // different apps on one host still get different ones.
-        const name = opts.name || TurboCache.defaultName();
-        process.env.TURBOCACHE_ARENA = name;      // inherited by workers forked later
-        return TurboCache.createPrimary(name, arenaBytes, indexSlots, o);
+        const name = opts.name || TurboKV.defaultName();
+        process.env.TURBOKV_ARENA = name;      // inherited by workers forked later
+        return TurboKV.createPrimary(name, arenaBytes, indexSlots, o);
     }
 
     // Wire the primary's side of the worker write path. Without this, worker
@@ -598,7 +598,7 @@ class TurboCache {
             const near = typeof v === 'string' &&
                 STORAGE_MODES.find(m => m === v.trim().toLowerCase());
             throw new TypeError(
-                `turbocache: ${key} must be one of ${list}; got ${JSON.stringify(v)}` +
+                `turbokv: ${key} must be one of ${list}; got ${JSON.stringify(v)}` +
                 (near ? `. Did you mean '${near}'?` : '.'));
         }
 
@@ -606,14 +606,14 @@ class TurboCache {
 
         if (typeof codec === 'string') {
             throw new TypeError(
-                `turbocache: codec must be an object with encode and decode functions, ` +
+                `turbokv: codec must be an object with encode and decode functions, ` +
                 `but got the string ${JSON.stringify(codec)}. ` +
                 (STORAGE_MODES.includes(codec)
                     ? `Did you mean storage: '${codec}'?`
                     : `The storage MODES are named with the storage option: ${list}.`));
         }
         if (typeof codec !== 'object') {
-            throw new TypeError(`turbocache: codec must be an object with encode and decode ` +
+            throw new TypeError(`turbokv: codec must be an object with encode and decode ` +
                                 `functions; got ${typeof codec}.`);
         }
         // The declaration says codec is "mutually exclusive with a storage mode
@@ -626,7 +626,7 @@ class TurboCache {
         for (const key of ['storage', 'values']) {
             if (noCodecMode.includes(opts[key])) {
                 throw new TypeError(
-                    `turbocache: ${key}: '${opts[key]}' stores values without a codec, ` +
+                    `turbokv: ${key}: '${opts[key]}' stores values without a codec, ` +
                     `so a codec cannot be used with it. Drop the codec, or use ` +
                     `storage: 'direct' or 'safe' (both accept a codec override).`);
             }
@@ -635,9 +635,9 @@ class TurboCache {
         const missing = ['encode', 'decode'].filter(k => typeof codec[k] !== 'function');
         if (missing.length) {
             throw new TypeError(
-                `turbocache: codec is missing ${missing.map(m => `${m}()`).join(' and ')}. ` +
+                `turbokv: codec is missing ${missing.map(m => `${m}()`).join(' and ')}. ` +
                 `A codec is { encode(value) -> string, decode(string) -> value }; ` +
-                `TurboCache.JSON_CODEC and TurboCache.V8_CODEC are the built-in ones.`);
+                `TurboKV.JSON_CODEC and TurboKV.V8_CODEC are the built-in ones.`);
         }
     }
 
@@ -661,7 +661,7 @@ class TurboCache {
 
     static defaultName() {
         const crypto = require('crypto');
-        const id = (process.argv[1] || process.cwd()) + '|' + (process.env.TURBOCACHE_ID || '');
+        const id = (process.argv[1] || process.cwd()) + '|' + (process.env.TURBOKV_ID || '');
         return '/tc-' + crypto.createHash('sha1').update(id).digest('hex').slice(0, 16);
     }
 
@@ -676,8 +676,8 @@ class TurboCache {
             if (!w || wired.has(w)) return;
             wired.add(w);
             w.on('message', m => {
-                if (m && m.t === RING_MSG) { TurboCache.drainSubmissions(); return; }
-                if (TurboCache.isCacheMessage(m)) TurboCache.applyBatch(m);
+                if (m && m.t === RING_MSG) { TurboKV.drainSubmissions(); return; }
+                if (TurboKV.isCacheMessage(m)) TurboKV.applyBatch(m);
             });
         };
         cluster.on('online', attach);
@@ -698,10 +698,10 @@ class TurboCache {
         // values indefinitely after any worker write -- and the regression test
         // that was supposed to catch it drove applyBatch directly, so it passed
         // while the default path regressed underneath it.
-        if (n > 0) TurboCache.#primaryInvalidate();
-        if (n >= budget && !TurboCache.#drainScheduled) {
-            TurboCache.#drainScheduled = true;
-            setImmediate(() => { TurboCache.#drainScheduled = false; TurboCache.drainSubmissions(budget); });
+        if (n > 0) TurboKV.#primaryInvalidate();
+        if (n >= budget && !TurboKV.#drainScheduled) {
+            TurboKV.#drainScheduled = true;
+            setImmediate(() => { TurboKV.#drainScheduled = false; TurboKV.drainSubmissions(budget); });
         }
         return n;
     }
@@ -715,11 +715,11 @@ class TurboCache {
     static #primaryInvalidate() {
         for (let round = 0; round < 64; round++) {
             let r;
-            try { r = native.ringRead(TurboCache.#primaryCursor, 1024); } catch { return; }
+            try { r = native.ringRead(TurboKV.#primaryCursor, 1024); } catch { return; }
             if (!r) return;                        // store detached underneath us
             if (r.wrapped) {                       // fell too far behind: flush wholesale
                 for (const c of instances) c.clearLocal();
-                TurboCache.#primaryCursor = r.head;
+                TurboKV.#primaryCursor = r.head;
                 return;
             }
             const n = r.hashes.length;
@@ -728,7 +728,7 @@ class TurboCache {
                 if (r.writers[i] === 0) continue;  // our own write
                 for (const c of instances) c._dropByHash(r.hashes[i]);
             }
-            TurboCache.#primaryCursor = r.head;
+            TurboKV.#primaryCursor = r.head;
             if (n < 1024) return;                  // caught up
         }
     }
@@ -762,8 +762,8 @@ class TurboCache {
     static #lastHb = -1;
 
     static #degrade(age) {
-        if (TurboCache.#degraded || isPrimaryProcess) return;
-        TurboCache.#degraded = true;
+        if (TurboKV.#degraded || isPrimaryProcess) return;
+        TurboKV.#degraded = true;
         for (const c of instances) {
             c._setDead(true, `primary heartbeat is ${age === -2 ? 'dated in the future' : age + 'ms old'}; serving L1 only`);
         }
@@ -774,10 +774,10 @@ class TurboCache {
         submitReady = null;
         try { native.detach(); } catch { /* already gone */ }
         storeReady = false;
-        TurboCache.#lastHb = -1;
-        if (TurboCache.#recoverTimer || !attachedName) return;
-        TurboCache.#recoverTimer = setInterval(() => TurboCache.#tryRecover(), 1000);
-        if (TurboCache.#recoverTimer.unref) TurboCache.#recoverTimer.unref();
+        TurboKV.#lastHb = -1;
+        if (TurboKV.#recoverTimer || !attachedName) return;
+        TurboKV.#recoverTimer = setInterval(() => TurboKV.#tryRecover(), 1000);
+        if (TurboKV.#recoverTimer.unref) TurboKV.#recoverTimer.unref();
     }
 
     static #tryRecover() {
@@ -790,19 +790,19 @@ class TurboCache {
         // one passes within two ticks.
         const hb = native.heartbeatRaw();
         const age = native.heartbeatAgeMs();
-        if (hb === TurboCache.#lastHb || age < 0 || age > TurboCache.#staleMsFor()) {
-            TurboCache.#lastHb = hb;
+        if (hb === TurboKV.#lastHb || age < 0 || age > TurboKV.#staleMsFor()) {
+            TurboKV.#lastHb = hb;
             try { native.detach(); } catch {}
             storeReady = false;
             return;
         }
-        clearInterval(TurboCache.#recoverTimer);
-        TurboCache.#recoverTimer = null;
-        TurboCache.#degraded = false;
+        clearInterval(TurboKV.#recoverTimer);
+        TurboKV.#recoverTimer = null;
+        TurboKV.#degraded = false;
         storeReady = true;
         const id = native.arenaId();
-        const sameArena = TurboCache.#arenaId !== null && id === TurboCache.#arenaId;
-        TurboCache.#arenaId = id;
+        const sameArena = TurboKV.#arenaId !== null && id === TurboKV.#arenaId;
+        TurboKV.#arenaId = id;
         for (const c of instances) c._recovered(sameArena);
     }
 
@@ -855,15 +855,15 @@ class TurboCache {
         // time it runs, create()/attach() have already made a shm segment that
         // nothing in the throw path unlinks -- verified: the arena outlived the
         // process that threw. Validation must precede the side effect.
-        TurboCache.#assertStorageOptions(opts);
-        if (!native.create(name, arenaBytes, indexSlots, 2)) throw new Error(TurboCache.#createError(arenaBytes));
+        TurboKV.#assertStorageOptions(opts);
+        if (!native.create(name, arenaBytes, indexSlots, 2)) throw new Error(TurboKV.#createError(arenaBytes));
         // Compression is off unless the caller explicitly asks AND the addon was
         // built with LZ4. Measured a bad trade (see DESIGN.md), so it is neither
         // the default nor a build dependency.
         if (opts.compress === true) {
             if (!native.hasLz4())
-                throw new Error('turbocache: compress:true requires an addon built with ' +
-                                'LZ4 (node-gyp configure build --turbocache_lz4=1)');
+                throw new Error('turbokv: compress:true requires an addon built with ' +
+                                'LZ4 (node-gyp configure build --turbokv_lz4=1)');
             native.setCompressMin(opts.compressMinBytes || 1024, opts.compressAccel || 1);
         } else {
             native.setCompressMin(1 << 30, 1);          // effectively never
@@ -878,15 +878,15 @@ class TurboCache {
             const rings = opts.submitRings || 32;
             const ringBytes = opts.submitRingBytes || (1 << 20);
             if (!native.submitCreate(name + '_sub', rings, ringBytes))
-                throw new Error('turbocache: submission ring segment could not be created');
+                throw new Error('turbokv: submission ring segment could not be created');
             submitName = name + '_sub';
         }
-        const c = new TurboCache({ ...opts, workerId: 0 });
+        const c = new TurboKV({ ...opts, workerId: 0 });
         c._startMaintenance(opts);
         return c;
     }
     static attachWorker(name, workerId, opts = {}) {
-        TurboCache.#assertStorageOptions(opts);   // see createPrimary
+        TurboKV.#assertStorageOptions(opts);   // see createPrimary
         // Worker ids must be >= 1. `#id === 0` is how every method recognises the
         // primary, so a worker attached as 0 takes the primary's WRITE path and
         // calls into the native writer against a read-only mapping. That does not
@@ -902,7 +902,7 @@ class TurboCache {
         if (!native.attach(name)) throw new Error('arena attach failed');
         storeReady = true;
         attachedName = name;
-        const c = new TurboCache({ ...opts, workerId: wid });
+        const c = new TurboKV({ ...opts, workerId: wid });
         if (opts.transport !== 'ipc') c.useSubmissionRing(name + '_sub');
         return c;
     }
@@ -1029,7 +1029,7 @@ class TurboCache {
             }
             return false;
         }
-        if (age === -2 || age > this.#staleMs) { TurboCache.#degrade(age); return true; }
+        if (age === -2 || age > this.#staleMs) { TurboKV.#degrade(age); return true; }
         return false;
     }
 
@@ -1093,8 +1093,8 @@ class TurboCache {
             // recovery always reported sameArena:false -- including for a plain
             // stall of the very same primary, which is the most common outage
             // and precisely the case the field exists to make readable.
-            if (TurboCache.#arenaId === null) {
-                try { TurboCache.#arenaId = native.arenaId(); } catch { /* not attached */ }
+            if (TurboKV.#arenaId === null) {
+                try { TurboKV.#arenaId = native.arenaId(); } catch { /* not attached */ }
             }
             return true;
         } catch { return false; }
@@ -1139,7 +1139,7 @@ class TurboCache {
             return this.#codec.decode(raw);
         }
         let v = raw;
-        if (this.#codec) { v = this.#codec.decode(raw); if (this.#freeze) TurboCache.deepFreeze(v); }
+        if (this.#codec) { v = this.#codec.decode(raw); if (this.#freeze) TurboKV.deepFreeze(v); }
         this.#l1Put(key, v, native.hashKey(key), this.#noCodec ? 0 : raw.length, expMs);
         // The L2 path used to return the very object it just placed in L1, so a
         // caller mutating a binary result corrupted the cached copy.
@@ -1236,7 +1236,7 @@ class TurboCache {
         else if (this.#codec && this.#isolate) l1Value = this.#codec.decode(enc);
         // Freeze only ever applies to an object the cache owns. Freezing the
         // caller's object would be a side effect on something they still hold.
-        if (this.#codec && this.#freeze) TurboCache.deepFreeze(l1Value);
+        if (this.#codec && this.#freeze) TurboKV.deepFreeze(l1Value);
         const keyHash = native.hashKey(key);
         this.#pendingDel.delete(key); this.#pendingDelHash.delete(keyHash);   // a write supersedes our pending delete
         // set() reports whether the pipeline ACCEPTED, serialised and queued the
@@ -1465,7 +1465,7 @@ class TurboCache {
     static hasCompression() { return native.hasLz4(); }
 
     // Live entries in this cache's namespace. Arena-wide counters are in
-    // TurboCache.arenaStats().
+    // TurboKV.arenaStats().
     get size() {
         const st = native.nsStats();
         if (!st) return 0;
@@ -1526,9 +1526,9 @@ class TurboCache {
         this.stopGuard();
         if (this.#timer) { clearInterval(this.#timer); this.#timer = null; }
         instances.delete(this);
-        if (instances.size === 0 && TurboCache.#recoverTimer) {
-            clearInterval(TurboCache.#recoverTimer); TurboCache.#recoverTimer = null;
-            TurboCache.#degraded = false;      // a timer left running re-attached with no instances
+        if (instances.size === 0 && TurboKV.#recoverTimer) {
+            clearInterval(TurboKV.#recoverTimer); TurboKV.#recoverTimer = null;
+            TurboKV.#degraded = false;      // a timer left running re-attached with no instances
         }
         this.#ringIdx = -1;
         // The ring slot is PROCESS-wide, so release it only once no live
@@ -1647,15 +1647,15 @@ class TurboCache {
         // rings to empty here is what keeps one worker's operations in order --
         // without it a clearAll() was observed leaving 3808 keys that had been
         // written before it.
-        if (submitName) { let guard = 0; while (TurboCache.drainSubmissions(8192) > 0 && ++guard < 512); }
+        if (submitName) { let guard = 0; while (TurboKV.drainSubmissions(8192) > 0 && ++guard < 512); }
         const b = msg.b;
         for (let i = 0; i < b.length; i += 5) {
             const op = b[i], key = b[i + 1];
-            if (op === 's') { native.set(key, b[i + 2], msg.id, b[i + 3], b[i + 4]); TurboCache.#localDrop(key); }
-            else if (op === 'd') { native.del(key, msg.id); TurboCache.#localDrop(key); }
+            if (op === 's') { native.set(key, b[i + 2], msg.id, b[i + 3], b[i + 4]); TurboKV.#localDrop(key); }
+            else if (op === 'd') { native.del(key, msg.id); TurboKV.#localDrop(key); }
             else if (op === 'c') { native.clearAll(msg.id); for (const c of instances) c.clearLocal(); }
             else if (op === 'n') { native.clearNamespace(b[i + 4], msg.id); for (const c of instances) c.clearLocal(); }
-            else if (op === 'i') { native.incr(key, b[i + 2], msg.id, b[i + 3], b[i + 4]); TurboCache.#localDrop(key); }
+            else if (op === 'i') { native.incr(key, b[i + 2], msg.id, b[i + 3], b[i + 4]); TurboKV.#localDrop(key); }
         }
     }
 
@@ -1671,4 +1671,4 @@ class TurboCache {
     // package and not reachable through `exports`.
 }
 
-module.exports = { TurboCache, Cache: TurboCache, MSG };
+module.exports = { TurboKV, Cache: TurboKV, MSG };

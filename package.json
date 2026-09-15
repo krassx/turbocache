@@ -1,16 +1,16 @@
 {
-  "name": "turbocache",
+  "name": "turbokv",
   "version": "0.1.0",
   "description": "Layered in-memory KV cache for Node.js clusters: per-process L1 with a byte budget over a shared-memory L2 the primary owns and workers map read-only.",
   "license": "MIT",
   "author": "Alexey Karimov",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/krassx/turbocache.git"
+    "url": "git+https://github.com/krassx/turbokv.git"
   },
-  "homepage": "https://github.com/krassx/turbocache#readme",
+  "homepage": "https://github.com/krassx/turbokv#readme",
   "bugs": {
-    "url": "https://github.com/krassx/turbocache/issues"
+    "url": "https://github.com/krassx/turbokv/issues"
   },
   "keywords": [
     "cache",
@@ -45,7 +45,7 @@
     "index.mjs",
     "index.d.ts",
     "index.d.mts",
-    "src/turbocache.js",
+    "src/turbokv.js",
     "src/native.js",
     "src/binding.cc",
     "src/store.h",

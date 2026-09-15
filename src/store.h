@@ -1,4 +1,4 @@
-// turbocache L2 arena.
+// turbokv L2 arena.
 //
 // One open-addressed index over a circular append-only log that evicts from the
 // tail, with a bounded second-chance re-append (MODE_LOG2). A size-class slab
@@ -250,7 +250,7 @@ struct Store {
     }
     // Refuse an arena holding compressed entries this build cannot decompress,
     // rather than attaching and reporting silent misses for them.
-#ifndef TURBOCACHE_LZ4
+#ifndef TURBOKV_LZ4
     if (h->features & FEATURE_LZ4) {
       shmClose(base, mapBytes, &baseHandle); base = nullptr; attachError = 1; return false;
     }

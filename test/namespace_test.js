@@ -1,5 +1,5 @@
 // Does a quota actually stop a hot namespace from evicting a cold one?
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const native = require('../src/native');
 const __native = native;
 let seq = 0;
@@ -9,11 +9,11 @@ const ok = (c, m) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  ${m}`); if (!c) fa
 function scenario(label, quotas) {
     // 'cold' writes a small working set once; 'hot' then hammers the arena.
     const name = '/tcnsq' + process.pid + '_' + (seq++);
-    const cold = TurboCache.createPrimary(name, 8 << 20, 1 << 16,
+    const cold = TurboKV.createPrimary(name, 8 << 20, 1 << 16,
         { storage: 'bytes', l1MaxBytes: 16 * 1024,
           namespace: { name: 'cold', quotaBytes: quotas.cold } });
     // second namespace in the SAME process, bound to the arena already created
-    const hot = TurboCache.open(
+    const hot = TurboKV.open(
         { storage: 'bytes', l1MaxBytes: 16 * 1024,
           namespace: { name: 'hot', quotaBytes: quotas.hot } });
 
@@ -26,7 +26,7 @@ function scenario(label, quotas) {
     cold.clearLocal();
     let survived = 0;
     for (let i = 0; i < COLD_KEYS; i++) if (cold.get('c' + i) !== undefined) survived++;
-    const st = TurboCache.namespaceStats();
+    const st = TurboKV.namespaceStats();
     const row = n => st.find(x => x.name === n) || {};
     console.log(`  ${label.padEnd(34)} cold survivors ${String(survived).padStart(5)}/${COLD_KEYS}` +
         `   cold bytes ${((row('cold').bytes || 0) / 1024).toFixed(0).padStart(5)}KB` +
@@ -47,7 +47,7 @@ const withQuota = scenario('cold 1MB / hot 2MB quota', { cold: 1 << 20, hot: 2 <
 // production and never saw the eviction policy at all.
 {
     const A = '/tcnsidx' + process.pid;
-    const cold = TurboCache.createPrimary(A, 32 << 20, 1 << 12, {
+    const cold = TurboKV.createPrimary(A, 32 << 20, 1 << 12, {
         storage: 'bytes', namespace: { name: 'cold', quotaBytes: 4 << 20 }, l1MaxBytes: 1 << 16 });
     const Ctor = Object.getPrototypeOf(cold).constructor;
     const hot = new Ctor({ storage: 'bytes', namespace: { name: 'hot' }, l1MaxBytes: 1 << 16 });
@@ -57,7 +57,7 @@ const withQuota = scenario('cold 1MB / hot 2MB quota', { cold: 1 << 20, hot: 2 <
     cold.clearLocal();
     let survivors = 0;
     for (let i = 0; i < 500; i++) if (cold.get('c' + i) !== undefined) survivors++;
-    const st = TurboCache.namespaceStats().find(x => x.name === 'cold') || {};
+    const st = TurboKV.namespaceStats().find(x => x.name === 'cold') || {};
     console.log(`  index-bound quota: ${survivors}/500 cold survivors, protected=${st.protected} dropped=${st.dropped}`);
     ok(survivors > 350, 'a quota protects a cold namespace under INDEX pressure, not just data pressure');
     ok(st.dropped < 200, 'protected entries are not counted as protected and then dropped anyway');

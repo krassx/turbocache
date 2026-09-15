@@ -1,10 +1,10 @@
 // Regression tests for every defect the adversarial review found.
-const { Cache, TurboCache } = require('../src/turbocache');
+const { Cache, TurboKV } = require('../src/turbokv');
 const native = require('../src/native');
 const __native = native;
 let fail = 0, n = 0;
 const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
-const mk = o => TurboCache.createPrimary('/tcrr' + process.pid + '_' + (n++), 8 << 20, 1 << 16,
+const mk = o => TurboKV.createPrimary('/tcrr' + process.pid + '_' + (n++), 8 << 20, 1 << 16,
     { storage: 'bytes', l1MaxBytes: 32 * 1024, ...o });
 
 // 1. long / non-latin1 keys must never collide or truncate
@@ -47,9 +47,9 @@ const mk = o => TurboCache.createPrimary('/tcrr' + process.pid + '_' + (n++), 8 
 {
     const c = mk({});
     c.set('k', 'from-primary');
-    TurboCache.applyBatch({ t: 'tc', id: 1, b: ['s', 'k', 'from-worker', 0, 0] });
+    TurboKV.applyBatch({ t: 'tc', id: 1, b: ['s', 'k', 'from-worker', 0, 0] });
     ok(c.get('k') === 'from-worker', 'primary L1 sees a worker set');
-    TurboCache.applyBatch({ t: 'tc', id: 1, b: ['d', 'k', null, 0, 0] });
+    TurboKV.applyBatch({ t: 'tc', id: 1, b: ['d', 'k', null, 0, 0] });
     ok(c.get('k') === undefined, 'primary L1 sees a worker delete');
     __native.destroy();
 }
@@ -63,7 +63,7 @@ const mk = o => TurboCache.createPrimary('/tcrr' + process.pid + '_' + (n++), 8 
 }
 // 10. no crash before an arena exists or after close
 {
-    ok(TurboCache.namespaceStats() === undefined, 'namespaceStats before an arena does not crash');
+    ok(TurboKV.namespaceStats() === undefined, 'namespaceStats before an arena does not crash');
     const c = mk({}); c.close();
     ok(native.get('anything') === undefined, 'native get after destroy does not crash');
 }
@@ -73,7 +73,7 @@ const mk = o => TurboCache.createPrimary('/tcrr' + process.pid + '_' + (n++), 8 
     c.set('big', 'v', { ttlMs: 2147483600 });
     ok(c.has('big') === true, 'huge ttlMs does not overflow into instant expiry');
     let threw = false;
-    try { TurboCache.open({ namespace: { name: 'a'.repeat(40) } }); } catch { threw = true; }
+    try { TurboKV.open({ namespace: { name: 'a'.repeat(40) } }); } catch { threw = true; }
     ok(threw, 'over-long namespace name rejected rather than aliased');
     __native.destroy();
 }
@@ -94,17 +94,17 @@ ok(typeof Cache === 'function', 'Cache alias is exported as the docs describe');
     // native.attach throws for any id, so `threw === 6` held even with the
     // validation deleted -- verified by deleting it, and the test still passed.
     const live = '/tcwid' + process.pid;
-    const primary = TurboCache.createPrimary(live, 8 << 20, 1 << 14, { storage: 'bytes' });
+    const primary = TurboKV.createPrimary(live, 8 << 20, 1 << 14, { storage: 'bytes' });
     let threw = 0, messages = 0;
     for (const bad of [0, -1, 1.5, null, undefined, 'x']) {
-        try { TurboCache.attachWorker(live, bad); }
+        try { TurboKV.attachWorker(live, bad); }
         catch (e) { threw++; if (/workerId must be/.test(e.message)) messages++; }
     }
     ok(threw === 6, 'attachWorker rejects every non-positive-integer workerId');
     ok(messages === 6, 'each rejection is the workerId check, not an attach failure');
     primary.close();
     let coerced = false;
-    try { TurboCache.attachWorker('/tcnope' + process.pid, '3'); } catch (e) { coerced = !/workerId must be/.test(e.message); }
+    try { TurboKV.attachWorker('/tcnope' + process.pid, '3'); } catch (e) { coerced = !/workerId must be/.test(e.message); }
     ok(coerced, "numeric string workerId '3' is coerced, not rejected");
 }
 

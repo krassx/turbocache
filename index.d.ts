@@ -1,11 +1,11 @@
 /**
- * turbocache — a layered in-memory KV cache for Node.js clusters.
+ * turbokv — a layered in-memory KV cache for Node.js clusters.
  *
  * L1 is a per-process JS Map with a byte budget; L2 is a shared-memory arena
  * that the primary owns and workers map read-only. Worker writes travel to the
  * primary through per-worker shared-memory submission rings.
  *
- * These declarations are hand-written against turbocache.js. They describe the
+ * These declarations are hand-written against turbokv.js. They describe the
  * PUBLIC surface only: anything prefixed with `_` is internal cross-instance
  * plumbing and is deliberately absent.
  */
@@ -118,7 +118,7 @@ export interface PrimaryOptions<T = unknown> extends CacheOptions<T> {
     /** Bytes per submission ring. Default 1MB. A value larger than half a ring
      *  can never be delivered and `set` reports it as a rejection. */
     submitRingBytes?: number;
-    /** Requires an addon built with `--turbocache_lz4=1`. Measured a poor trade;
+    /** Requires an addon built with `--turbokv_lz4=1`. Measured a poor trade;
      *  neither the default nor a build dependency. */
     compress?: boolean;
     compressMinBytes?: number;
@@ -193,22 +193,22 @@ export interface KeysOptions {
  * `set` never throws: an unusable key, value or type is reported as `false`
  * with the reason in `lastError`.
  */
-export declare class TurboCache<T = unknown> {
+export declare class TurboKV<T = unknown> {
     constructor(options?: CacheOptions<T>);
 
     /** Create the arena and become its sole writer. Call before forking. */
     static createPrimary<V = unknown>(
         name: string, arenaBytes: number, indexSlots: number, options?: PrimaryOptions<V>
-    ): TurboCache<V>;
+    ): TurboKV<V>;
 
     /** Attach read-only from a worker. `workerId` must be an integer >= 1;
      *  0 is the primary and is rejected. */
     static attachWorker<V = unknown>(
         name: string, workerId: number, options?: CacheOptions<V>
-    ): TurboCache<V>;
+    ): TurboKV<V>;
 
     /** Create or attach automatically, choosing the role from `cluster`. */
-    static open<V = unknown>(options?: OpenOptions<V>): TurboCache<V>;
+    static open<V = unknown>(options?: OpenOptions<V>): TurboKV<V>;
 
     /** Wire the primary to apply worker batches. Idempotent. */
     static install(cluster: unknown): void;
@@ -289,7 +289,7 @@ export declare class TurboCache<T = unknown> {
     stopGuard(): void;
 }
 
-export { TurboCache as Cache };
+export { TurboKV as Cache };
 /** Message tag used on the cluster channel. */
 export declare const MSG: string;
-export default TurboCache;
+export default TurboKV;

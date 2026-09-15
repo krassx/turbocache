@@ -3,13 +3,13 @@
 // silently degrades. Costs roughly 2-3x JSON; use only when you need it.
 const v8 = require('v8');
 const __native = require('../src/native');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 // The SHIPPED codec, not a local re-implementation of it: a copy here would
 // keep passing while the real one regressed (decision 37b).
-const V8C = TurboCache.V8_CODEC;
+const V8C = TurboKV.V8_CODEC;
 let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
 
-const c = TurboCache.createPrimary('/tcv8' + process.pid, 32 << 20, 1 << 16,
+const c = TurboKV.createPrimary('/tcv8' + process.pid, 32 << 20, 1 << 16,
                                    { codec: V8C, l1MaxBytes: 32 * 1024, freeze: false });
 const val = { when: new Date('2026-09-08T10:00:00Z'), tags: new Set(['a']), index: new Map([['k', 1]]),
               bytes: new Uint8Array([1, 2, 3]), n: NaN, inf: Infinity, re: /abc/g };
@@ -28,7 +28,7 @@ ok(g.inf === Infinity, 'Infinity preserved');
 ok(g.re instanceof RegExp && g.re.source === 'abc', 'RegExp preserved');
 
 let threw = false;
-try { TurboCache.assertFastCodec(V8C); } catch { threw = true; }
+try { TurboKV.assertFastCodec(V8C); } catch { threw = true; }
 ok(!threw, 'fast-path check leaves non-JSON codecs alone');
 
 // A decoded typed array must OWN its backing store.

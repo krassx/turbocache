@@ -1,7 +1,7 @@
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
 
-const c = TurboCache.open({ storage: 'bytes', namespace: 'app' });
+const c = TurboKV.open({ storage: 'bytes', namespace: 'app' });
 
 // get / set
 ok(c.set('k', 'v') === true, 'set returns true on success');
@@ -25,7 +25,7 @@ ok(c.get('k') === undefined && c.has('k') === false, 'deleted key is gone from b
 ok(c.delete('k') === false, 'delete returns false when absent');
 
 // namespace isolation
-const d = TurboCache.attachWorker.length >= 0 ? null : null;   // placeholder, same arena
+const d = TurboKV.attachWorker.length >= 0 ? null : null;   // placeholder, same arena
 c.set('shared', 'ns-a');
 ok(c.get('shared') === 'ns-a', 'namespaced key reads back');
 
@@ -58,7 +58,7 @@ c.clearAll();
 for (let i = 0; i < 5; i++) c.set('e' + i, 'v');
 ok([...c.keys()].sort().join(',') === 'e0,e1,e2,e3,e4', 'keys() enumerates this namespace');
 ok(c.size === 5, 'size reports live entries');
-ok(typeof TurboCache.arenaStats().live === 'number', 'arenaStats() exposes arena counters');
+ok(typeof TurboKV.arenaStats().live === 'number', 'arenaStats() exposes arena counters');
 ok([...c.keys({ limit: 2 })].length === 2, 'keys() honours limit');
 
 // lifecycle
@@ -77,7 +77,7 @@ process.exit(fail ? 1 : 0);
     let msg = null;
     try {
         // Far larger than any /dev/shm; create must fail rather than succeed.
-        TurboCache.createPrimary('/tcfail' + process.pid, 1024 * (1 << 30), 1 << 16, {});
+        TurboKV.createPrimary('/tcfail' + process.pid, 1024 * (1 << 30), 1 << 16, {});
     } catch (e) { msg = e.message; }
     ok(msg !== null, 'an impossible arena size fails loudly instead of silently');
     ok(/arena create failed/.test(msg || ''),

@@ -3,7 +3,7 @@
 // paths, so falling off one now costs relatively more than it used to.
 const native = require('../src/native');
 const __native = native;
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const fs = require('fs');
 let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
 
@@ -51,7 +51,7 @@ for (const file of walk(root)) {
     const text = stripComments(raw);
     scanned++;
     for (const name of ['JSON.stringify', 'JSON.parse']) {
-        for (const call of TurboCache.callArgCounts(text, name)) {
+        for (const call of TurboKV.callArgCounts(text, name)) {
             if (call.args > 1) {
                 offenders++;
                 console.log(`  FAIL: ${path.relative(root, file)} -> ${call.text.slice(0, 70)}`);
@@ -72,15 +72,15 @@ const bad = [
 ];
 for (const [name, c] of bad) {
     let threw = false;
-    try { TurboCache.assertFastCodec(c); } catch { threw = true; }
+    try { TurboKV.assertFastCodec(c); } catch { threw = true; }
     ok(threw, `caller codec rejected: ${name}`);
 }
 let fine = true;
-try { TurboCache.assertFastCodec({ encode: JSON.stringify, decode: JSON.parse }); } catch { fine = false; }
+try { TurboKV.assertFastCodec({ encode: JSON.stringify, decode: JSON.parse }); } catch { fine = false; }
 ok(fine, 'plain JSON codec accepted');
 
 // 5. A cached substring must be flattened, or it retains its parent.
-const cache = TurboCache.createPrimary('/tcfp2' + process.pid, 16 << 20, 1 << 16, { values: 'bytes' });
+const cache = TurboKV.createPrimary('/tcfp2' + process.pid, 16 << 20, 1 << 16, { values: 'bytes' });
 const parent = new Array(50000).fill('abcdefgh').join('');
 cache.set('slice', parent.substring(0, 500));
 ok(cache.get('slice').length === 500, 'substring cached correctly');

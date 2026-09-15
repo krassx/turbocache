@@ -7,12 +7,12 @@
 // what that mode is supposed to do, including the lossy JSON cells, which are
 // correct behaviour rather than bugs (decision 29).
 const v8 = require('v8');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const JSONC = { encode: JSON.stringify, decode: JSON.parse };
 const V8C = { encode: v => v8.serialize(v).toString('latin1'),
               decode: s => v8.deserialize(Buffer.from(s, 'latin1')) };
 let n = 0;
-const mk = o => TurboCache.createPrimary('/tctm' + process.pid + '_' + (n++), 32 << 20, 1 << 16,
+const mk = o => TurboKV.createPrimary('/tctm' + process.pid + '_' + (n++), 32 << 20, 1 << 16,
                                          { l1MaxBytes: 16 * 1024, freeze: false, ...o });
 
 const values = {

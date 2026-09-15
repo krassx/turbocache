@@ -2,7 +2,7 @@
 // are correct but scale wrong. Assertions are RATIOS between configurations
 // measured in the same process, never absolute times, so a slow or loaded CI
 // machine moves both sides together and the test stays meaningful.
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 let fail = 0, n = 0;
 const ok = (c, m) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  ${m}`); if (!c) fail++; };
 
@@ -21,7 +21,7 @@ const ok = (c, m) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  ${m}`); if (!c) fa
     // the fix reverted for exactly that reason.
     const COLD = 150000, N = 60000, FILL = 'f'.repeat(160);
     const cost = (l1mb) => {
-        const c = TurboCache.createPrimary(`/tcperf${process.pid}_${n++}`, 128 << 20, 1 << 19,
+        const c = TurboKV.createPrimary(`/tcperf${process.pid}_${n++}`, 128 << 20, 1 << 19,
             { storage: 'bytes', l1MaxBytes: l1mb << 20 });
         for (let i = 0; i < COLD; i++) c.set('cold:' + i, `cold:${i}#1#${FILL}`);
         let sink = 0;

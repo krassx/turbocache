@@ -3,7 +3,7 @@
 // waiting on a later tick and the workload does not yield the event loop.
 const { run, buildPlan, BUGSEE } = require('./workload');
 const __native = require('../src/native');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const bugsee = require(BUGSEE);
 
 const OPS = Number(process.env.OPS || 300000);
@@ -21,7 +21,7 @@ function report(name, r, extra) {
         (extra ? '   ' + extra : ''));
 }
 
-// turbocache stores bytes, so the application owns the codec. JSON.parse /
+// turbokv stores bytes, so the application owns the codec. JSON.parse /
 // JSON.stringify are charged to it here, exactly as an app would pay.
 const tcObj = c => ({ sync: true,
     get: k => { const s = c.get(k); return s === undefined ? undefined : JSON.parse(s); },
@@ -33,7 +33,7 @@ const JSONC = { encode: JSON.stringify, decode: JSON.parse };
 const bs = c => ({ sync: false, get: k => c.get(k), set: (k, v) => c.set(k, v) });
 
 let n = 0;
-const fresh = (opts) => TurboCache.createPrimary('/tc-sng-' + process.pid + '-' + (n++), L2, 1 << 20, opts);
+const fresh = (opts) => TurboKV.createPrimary('/tc-sng-' + process.pid + '-' + (n++), L2, 1 << 20, opts);
 
 (async () => {
     console.log(`single process: ops=${OPS} zipf s=1.0, 90% read / 10% write, cache-aside`);
@@ -49,27 +49,27 @@ const fresh = (opts) => TurboCache.createPrimary('/tc-sng-' + process.pid + '-' 
         head();
         report('(harness floor, no cache)', await run(noop, plan, 256, NOYIELD));
         let tc = fresh();
-        report('turbocache (sync)', await run(tcObj(tc), plan, 256, NOYIELD),
+        report('turbokv (sync)', await run(tcObj(tc), plan, 256, NOYIELD),
                `L1hit=${tc.stats.l1Hits} L2hit=${tc.stats.l2Hits}`);
         __native.destroy();
         tc = fresh();
         const a = tcObj(tc);
-        report('turbocache (awaited)', await run({ sync: false, get: async k => a.get(k), set: async (k, v) => a.set(k, v) }, plan, 256, NOYIELD));
+        report('turbokv (awaited)', await run({ sync: false, get: async k => a.get(k), set: async (k, v) => a.set(k, v) }, plan, 256, NOYIELD));
         __native.destroy();
 
         tc = fresh({ codec: JSONC, l1MaxBytes: L1 });
-        report('turbocache (codec)', await run(tcStr(tc), plan, 256, NOYIELD),
+        report('turbokv (codec)', await run(tcStr(tc), plan, 256, NOYIELD),
                `L1hit=${tc.stats.l1Hits} L2hit=${tc.stats.l2Hits}`);
         __native.destroy();
 
         tc = fresh({ codec: JSONC, l1MaxBytes: L1, freeze: true });
-        report('turbocache (codec, frozen)', await run(tcStr(tc), plan, 256, NOYIELD));
+        report('turbokv (codec, frozen)', await run(tcStr(tc), plan, 256, NOYIELD));
         __native.destroy();
 
         report('bugsee (L1 only)', await run(bs(new bugsee.Cache({ l1MaxBytes: L1, enableIpc: false })), plan, 256, NOYIELD));
     }
 
-    // Opaque payloads (rendered HTML, serialized responses). turbocache stores
+    // Opaque payloads (rendered HTML, serialized responses). turbokv stores
     // them verbatim; bugsee's API is JSON-only so it must still encode.
     console.log(`\n=== scenario C: 60000-key working set | opaque string values ===`);
     const planC = buildPlan({ ops: OPS, nkeys: 60000, seed: 42 });
@@ -77,10 +77,10 @@ const fresh = (opts) => TurboCache.createPrimary('/tc-sng-' + process.pid + '-' 
     head();
     report('(harness floor, no cache)', await run(noop, planC, 256, NOYIELD));
     let tcC = fresh();
-    report('turbocache (raw bytes)', await run(tcStr(tcC), planC, 256, NOYIELD));
+    report('turbokv (raw bytes)', await run(tcStr(tcC), planC, 256, NOYIELD));
     __native.destroy();
     tcC = fresh({ values: 'bytes', l1MaxBytes: L1 });
-    report('turbocache (primitives)', await run(tcStr(tcC), planC, 256, NOYIELD),
+    report('turbokv (primitives)', await run(tcStr(tcC), planC, 256, NOYIELD),
            'exact accounting + flatten');
     __native.destroy();
     report('bugsee (L1 only)', await run(bs(new bugsee.Cache({ l1MaxBytes: L1, enableIpc: false })), planC, 256, NOYIELD));

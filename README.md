@@ -1,4 +1,4 @@
-# turbocache
+# turbokv
 
 A layered in-memory KV cache for Node.js clusters.
 
@@ -9,12 +9,12 @@ primary through per-worker shared-memory submission rings rather than the cluste
 IPC channel.
 
 ```js
-const { TurboCache } = require('turbocache');
-// or: import { TurboCache } from 'turbocache';
+const { TurboKV } = require('turbokv');
+// or: import { TurboKV } from 'turbokv';
 
 // primary, before forking
-const cache = TurboCache.open();
-TurboCache.install(require('cluster'));
+const cache = TurboKV.open();
+TurboKV.install(require('cluster'));
 
 // anywhere
 cache.set('user:42', 'ada', { ttlMs: 60_000 });
@@ -77,7 +77,7 @@ platform serves every supported Node major:
 Anything not listed falls back to compiling from source at install time, which
 needs a compiler and Python, exactly as before.
 
-> **Bun:** this used to need `"trustedDependencies": ["turbocache"]`, because
+> **Bun:** this used to need `"trustedDependencies": ["turbokv"]`, because
 > Bun blocks lifecycle scripts by default and the addon was therefore never
 > compiled. With prebuilds it no longer does — `bun add` still reports
 > "Blocked 1 postinstall", and the package works anyway, because the binary is
@@ -101,7 +101,7 @@ pinning a pool slab on every runtime); see DESIGN.md decision 46.
 ```
 index.js  index.mjs  index.d.ts   entry points; consumers never see src/
 binding.gyp                       addon build, at the package root
-src/      turbocache.js           the JS layer (L1, coherence, transports)
+src/      turbokv.js           the JS layer (L1, coherence, transports)
           native.js               single place the addon is resolved
           binding.cc *.h          the arena, submission rings, platform layer
           vendor/                 rapidhash, verbatim upstream

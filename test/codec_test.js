@@ -1,10 +1,10 @@
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const __native = require('../src/native');
 const JSONC = { encode: JSON.stringify, decode: JSON.parse };
 let fail = 0;
 const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
 
-const cache = TurboCache.createPrimary('/tc-codec-' + process.pid, 32 << 20, 1 << 16,
+const cache = TurboKV.createPrimary('/tc-codec-' + process.pid, 32 << 20, 1 << 16,
                                        { codec: JSONC, l1MaxBytes: 256 * 1024 });
 const obj = { id: 'x1', items: [{ k: 'a', v: 1 }, { k: 'b', v: 2 }], nested: { deep: true } };
 cache.set('o1', obj);
@@ -28,7 +28,7 @@ ok(JSON.stringify(g2) === JSON.stringify(obj), 'L2-decoded value matches');
 ok(cache.get('nope') === undefined, 'miss returns undefined');
 __native.destroy();
 
-const cf = TurboCache.createPrimary('/tc-codec2-' + process.pid, 8 << 20, 1 << 16,
+const cf = TurboKV.createPrimary('/tc-codec2-' + process.pid, 8 << 20, 1 << 16,
                                     { codec: JSONC, freeze: true });
 cf.set('fz', { a: { b: 1 } });
 const fz = cf.get('fz');

@@ -1,9 +1,9 @@
 'use strict';
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const __native = require('../src/native');
 let fail = 0, n = 0;
 const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
-const mk = storage => TurboCache.createPrimary('/tcsm' + process.pid + '_' + (n++), 32 << 20, 1 << 16,
+const mk = storage => TurboKV.createPrimary('/tcsm' + process.pid + '_' + (n++), 32 << 20, 1 << 16,
                                                { storage, l1MaxBytes: 1 << 20 });
 
 // --- direct: full fidelity, shared frozen object, mutation throws
@@ -86,7 +86,7 @@ for (const storage of ['direct', 'safe']) {
     }).join(', ') + ' }';
     const throws = (opts, mustMention) => {
         let e = null;
-        try { TurboCache.createPrimary('/tcsmx' + process.pid + '_' + (n++), 8 << 20, 1 << 13, opts); }
+        try { TurboKV.createPrimary('/tcsmx' + process.pid + '_' + (n++), 8 << 20, 1 << 13, opts); }
         catch (err) { e = err; }
         ok(e instanceof TypeError, `rejects ${label(opts)} with a TypeError`);
         ok(e != null && mustMention.every(w => e.message.includes(w)),
@@ -105,8 +105,8 @@ for (const storage of ['direct', 'safe']) {
     throws({ values: 'diret' },   ['values', 'diret']);
     // The declaration calls codec "mutually exclusive with a storage mode that
     // implies one"; that was never enforced, and the codec was silently dropped.
-    throws({ storage: 'bytes', codec: TurboCache.JSON_CODEC }, ['without a codec']);
-    throws({ values: 'primitives', codec: TurboCache.JSON_CODEC }, ['without a codec']);
+    throws({ storage: 'bytes', codec: TurboKV.JSON_CODEC }, ['without a codec']);
+    throws({ values: 'primitives', codec: TurboKV.JSON_CODEC }, ['without a codec']);
     // a codec that is not one
     throws({ codec: {} },                          ['encode()', 'decode()']);
     throws({ codec: { encode: JSON.stringify } },  ['decode()']);
@@ -124,9 +124,9 @@ for (const storage of ['direct', 'safe']) {
     for (const opts of [{}, { storage: 'bytes' }, { storage: 'direct' }, { storage: 'safe' },
                         { storage: 'primitives' }, { codec: null },
                         { codec: { encode: JSON.stringify, decode: JSON.parse } },
-                        { codec: TurboCache.V8_CODEC }]) {
+                        { codec: TurboKV.V8_CODEC }]) {
         try {
-            TurboCache.createPrimary('/tcsmok' + process.pid + '_' + (n++), 8 << 20, 1 << 13, opts);
+            TurboKV.createPrimary('/tcsmok' + process.pid + '_' + (n++), 8 << 20, 1 << 13, opts);
             built++;
         } catch (e) { ok(false, `valid options rejected: ${label(opts)} -> ${e.message}`); }
         __native.destroy();
@@ -141,7 +141,7 @@ for (const storage of ['direct', 'safe']) {
     // silently selected BYTES mode, so a caller following the declaration had
     // every object rejected by set().
     for (const mode of ['direct', 'safe']) {
-        const c = TurboCache.createPrimary('/tcsmal' + process.pid + '_' + (n++), 8 << 20, 1 << 13,
+        const c = TurboKV.createPrimary('/tcsmal' + process.pid + '_' + (n++), 8 << 20, 1 << 13,
                                            { values: mode, freeze: false });
         ok(c.storage === mode, `values: '${mode}' selects ${mode} mode (got '${c.storage}')`);
         c.set('o', { a: 1 });

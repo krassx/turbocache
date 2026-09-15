@@ -5,11 +5,11 @@
 // ships, because the recurring failure in this repo has been tests that
 // exercise a helper or a non-default mode and so keep passing while the shipped
 // path regresses.
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const native = require('../src/native');
 let fails = 0, n = 0;
 const ok = (c, m) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  ${m}`); if (!c) fails++; };
-const mk = (o) => TurboCache.createPrimary('/tcr2_' + process.pid + '_' + (n++), 16 << 20, 1 << 14,
+const mk = (o) => TurboKV.createPrimary('/tcr2_' + process.pid + '_' + (n++), 16 << 20, 1 << 14,
     { storage: 'bytes', l1MaxBytes: 1 << 18, ...o });
 
 // incr/cas write a natively-typed number, bypassing the codec. get() then fed
@@ -92,7 +92,7 @@ for (const mode of ['direct', 'safe']) {
 {
     const seen = [];
     for (const mb of [24, 26, 28, 32]) {
-        const c = TurboCache.createPrimary('/tcquant' + process.pid + '_' + mb, mb << 20, 1 << 14, { storage: 'bytes' });
+        const c = TurboKV.createPrimary('/tcquant' + process.pid + '_' + mb, mb << 20, 1 << 14, { storage: 'bytes' });
         const data = native.stats().dataBytes;
         seen.push({ mb, data, frac: data / (mb << 20) });
         c.close();
@@ -106,7 +106,7 @@ for (const mode of ['direct', 'safe']) {
 
 // And the log must still be correct when dataBytes is not a power of two.
 {
-    const c = TurboCache.createPrimary('/tcquant2' + process.pid, 26 << 20, 1 << 15, { storage: 'bytes' });
+    const c = TurboKV.createPrimary('/tcquant2' + process.pid, 26 << 20, 1 << 15, { storage: 'bytes' });
     const N = 40000, val = (i) => 'v'.repeat(180) + i;
     for (let i = 0; i < N; i++) c.set('k' + i, val(i));
     c.clearLocal();

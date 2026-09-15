@@ -11,7 +11,7 @@
 // Neither had a test. Coverage found them: the window's shed branch and the
 // -1 branch were both unexecuted by the whole suite.
 const cluster = require('cluster');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const native = require('../src/native');
 
 
@@ -39,9 +39,9 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
 
     // maintenance:false means this primary never stamps a heartbeat, which is
     // exactly the condition the worker has to tell apart from death.
-    TurboCache.createPrimary(ARENA, 32 << 20, 1 << 16,
+    TurboKV.createPrimary(ARENA, 32 << 20, 1 << 16,
                              { storage: 'bytes', transport: 'ipc', maintenance: false });
-    TurboCache.install(cluster);
+    TurboKV.install(cluster);
 
     const w = cluster.fork({ TC_CHILD: '1', TC_ARENA: ARENA });
     w.on('message', (m) => {
@@ -77,7 +77,7 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
     setTimeout(() => { console.log('  TIMEOUT'); process.exit(1); }, 30000);
 } else {
     // --- worker
-    const c = TurboCache.attachWorker(process.env.TC_ARENA, cluster.worker.id,
+    const c = TurboKV.attachWorker(process.env.TC_ARENA, cluster.worker.id,
         { storage: 'bytes', transport: 'ipc',
           // Tiny window and tiny outbox, so a modest burst reaches the state that
           // needs both to be full: the window exhausted AND nowhere left to batch.

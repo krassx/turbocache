@@ -1,4 +1,4 @@
-// Locates LZ4 for the optional --turbocache_lz4=1 build. Tries pkg-config, then
+// Locates LZ4 for the optional --turbokv_lz4=1 build. Tries pkg-config, then
 // the usual prefixes. Prints "<includedir>|<libdir>" or exits non-zero.
 const { execSync } = require('child_process');
 const fs = require('fs');
@@ -14,7 +14,7 @@ const prefixes = [process.env.LZ4_PREFIX, '/opt/homebrew', '/usr/local', '/usr',
 const found = tryPkgConfig() ||
     prefixes.map(p => `${p}/include|${p}/lib`).find(pair => fs.existsSync(pair.split('|')[0] + '/lz4.h'));
 if (!found) {
-    process.stderr.write('turbocache: --turbocache_lz4=1 requested but lz4.h was not found. ' +
+    process.stderr.write('turbokv: --turbokv_lz4=1 requested but lz4.h was not found. ' +
         'Install LZ4 (brew install lz4 / apt install liblz4-dev) or set LZ4_PREFIX.\n');
     process.exit(1);
 }

@@ -7,7 +7,7 @@
 // COUNTED. Other workers then see a miss, never a wrong value. A silent drop
 // here would be indistinguishable from success at the call site.
 const cluster = require('cluster');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const native = require('../src/native');
 
 
@@ -33,11 +33,11 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
     let fails = 0;
     const ok = (c, m) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  ${m}`); if (!c) fails++; };
 
-    const c = TurboCache.createPrimary(ARENA, 32 << 20, 1 << 16,
+    const c = TurboKV.createPrimary(ARENA, 32 << 20, 1 << 16,
         // A deliberately tiny ring: a modest burst must exhaust it, which is the
         // state the shed path exists for.
         { storage: 'bytes', transport: 'shm', submitRingBytes: 4096 });
-    TurboCache.install(cluster);
+    TurboKV.install(cluster);
 
     const w = cluster.fork({ TC_CHILD: '1', TC_ARENA: ARENA });
     w.on('message', (m) => {
@@ -56,7 +56,7 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
                'a worker delete goes through the ring and clears the local copy');
             // Drain whatever did fit, then tell the worker to move on.
             let guard = 0;
-            while (TurboCache.drainSubmissions(8192) > 0 && ++guard < 256);
+            while (TurboKV.drainSubmissions(8192) > 0 && ++guard < 256);
             c.set('sentinel', 'BEFORE-CLEAR');
             w.send({ t: 'clear-ready' });
             return;
@@ -86,7 +86,7 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
     setTimeout(() => { console.log('  TIMEOUT'); process.exit(1); }, 30000);
 } else {
     // --- worker
-    const c = TurboCache.attachWorker(process.env.TC_ARENA, cluster.worker.id,
+    const c = TurboKV.attachWorker(process.env.TC_ARENA, cluster.worker.id,
                                       { storage: 'bytes', transport: 'shm' });
 
     // A value can fit the ARENA and still be too big for a submission-ring

@@ -5,15 +5,15 @@
 const { fork } = require('child_process');
 const ARENA = process.env.TC_ARENA || ('/tcwl' + process.pid);
 const T = process.env.TC_T || 'shm';
-const P = require.resolve('../src/turbocache.js');
+const P = require.resolve('../src/turbokv.js');
 
 if (process.env.TC_ROLE === 'primary') {
-    const { TurboCache } = require(P);
+    const { TurboKV } = require(P);
     // maintenance:false so the test owns the heartbeat and can stop it.
-    const c = TurboCache.createPrimary(ARENA, 16 << 20, 1 << 14, { storage: 'bytes', transport: T, maintenance: false });
+    const c = TurboKV.createPrimary(ARENA, 16 << 20, 1 << 14, { storage: 'bytes', transport: T, maintenance: false });
     c.set('seed', 'from-primary');
     const cluster = require('cluster');
-    TurboCache.install(cluster);
+    TurboKV.install(cluster);
     const hb = setInterval(() => { try { require('../src/native').heartbeat(); } catch {} }, 300);
     process.on('message', (m) => {
         if (!m) return;
@@ -29,7 +29,7 @@ if (process.env.TC_ROLE === 'primary') {
             w.on('message', (cm) => {
                 if (!cm || cm.t !== 'closed') return;
                 setTimeout(() => {
-                    let g = 0; while (TurboCache.drainSubmissions(8192) > 0 && ++g < 64);
+                    let g = 0; while (TurboKV.drainSubmissions(8192) > 0 && ++g < 64);
                     process.send({ t: 'readback', sibOk: cm.sibOk,
                                    w1: c.get('w1'), seed: c.get('seed'), sib: c.get('sib') });
                     w.kill();
@@ -40,14 +40,14 @@ if (process.env.TC_ROLE === 'primary') {
     process.send({ t: 'up' });
     setInterval(() => {}, 1000);
 } else if (process.env.TC_ROLE === 'writeonly') {
-    const { TurboCache } = require(P);
-    const c = TurboCache.attachWorker(ARENA, 1, { storage: 'bytes', transport: T, primaryStaleMs: 1500 });
+    const { TurboKV } = require(P);
+    const c = TurboKV.attachWorker(ARENA, 1, { storage: 'bytes', transport: T, primaryStaleMs: 1500 });
     let i = 0;
     setInterval(() => { c.set('wo' + (i++), 'v'); process.send({ t: 'p', dead: c.primaryDead === true }); }, 200);
 } else if (process.env.TC_ROLE === 'closer') {
-    const { TurboCache } = require(P);
-    const a = TurboCache.attachWorker(ARENA, 1, { storage: 'bytes', transport: T });
-    const b = TurboCache.attachWorker(ARENA, 1, { storage: 'bytes', transport: T });
+    const { TurboKV } = require(P);
+    const a = TurboKV.attachWorker(ARENA, 1, { storage: 'bytes', transport: T });
+    const b = TurboKV.attachWorker(ARENA, 1, { storage: 'bytes', transport: T });
     a.set('w1', 'queued-before-close');
     a.delete('seed');
     a.close();                                    // b is still live

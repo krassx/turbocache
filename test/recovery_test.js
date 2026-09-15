@@ -14,12 +14,12 @@ const path = require('path');
 const ARENA = process.env.TC_ARENA || ('/tcrecov' + process.pid);
 
 if (process.env.TC_ROLE === 'primary') {
-    const { TurboCache } = require('../src/turbocache');
+    const { TurboKV } = require('../src/turbokv');
     // maintenance:false so this test OWNS the heartbeat. The library's own
     // maintenance timer stamps it independently, so pausing a second interval
     // alongside it stalls nothing - SIGSTOP only appeared to work because it
     // froze the whole process, library timer included.
-    const c = TurboCache.createPrimary(ARENA, 16 << 20, 1 << 14, { storage: 'bytes', maintenance: false });
+    const c = TurboKV.createPrimary(ARENA, 16 << 20, 1 << 14, { storage: 'bytes', maintenance: false });
     c.set('k', process.env.TC_VALUE);
     // A stalled primary is simulated by pausing the heartbeat rather than by
     // SIGSTOP: signals are the wrong tool here. SIGSTOP does not exist on
@@ -35,8 +35,8 @@ if (process.env.TC_ROLE === 'primary') {
     process.send({ t: 'up' });
     setInterval(() => {}, 1000);
 } else if (process.env.TC_ROLE === 'worker') {
-    const { TurboCache } = require('../src/turbocache');
-    const c = TurboCache.attachWorker(ARENA, 1, { storage: 'bytes', primaryStaleMs: 2000 });
+    const { TurboKV } = require('../src/turbokv');
+    const c = TurboKV.attachWorker(ARENA, 1, { storage: 'bytes', primaryStaleMs: 2000 });
     c.get('k');                                    // warm L1 so degraded reads still work
     process.send({ t: 'ready' });
     // Leave on request rather than only on a signal. A normal exit is what

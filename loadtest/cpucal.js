@@ -3,7 +3,7 @@
 // real work per iteration too: RNG, key string construction, value building and
 // verification. Run the identical loop against a no-op cache to price that, so
 // the cache's own share is a subtraction rather than an assumption.
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const N = Number(process.env.N || 3000000);
 const COLD = 200000, HOT = 300, SHARED = 500;
 const FILL = 'f'.repeat(160);
@@ -41,10 +41,10 @@ function run(cache, label) {
 const noop = { get: () => undefined, set: () => {}, flush: () => {} };
 const gen = run(noop, 'generator only (no-op cache)');
 
-const cache = TurboCache.createPrimary('/tccal', 192 << 20, 1 << 18, { storage: 'bytes' });
+const cache = TurboKV.createPrimary('/tccal', 192 << 20, 1 << 18, { storage: 'bytes' });
 for (let i = 0; i < COLD; i++) cache.set('cold:' + i, `cold:${i}#1#${FILL}`);
 for (let i = 0; i < HOT; i++) cache.set('hot:' + i, `hot:${i}#1#${FILL}`);
-const full = run(cache, 'generator + turbocache');
-console.log(`\n  turbocache's own share             ${(full - gen).toFixed(0)} ns/op` +
+const full = run(cache, 'generator + turbokv');
+console.log(`\n  turbokv's own share             ${(full - gen).toFixed(0)} ns/op` +
             `   (${(100 * (full - gen) / full).toFixed(0)}% of the loop; the generator is the other ${(100 * gen / full).toFixed(0)}%)`);
 cache.close();

@@ -9,7 +9,7 @@
 //                                 OTHER workers drop L1 and refill from L2
 const cluster = require('cluster');
 const os = require('os');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 
 const WORKERS  = Number(process.env.WORKERS || 4);
 const MINUTES  = Number(process.env.MINUTES || 12);
@@ -76,13 +76,13 @@ function verify(key, val) {
 }
 
 if (cluster.isPrimary) {
-    console.log(`turbocache load test — ${WORKERS} workers, ${MINUTES} min, storage=${MODE}` +
+    console.log(`turbokv load test — ${WORKERS} workers, ${MINUTES} min, storage=${MODE}` +
         `, values are ${MODE === 'bytes' ? 'strings' : 'objects'}`);
     console.log(`  node ${process.version} on ${os.platform()}/${os.arch()}, ${os.cpus().length} cpus`);
     console.log(`  L1 ${(L1/1048576).toFixed(0)}MB/worker, L2 ${(L2/1048576).toFixed(0)}MB shared`);
     console.log(`  bands: hot=${HOT} (L1-resident)  cold=${COLD} (L2)  shared=${SHARED} (cross-worker)\n`);
 
-    const cache = TurboCache.createPrimary(ARENA, L2, slotsFor(L2), { storage: MODE, l1MaxBytes: L1 });
+    const cache = TurboKV.createPrimary(ARENA, L2, slotsFor(L2), { storage: MODE, l1MaxBytes: L1 });
     // Mode semantics, asserted before any load runs. Each mode is SUPPOSED to
     // treat rich types differently -- `safe` silently degrading a Date to a
     // string is correct JSON behaviour, not a bug -- so the check is against a
@@ -123,11 +123,11 @@ if (cluster.isPrimary) {
     }
 
     process.env.TC_ARENA = ARENA;
-    TurboCache.install(cluster);
+    TurboKV.install(cluster);
 
     // seed the cold band so flow 2 has something to find
     for (let i = 0; i < COLD; i++) cache.set('cold:' + i, makeVal('cold:' + i, 1));
-    console.log(`  seeded ${COLD} cold keys, arena live=${TurboCache.arenaStats().live}\n`);
+    console.log(`  seeded ${COLD} cold keys, arena live=${TurboKV.arenaStats().live}\n`);
 
     const agg = {};
     const series = [];                 // { t, workerRssMB, primaryRssMB, heapMB, ops }
@@ -144,7 +144,7 @@ if (cluster.isPrimary) {
         const ws = Object.values(agg);
         if (!ws.length) return;
         const sum = k => ws.reduce((a, x) => a + (x[k] || 0), 0);
-        const st = TurboCache.arenaStats() || {};
+        const st = TurboKV.arenaStats() || {};
         const mins = ((Date.now() - started) / 60000).toFixed(1);
         const wRss = sum('rss') / ws.length, wHeap = sum('heap') / ws.length;
         const pMem = process.memoryUsage();
@@ -171,7 +171,7 @@ if (cluster.isPrimary) {
         const ws = Object.values(agg);
         const sum = k => ws.reduce((a, x) => a + (x[k] || 0), 0);
         const secs = Number(process.hrtime.bigint() - t0) / 1e9;
-        const st = TurboCache.arenaStats() || {};
+        const st = TurboKV.arenaStats() || {};
         console.log(`\n=== RESULT (storage=${MODE}) after ${(secs/60).toFixed(1)} minutes ===`);
         console.log(`  total ops              ${sum('ops').toLocaleString()}  (${(sum('ops')/secs/1000).toFixed(0)}k ops/s aggregate)`);
         console.log(`  flow 1  read L1 only   ${sum('f1').toLocaleString()}`);
@@ -311,7 +311,7 @@ if (cluster.isPrimary) {
     }, MINUTES * 60000);
 } else {
     const id = Number(process.env.WORKER_ID);
-    const cache = TurboCache.attachWorker(ARENA, id, { storage: MODE, l1MaxBytes: L1 });
+    const cache = TurboKV.attachWorker(ARENA, id, { storage: MODE, l1MaxBytes: L1 });
     const s = { t: 'stat', id, ops: 0, f1: 0, f2: 0, f3: 0, f4: 0, l1: 0, l2: 0, miss: 0,
                 prop: 0, wrong: 0, err: 0, rss: 0, heap: 0, cpuUs: 0, upMs: 0,
                 sent: 0, shed: 0, cong: 0 };

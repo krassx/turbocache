@@ -6,14 +6,14 @@
 // supported way to reach it from ESM without duplicating the module.
 //
 // Named exports are listed explicitly rather than re-exported wholesale so that
-// `import { TurboCache } from 'turbocache'` is statically analysable by
+// `import { TurboKV } from 'turbokv'` is statically analysable by
 // bundlers, which cannot see through a dynamic require.
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const mod = require('./src/turbocache.js');
+const mod = require('./src/turbokv.js');
 
-export const TurboCache = mod.TurboCache;
+export const TurboKV = mod.TurboKV;
 export const Cache = mod.Cache;
 export const MSG = mod.MSG;
-export default mod.TurboCache;
+export default mod.TurboKV;

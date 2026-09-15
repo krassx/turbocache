@@ -4,18 +4,18 @@
 # takes no external dependency at all and is buildable anywhere.
 #
 #   node-gyp configure build                      # no LZ4, no dependency
-#   node-gyp configure build --turbocache_lz4=1   # link system LZ4
+#   node-gyp configure build --turbokv_lz4=1   # link system LZ4
 {
-  "variables": { "turbocache_lz4%": "0", "turbocache_coverage%": "0" },
+  "variables": { "turbokv_lz4%": "0", "turbokv_coverage%": "0" },
   "targets": [{
-    "target_name": "turbocache",
+    "target_name": "turbokv",
     "sources": ["src/binding.cc"],
     "defines": ["NAPI_DISABLE_CPP_EXCEPTIONS"],
     "cflags_cc": ["-std=c++17", "-O3"],
     "xcode_settings": { "CLANG_CXX_LANGUAGE_STANDARD": "c++17", "OTHER_CFLAGS": ["-O3"] },
     "conditions": [
-      ["turbocache_lz4==1", {
-        "defines": ["TURBOCACHE_LZ4"],
+      ["turbokv_lz4==1", {
+        "defines": ["TURBOKV_LZ4"],
         "include_dirs": ["<!(node scripts/find_lz4.js include)"],
         "libraries": ["-L<!(node scripts/find_lz4.js lib)", "-llz4"]
       }],
@@ -23,7 +23,7 @@
       # codegen and costs roughly 2x, so it must never be what a consumer builds.
       # -O0 because -O3 inlines the header-only code into unrecognisable line
       # ranges, which is the whole of store_ops.h and submit.h.
-      ["turbocache_coverage==1", {
+      ["turbokv_coverage==1", {
         "cflags": ["--coverage", "-O0"],
         "cflags_cc": ["--coverage", "-O0"],
         "ldflags": ["--coverage"],

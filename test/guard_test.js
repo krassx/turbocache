@@ -5,7 +5,7 @@
 // nothing said so. The signal is a FinalizationRegistry now, with a floor poll
 // behind it. This test asserts the guard runs and sheds; being green on Node
 // alone would prove nothing, so run it under bun/deno too.
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 
 let fails = 0;
 const ok = (c, m) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  ${m}`); if (!c) fails++; };
@@ -15,7 +15,7 @@ const rt = typeof Bun !== 'undefined' ? 'bun' : (typeof Deno !== 'undefined' ? '
     // maxHeapFraction 0.0001 makes any live heap "too much", so the guard fires
     // as soon as it receives a reading. What is under test is the SIGNAL, not
     // the threshold arithmetic.
-    const c = TurboCache.createPrimary('/tcguard' + process.pid, 32 << 20, 1 << 16,
+    const c = TurboKV.createPrimary('/tcguard' + process.pid, 32 << 20, 1 << 16,
         { storage: 'bytes', l1MaxBytes: 8 << 20, heapGuard: { maxHeapFraction: 0.0001, shedFraction: 0.5 } });
 
     for (let i = 0; i < 20000; i++) c.set('k' + i, 'v'.repeat(200));   // fill L1
@@ -42,7 +42,7 @@ const rt = typeof Bun !== 'undefined' ? 'bun' : (typeof Deno !== 'undefined' ? '
     ok((c.stats.heapShed || 0) > before, `[${rt}] the guard shed L1 at least once (heapShed=${c.stats.heapShed || 0})`);
 
     // And it must not fire when the threshold is sane.
-    const c2 = TurboCache.createPrimary('/tcguard2' + process.pid, 32 << 20, 1 << 16,
+    const c2 = TurboKV.createPrimary('/tcguard2' + process.pid, 32 << 20, 1 << 16,
         { storage: 'bytes', l1MaxBytes: 1 << 20, heapGuard: { maxHeapFraction: 0.99 } });
     for (let i = 0; i < 2000; i++) c2.set('k' + i, 'v'.repeat(200));
     await new Promise(r => setTimeout(r, 1500));
@@ -61,7 +61,7 @@ const rt = typeof Bun !== 'undefined' ? 'bun' : (typeof Deno !== 'undefined' ? '
         globalThis.FinalizationRegistry = undefined;     // gcSubscribe must fall back
         let shed = 0, frac = 0;
         try {
-            const c3 = TurboCache.createPrimary('/tcguard3' + process.pid, 32 << 20, 1 << 16,
+            const c3 = TurboKV.createPrimary('/tcguard3' + process.pid, 32 << 20, 1 << 16,
                 { storage: 'bytes', l1MaxBytes: 8 << 20, heapGuard: { maxHeapFraction: 0.0001, shedFraction: 0.5 } });
             for (let i = 0; i < 20000; i++) c3.set('k' + i, 'v'.repeat(200));
             const deadline = Date.now() + 6000;          // must outlast the 1s poll

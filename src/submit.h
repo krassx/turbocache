@@ -6,7 +6,7 @@
 // worker's event loop while V8 serializes the batch: measured 0.49ms p50 and
 // 1.15ms p99 for a ~525KB batch. Everything else that worker is doing waits
 // behind that, including the application's own cluster messages, because
-// process.send is the shared channel and not turbocache's private pipe.
+// process.send is the shared channel and not turbokv's private pipe.
 //
 // Here a write is a memcpy into a ring the primary already has mapped.
 //

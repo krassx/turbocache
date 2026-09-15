@@ -3,11 +3,11 @@
 // lookup. The difference must be the L1 refill on every hit: 200k cold keys
 // against a small L1 means each read inserts a value that is evicted before it
 // is ever reused. Vary L1 to see whether that is the whole story.
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const COLD = 200000, N = 300000;
 const FILL = 'f'.repeat(160);
 for (const l1mb of [2, 8, 32, 128]) {
-    const cache = TurboCache.createPrimary('/tcf2_' + l1mb, 192 << 20, 1 << 18,
+    const cache = TurboKV.createPrimary('/tcf2_' + l1mb, 192 << 20, 1 << 18,
         { storage: 'bytes', l1MaxBytes: l1mb << 20 });
     for (let i = 0; i < COLD; i++) cache.set('cold:' + i, `cold:${i}#1#${FILL}`);
     let sink = 0;

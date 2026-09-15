@@ -1,10 +1,10 @@
 'use strict';
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const __native = require('../src/native');
 const JSONC = { encode: JSON.stringify, decode: JSON.parse };
 const L = s => console.log('    ' + s);
 let n = 0;
-const mk = o => TurboCache.createPrimary('/tcm' + process.pid + '_' + (n++), 32 << 20, 1 << 16,
+const mk = o => TurboKV.createPrimary('/tcm' + process.pid + '_' + (n++), 32 << 20, 1 << 16,
                                          Object.assign({ l1MaxBytes: 64 * 1024 }, o));
 const evict = (c, prim) => { const v = { pad: 'x'.repeat(300) };
     for (let i = 0; i < 400; i++) c.set('f' + i, prim ? JSON.stringify(v) : v); };

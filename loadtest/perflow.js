@@ -1,12 +1,12 @@
 'use strict';
 // The blended "ns per cache op" hides which of the four flows is expensive.
 // Price each one separately, with the generator cost (measured at 33ns) subtracted.
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const N = Number(process.env.N || 2000000);
 const COLD = 200000, HOT = 300;
 const FILL = 'f'.repeat(160);
 
-const cache = TurboCache.createPrimary('/tcflow', 192 << 20, 1 << 18, { storage: 'bytes' });
+const cache = TurboKV.createPrimary('/tcflow', 192 << 20, 1 << 18, { storage: 'bytes' });
 for (let i = 0; i < COLD; i++) cache.set('cold:' + i, `cold:${i}#1#${FILL}`);
 for (let i = 0; i < HOT; i++) cache.set('hot:' + i, `hot:${i}#1#${FILL}`);
 

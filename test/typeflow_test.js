@@ -1,9 +1,9 @@
 // This printed a table and exited 0 no matter what it observed -- it could not
 // fail, so it was not a test. The table is still useful; the assertions make it
 // mean something.
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const native = require('../src/native');
-const c = TurboCache.createPrimary('/tctf' + process.pid, 32 << 20, 1 << 16,
+const c = TurboKV.createPrimary('/tctf' + process.pid, 32 << 20, 1 << 16,
                                    { values: 'bytes', l1MaxBytes: 32 * 1024 });
 let fails = 0;
 const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fails++; } };

@@ -1,7 +1,7 @@
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const __native = require('../src/native');
 let fail = 0; const ok = (c, m) => { if (!c) { console.log('  FAIL:', m); fail++; } };
-const c = TurboCache.createPrimary('/tcprim' + process.pid, 32 << 20, 1 << 16,
+const c = TurboKV.createPrimary('/tcprim' + process.pid, 32 << 20, 1 << 16,
                                    { values: 'bytes', l1MaxBytes: 1 << 20 });
 c.set('s', 'hello'); c.set('n', 42); c.set('b', true);
 ok(c.get('s') === 'hello', 'string roundtrip');

@@ -16,13 +16,13 @@ const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
-const OBJ = path.join(ROOT, 'build/Release/obj.target/turbocache/src');
+const OBJ = path.join(ROOT, 'build/Release/obj.target/turbokv/src');
 const run = (cmd, args, opts = {}) =>
     execFileSync(cmd, args, { cwd: ROOT, stdio: 'inherit', ...opts });
 
 // --- 1. instrumented build
 console.log('--- building with --coverage');
-run('npx', ['node-gyp', 'configure', 'build', '--turbocache_coverage=1'],
+run('npx', ['node-gyp', 'configure', 'build', '--turbokv_coverage=1'],
     { stdio: ['ignore', 'ignore', 'inherit'] });
 
 // A .gcda accumulates across runs, so clear it or a stale run inflates the

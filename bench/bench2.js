@@ -5,7 +5,7 @@ const keys = Array.from({length: KEYS}, (_, i) => 'user:session:' + i);
 const _native = require('../src/native');
 if (!_native.hasLz4()) {
     console.log('  SKIPPED: this addon was built without LZ4 ' +
-                '(rebuild with --turbocache_lz4=1 to run the compression measurements)');
+                '(rebuild with --turbokv_lz4=1 to run the compression measurements)');
     process.exit(0);
 }
 

@@ -7,14 +7,14 @@
 //   (b) the cluster IPC channel cannot CARRY them fast enough
 // These have opposite fixes, so measure them separately.
 const cluster = require('cluster');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const ARENA = process.env.ARENA || '/tcceil';
 const L2 = Number(process.env.L2 || 192 * 1024 * 1024);
 const N = Number(process.env.N || 400000);
 const VAL = 'v'.repeat(180);
 
 if (cluster.isPrimary) {
-    const cache = TurboCache.createPrimary(ARENA, L2, 1 << 18, { storage: 'bytes', transport: 'ipc' });
+    const cache = TurboKV.createPrimary(ARENA, L2, 1 << 18, { storage: 'bytes', transport: 'ipc' });
 
     // (a) apply ceiling: primary writes straight into the arena, no IPC at all.
     let t0 = process.hrtime.bigint();
@@ -43,7 +43,7 @@ if (cluster.isPrimary) {
         got += m.b ? m.b.length / 5 : 0;
     });
 } else {
-    const cache = TurboCache.attachWorker(ARENA, 1, { storage: 'bytes', l1MaxBytes: 2 << 20, transport: 'ipc' });
+    const cache = TurboKV.attachWorker(ARENA, 1, { storage: 'bytes', l1MaxBytes: 2 << 20, transport: 'ipc' });
     process.send({ t: 'go' });
     // Yield between chunks. The L2 write path is asynchronous by construction:
     // process.send() queues into libuv and the drain callback that clears our

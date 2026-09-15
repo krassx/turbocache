@@ -1,6 +1,6 @@
 // json-fastpath-lint: allow - the counting codec wraps JSON deliberately.
 // Where does JSON actually get called? Count it, do not assume.
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const __native = require('../src/native');
 let enc = 0, dec = 0;
 const COUNTING = { encode: v => { enc++; return JSON.stringify(v); },
@@ -8,7 +8,7 @@ const COUNTING = { encode: v => { enc++; return JSON.stringify(v); },
 
 function run(label, opts, ops) {
     enc = dec = 0;
-    const c = TurboCache.createPrimary('/tcjc' + process.pid + label.length, 64 << 20, 1 << 18, opts);
+    const c = TurboKV.createPrimary('/tcjc' + process.pid + label.length, 64 << 20, 1 << 18, opts);
     const val = i => ({ id: 'u' + i, items: [1, 2, 3], s: 'x'.repeat(200) });
     const SETS = 500;
     for (let i = 0; i < SETS; i++) c.set('k' + i, opts.codec ? val(i) : JSON.stringify(val(i)));

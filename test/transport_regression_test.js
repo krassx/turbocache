@@ -7,7 +7,7 @@
 // so when set() started bypassing applyBatch for the shm ring, the test kept
 // passing while the shipped default path served stale data.
 const cluster = require('cluster');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const native = require('../src/native');
 
 const T = process.env.TC_T || 'shm';
@@ -17,10 +17,10 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
     let fails = 0;
     const ok = (c, m) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  [${T}] ${m}`); if (!c) fails++; };
 
-    const c = TurboCache.createPrimary(ARENA, 32 << 20, 1 << 16,
+    const c = TurboKV.createPrimary(ARENA, 32 << 20, 1 << 16,
         { storage: 'bytes', transport: T, submitRingBytes: 1 << 16 });
-    TurboCache.install(cluster);
-    TurboCache.install(cluster);          // idempotent: a second install must not double-apply
+    TurboKV.install(cluster);
+    TurboKV.install(cluster);          // idempotent: a second install must not double-apply
 
     c.set('coh', 'PRIMARY');
     c.get('coh');                          // resident in the primary's own L1
@@ -34,7 +34,7 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
         if (!m || m.t !== 'phase') return;
         setTimeout(() => {
             let guard = 0;
-            while (TurboCache.drainSubmissions(8192) > 0 && ++guard < 64);
+            while (TurboKV.drainSubmissions(8192) > 0 && ++guard < 64);
 
             ok(c.get('coh') === 'WORKER', 'primary L1 follows a worker overwrite');
             ok(c.get('del') === undefined && native.get('del') === undefined,
@@ -60,7 +60,7 @@ if (cluster.isPrimary && !process.env.TC_CHILD) {
     });
     setTimeout(() => { console.log(`[${T}] TIMEOUT`); process.exit(1); }, 20000);
 } else {
-    const c = TurboCache.attachWorker(ARENA, cluster.worker ? cluster.worker.id : 1,
+    const c = TurboKV.attachWorker(ARENA, cluster.worker ? cluster.worker.id : 1,
         { storage: 'bytes', transport: T, l1MaxBytes: 1 << 20 });
     c.set('coh', 'WORKER');
     c.set('del', 'to-be-deleted');

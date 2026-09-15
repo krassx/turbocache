@@ -1,11 +1,11 @@
 'use strict';
 // json-fastpath-lint: allow
 // Scorecard for the three storage modes: validity, safety, consistency, performance.
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const __native = require('../src/native');
 const MODES = ['bytes', 'direct', 'safe'];
 let seq = 0;
-const mk = (storage, opts = {}) => TurboCache.createPrimary(
+const mk = (storage, opts = {}) => TurboKV.createPrimary(
     '/tcrep' + process.pid + '_' + (seq++), 64 << 20, 1 << 17,
     { storage, l1MaxBytes: 256 * 1024, ...opts });
 // push a key out of L1 without disturbing L2
@@ -181,7 +181,7 @@ if (process.argv[2] === 'child') {
     const [, , , arena, mode] = process.argv;
     const prim = mode === 'bytes';
     if (!process.env.TC_CHILD) {
-        const c = TurboCache.createPrimary(arena, 32 << 20, 1 << 16, { storage: mode, l1MaxBytes: 64 * 1024 });
+        const c = TurboKV.createPrimary(arena, 32 << 20, 1 << 16, { storage: mode, l1MaxBytes: 64 * 1024 });
         const N = 200;
         for (let i = 0; i < N; i++) c.set('k' + i, prim ? 'val' + i : { i, tag: 'val' + i });
         const { execFileSync } = require('child_process');
@@ -190,7 +190,7 @@ if (process.argv[2] === 'child') {
         __native.destroy();
         process.stdout.write(r);
     } else {
-        const c = TurboCache.attachWorker(arena, 1, { storage: mode, l1MaxBytes: 64 * 1024 });
+        const c = TurboKV.attachWorker(arena, 1, { storage: mode, l1MaxBytes: 64 * 1024 });
         let ok = 0, bad = 0, missing = 0;
         for (let i = 0; i < 200; i++) {
             const g = c.get('k' + i);
@@ -218,7 +218,7 @@ async function performance() {
         const cells = [];
         for (const mode of MODES) {
             const prim = mode === 'bytes';
-            const c = TurboCache.createPrimary('/tcperf' + process.pid + '_' + (seq++), 256 << 20, 1 << 20,
+            const c = TurboKV.createPrimary('/tcperf' + process.pid + '_' + (seq++), 256 << 20, 1 << 20,
                                                { storage: mode, l1MaxBytes: 2 << 20 });
             // primitives cannot take objects, so the app encodes - counted against it
             const p = prim ? { ...plan, vals: plan.vals.map(v => JSON.stringify(v)) } : plan;

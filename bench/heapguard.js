@@ -1,5 +1,5 @@
 // Does a post-GC guard bound LIVE heap when the byte estimate is wrong?
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const __native = require('../src/native');
 const { makeValue, mkRng } = require('../bench/workload');
 const v8 = require('v8');
@@ -16,7 +16,7 @@ new PerformanceObserver(() => {
 let seq = 0;
 async function fill(opts, label) {
     peakLive = 0;
-    const c = TurboCache.createPrimary('/tchg' + process.pid + '_' + (seq++), 64 << 20, 1 << 16,
+    const c = TurboKV.createPrimary('/tchg' + process.pid + '_' + (seq++), 64 << 20, 1 << 16,
         { codec: JSONC, l1MaxBytes: 1 << 30, ...opts });   // budget deliberately absurd
     for (let i = 0; i < 200000; i++) {
         c.set('k' + i, makeValue(mkRng(i), 800));

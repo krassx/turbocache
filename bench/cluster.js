@@ -1,7 +1,7 @@
 'use strict';
 // 1 primary + N workers, shared keyspace so workers genuinely interfere:
 // every worker's write invalidates the other workers' L1 copies, and misses
-// must cross the process boundary (IPC for bugsee, shared memory for turbocache).
+// must cross the process boundary (IPC for bugsee, shared memory for turbokv).
 const cluster = require('cluster');
 const __native = require('../src/native');
 const os = require('os');
@@ -37,11 +37,11 @@ if (cluster.isPrimary) {
 
     let applyBatch = null;
     if (IMPL === 'turbo') {
-        const { TurboCache } = require('../src/turbocache');
-        TurboCache.createPrimary(ARENA, L2, 1 << 20);       // must exist before fork
+        const { TurboKV } = require('../src/turbokv');
+        TurboKV.createPrimary(ARENA, L2, 1 << 20);       // must exist before fork
         process.env.TC_ARENA = ARENA;
-        applyBatch = TurboCache.applyBatch;
-        var isCacheMsg = TurboCache.isCacheMessage;
+        applyBatch = TurboKV.applyBatch;
+        var isCacheMsg = TurboKV.isCacheMessage;
     } else {
         // Construct IpcServer directly (rather than createMasterHandler) so the
         // benchmark can read L2 occupancy afterwards and tell saturation apart
@@ -79,7 +79,7 @@ if (cluster.isPrimary) {
         console.log(`  writes               : ${tot.writes}`);
         console.log(`  latency ns (avg of workers): p50=${p50}  p99=${p99}  p99.9=${p999}`);
         if (IMPL === 'turbo') {
-            const st = require('../src/turbocache').__native.stats();
+            const st = require('../src/turbokv').__native.stats();
             console.log(`  primary applied ${applied} IPC batches; L2 holds ${st.live} entries`);
         } else {
             console.log(`  primary L2 holds ${srv.l2.itemCount} entries, ${(srv.l2.length/1048576).toFixed(1)}MB of ${L2/1048576}MB`);
@@ -92,12 +92,12 @@ if (cluster.isPrimary) {
         const id = Number(process.env.WORKER_ID);
         let c;
         if (IMPL === 'turbo') {
-            const { TurboCache } = require('../src/turbocache');
+            const { TurboKV } = require('../src/turbokv');
             // Was passing codec:null with no storage preset, which selects the
             // un-nameable "raw" mode and skips the flatten that 'primitives'
             // pays - so the headline number omitted ~20% of the default mode's
             // cost. Use the real presets.
-            c = TurboCache.attachWorker(process.env.TC_ARENA, id, MODE === 'codec'
+            c = TurboKV.attachWorker(process.env.TC_ARENA, id, MODE === 'codec'
                 ? { l1MaxBytes: L1, codec: JSONC }
                 : { l1MaxBytes: L1, storage: 'bytes' });
         } else {

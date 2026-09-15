@@ -1,7 +1,7 @@
 'use strict';
 // The package entry points, exercised as a consumer reaches them.
 //
-// Coverage found these at 0%: every other test requires `../src/turbocache`
+// Coverage found these at 0%: every other test requires `../src/turbokv`
 // directly, so `index.js`, `index.mjs` and the `exports` map that routes to them
 // were never loaded by the suite. That is the surface consumers actually touch,
 // and it is where the CJS/ESM split can break without any source file changing --
@@ -15,29 +15,29 @@ let fail = 0;
 const ok = (c, m) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  ${m}`); if (!c) fail++; };
 
 const ROOT = path.join(__dirname, '..');
-const EXPECTED = ['TurboCache', 'Cache', 'MSG'];
+const EXPECTED = ['TurboKV', 'Cache', 'MSG'];
 
 (async () => {
-    // --- CommonJS: require('turbocache')
+    // --- CommonJS: require('turbokv')
     const cjs = require(path.join(ROOT, 'index.js'));
-    ok(typeof cjs.TurboCache === 'function', 'cjs: TurboCache is exported');
-    ok(cjs.Cache === cjs.TurboCache, 'cjs: Cache is the same class as TurboCache');
+    ok(typeof cjs.TurboKV === 'function', 'cjs: TurboKV is exported');
+    ok(cjs.Cache === cjs.TurboKV, 'cjs: Cache is the same class as TurboKV');
     ok(typeof cjs.MSG === 'string', 'cjs: MSG is exported');
-    ok(typeof cjs.TurboCache.createPrimary === 'function',
+    ok(typeof cjs.TurboKV.createPrimary === 'function',
        'cjs: the class carries its statics');
-    ok(cjs.TurboCache.native === undefined,
+    ok(cjs.TurboKV.native === undefined,
        'cjs: the addon is NOT reachable from the public surface');
 
-    // --- ESM: import 'turbocache'
+    // --- ESM: import 'turbokv'
     const esm = await import(pathToFileURL(path.join(ROOT, 'index.mjs')).href);
     for (const name of EXPECTED) {
         ok(esm[name] !== undefined, `esm: ${name} is a named export`);
     }
-    ok(esm.default === esm.TurboCache,
+    ok(esm.default === esm.TurboKV,
        'esm: the DEFAULT export is the class, not the module namespace');
-    ok(esm.TurboCache === cjs.TurboCache,
+    ok(esm.TurboKV === cjs.TurboKV,
        'esm and cjs resolve to the same class (one implementation, two wrappers)');
-    ok(esm.Cache === esm.TurboCache, 'esm: Cache aliases TurboCache');
+    ok(esm.Cache === esm.TurboKV, 'esm: Cache aliases TurboKV');
 
     // --- the two entry points must agree on their surface
     const cjsNames = Object.keys(cjs).sort();
@@ -48,7 +48,7 @@ const EXPECTED = ['TurboCache', 'Cache', 'MSG'];
        `the public surface is exactly ${[...EXPECTED].sort().join(', ')}`);
 
     // --- and the class actually works when reached this way
-    const c = cjs.TurboCache.createPrimary('/tcep' + process.pid, 8 << 20, 1 << 13,
+    const c = cjs.TurboKV.createPrimary('/tcep' + process.pid, 8 << 20, 1 << 13,
                                            { storage: 'direct' });
     c.set('k', { a: 1 });
     const got = c.get('k');

@@ -7,7 +7,7 @@
 // event loop is frozen for that long, and every other thing that worker is doing
 // -- app IPC, timers, request handling -- waits.
 const cluster = require('cluster');
-const { TurboCache } = require('../src/turbocache');
+const { TurboKV } = require('../src/turbokv');
 const ARENA = '/tcsend';
 const SER = process.env.SER === 'advanced' ? 'advanced' : 'json';
 const N = Number(process.env.N || 400000);
@@ -17,9 +17,9 @@ const pct = (a, p) => a.length ? a[Math.min(a.length - 1, Math.floor(a.length * 
 
 if (cluster.isPrimary) {
     const L2 = 192 * 1024 * 1024;
-    const cache = TurboCache.createPrimary(ARENA, L2, slotsFor(L2), { storage: 'bytes', transport: 'ipc' });
+    const cache = TurboKV.createPrimary(ARENA, L2, slotsFor(L2), { storage: 'bytes', transport: 'ipc' });
     cluster.setupPrimary({ serialization: SER, exec: __filename });
-    TurboCache.install(cluster);
+    TurboKV.install(cluster);
     const w = cluster.fork({ TC_ARENA: ARENA });
     w.on('message', (m) => {
         if (!m || m.t !== 'r') return;
@@ -30,7 +30,7 @@ if (cluster.isPrimary) {
         w.kill(); cache.close(); process.exit(0);
     });
 } else {
-    const cache = TurboCache.attachWorker(ARENA, 1, { storage: 'bytes', l1MaxBytes: 2 << 20, transport: 'ipc' });
+    const cache = TurboKV.attachWorker(ARENA, 1, { storage: 'bytes', l1MaxBytes: 2 << 20, transport: 'ipc' });
     // Wrap process.send to time the synchronous portion of each call.
     const realSend = process.send.bind(process);
     const durs = []; let bytes = 0;
