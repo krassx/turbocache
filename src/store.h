@@ -156,6 +156,17 @@ struct Store {
   // ---- lifecycle -------------------------------------------------------
   bool create(const char *nm, uint64_t totalBytes, uint64_t indexSlots, uint8_t mode) {
     if (indexSlots < 16 || (indexSlots & (indexSlots - 1))) return false;   // power of two
+    // Release whatever this process already owns. `g` is process-global, so a
+    // second create() REPLACES the first -- and without this the old mapping
+    // and its shm name both stayed for the life of the process. attachReadOnly
+    // and Submit::open each carry this same guard already; create() was the one
+    // that did not, and it is the one that also has a name to unlink. A suite
+    // that creates an arena per test therefore accumulated every one of them,
+    // which is why it needed gigabytes of /dev/shm to finish.
+    //
+    // Before the new name is written: destroy() unlinks `name`, which must
+    // still be the OLD one.
+    if (base) destroy();
     snprintf(name, sizeof(name), "%s", nm);
     base = (uint8_t *)shmCreate(nm, totalBytes, &baseHandle);
     if (!base) return false;

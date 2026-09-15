@@ -5,13 +5,21 @@
 const { execFileSync } = require('child_process');
 const path = require('path');
 
+// Every test process releases its shared memory on exit. See test/_cleanup.js:
+// segments outlive their creator by design, so without this a full run strands
+// one arena and one ring per test file and needs gigabytes of /dev/shm.
+// NODE_OPTIONS rather than a require in each file, so a new test cannot forget,
+// and it reaches the workers tests fork as well.
+const CLEANUP = path.join(__dirname, '_cleanup.js');
+process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS ? process.env.NODE_OPTIONS + ' ' : ''}--require ${JSON.stringify(CLEANUP)}`;
+
 const SUITE = [
     'test.js', 'api_test.js', 'codec_test.js', 'prim_test.js', 'json_fastpath_test.js',
     'v8codec_test.js', 'storage_modes_test.js', 'namespace_test.js', 'cluster_api_test.js',
     'review_regression_test.js', 'gaps_test.js', 'typeflow_test.js', 'typematrix_test.js',
     'perf_regression_test.js', 'guard_test.js', 'recovery_test.js',
     'review2_regression_test.js', 'entrypoints_test.js',
-    'backpressure_test.js', 'worker_ops_test.js',
+    'backpressure_test.js', 'worker_ops_test.js', 'shm_leak_test.js',
 ];
 // Same file, both transports: the shared-memory path is the default and the IPC
 // path is the fallback, and a regression in either is a regression.

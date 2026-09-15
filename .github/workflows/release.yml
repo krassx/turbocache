@@ -87,7 +87,16 @@ jobs:
   prebuild-musl:
     name: linux-x64-musl
     runs-on: ubuntu-22.04
-    container: node:22-alpine
+    container:
+      image: node:22-alpine
+      # Docker defaults /dev/shm to 64MB and the arena IS shared memory, so the
+      # suite needs more; the glibc runners never hit this because they are VMs
+      # whose /dev/shm is half of RAM. This was 8g while the suite leaked a
+      # segment per process. With that fixed the requirement is just the largest
+      # single arena the suite builds -- perf_regression_test asks for 128MB so
+      # that nothing evicts while it measures. Measured in this exact image:
+      # 128m fails, 256m passes. 512m is 2x the known-good floor.
+      options: --shm-size=512m
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain

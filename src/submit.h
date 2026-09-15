@@ -122,6 +122,7 @@ struct Submit {
               uint32_t maxKey_, uint32_t maxVal_) {
     if (ringCount_ == 0 || ringBytes_ == 0 || (ringBytes_ & (ringBytes_ - 1))) return false;
     if (ringBytes_ < 4096 || ringCount_ > 4096) return false;
+    if (base) close();          // same guard as open(); a second create replaces the first
     bytes = sizeFor(ringCount_, ringBytes_);
     base = shmCreate(name, bytes, &h);
     if (!base) return false;

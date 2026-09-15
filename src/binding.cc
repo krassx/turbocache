@@ -257,6 +257,10 @@ static Submit g_submit;
 static int32_t g_ringIdx = -1;
 
 // primary: submitCreate(name, ringCount, ringBytes)
+// The ring segment this process created, so it can be unlinked when replaced or
+// destroyed. Submit itself tracks no name.
+static char g_prevRing[256] = {0};
+
 static napi_value SubmitCreate(napi_env env, napi_callback_info info) {
   ARG(3)
   char name[256]; size_t nl = 0;
@@ -264,8 +268,13 @@ static napi_value SubmitCreate(napi_env env, napi_callback_info info) {
   int32_t count = 0, bytes = 0;
   napi_get_value_int32(env, argv[1], &count);
   napi_get_value_int32(env, argv[2], &bytes);
+  // Unlink the ring this process created before, if any. Submit tracks no name
+  // of its own, so the name can only be released here -- otherwise a process
+  // that creates a second ring strands the first segment permanently.
+  if (g_prevRing[0] && strcmp(g_prevRing, name) != 0) shmUnlink(g_prevRing);
   shmUnlink(name);                       // reclaim a crashed run's segment
   bool ok = g_submit.create(name, (uint32_t)count, (uint32_t)bytes, KEY_MAX, (uint32_t)SCRATCH);
+  if (ok) snprintf(g_prevRing, sizeof g_prevRing, "%s", name);
   napi_value r; napi_get_boolean(env, ok, &r); return r;
 }
 
@@ -493,6 +502,10 @@ static napi_value SubmitMaxValue(napi_env env, napi_callback_info info) {
 
 static napi_value SubmitDestroy(napi_env env, napi_callback_info info) {
   if (g_submit.base) g_submit.close();
+  // close() releases the mapping; the NAME outlives it until unlinked, and a
+  // process that created a ring is the one responsible for removing it. Workers
+  // use submitRelease() instead and must never unlink a ring they only opened.
+  if (g_prevRing[0]) { shmUnlink(g_prevRing); g_prevRing[0] = '\0'; }
   g_ringIdx = -1;
   return nullptr;
 }
